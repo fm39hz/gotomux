@@ -87,3 +87,38 @@ func TestJSONRejectAbsoluteLayout(t *testing.T) {
 		t.Fatal("want reject absolute layout")
 	}
 }
+
+func TestApplyTemplate(t *testing.T) {
+	tmpl := &Preset{
+		Name: "default",
+		Windows: []PresetWindow{
+			{Name: "editor", Panes: []PresetPane{{Cmd: "nvim"}}},
+			{Name: "test", Panes: []PresetPane{{Cwd: "test"}, {Cwd: ""}}},
+		},
+	}
+	p := applyTemplate(tmpl, "myproj", "/work/myproj")
+	if p.Name != "myproj" || p.Cwd != "/work/myproj" {
+		t.Fatalf("root: %+v", p)
+	}
+	if p.Windows[0].Panes[0].Cwd != "/work/myproj" || p.Windows[0].Panes[0].Cmd != "nvim" {
+		t.Fatalf("editor: %+v", p.Windows[0].Panes[0])
+	}
+	if p.Windows[1].Panes[0].Cwd != "/work/myproj/test" {
+		t.Fatalf("rel: %q", p.Windows[1].Panes[0].Cwd)
+	}
+	if p.Windows[1].Panes[1].Cwd != "/work/myproj" {
+		t.Fatalf("empty: %q", p.Windows[1].Panes[1].Cwd)
+	}
+}
+
+func TestResolveCwd(t *testing.T) {
+	if resolveCwd("/a", "") != "/a" {
+		t.Fatal("empty")
+	}
+	if resolveCwd("/a", "b") != "/a/b" {
+		t.Fatal("rel")
+	}
+	if resolveCwd("/a", "/abs") != "/abs" {
+		t.Fatal("abs")
+	}
+}

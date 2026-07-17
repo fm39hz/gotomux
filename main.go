@@ -47,6 +47,7 @@ Keys (fzf-style combobox — type to filter anytime):
   esc           quit
 
 Store: $XDG_DATA_HOME/tmux_project/state.db
+	Template: .../templates/default.json (Create/Zoxide when no preset)
 Edit format: JSON {name,cwd,windows:[{name,layout,panes:[{cwd,cmd}]}]}`)
 			return
 		}
@@ -95,8 +96,9 @@ func run() error {
 
 func connectItem(ctl *TmuxCtl, store *Store, it item) error {
 	switch it.kind {
-	case kindCreate:
-		return ctl.Connect(it.name, it.path)
+	case kindCreate, kindZoxide:
+		// live → preset → default template (no prompts)
+		return connectProject(ctl, store, it.name, it.path)
 	case kindActive:
 		return ctl.Connect(it.name, "")
 	case kindPreset:
@@ -106,8 +108,6 @@ func connectItem(ctl *TmuxCtl, store *Store, it item) error {
 		}
 		_ = store.Touch(it.name)
 		return ctl.ConnectPreset(p)
-	case kindZoxide:
-		return ctl.Connect(it.name, it.path)
 	default:
 		return fmt.Errorf("unknown item kind")
 	}
