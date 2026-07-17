@@ -1,4 +1,6 @@
-# tmux_project
+# Tmux Project
+
+A small tools created after i'm so tired with manually manage tmuxp and sesh setup
 
 Interactive tmux session picker with saved layouts (tmuxp-like), fuzzy filter, and project templates.
 
@@ -39,25 +41,25 @@ tmux_project -h
 
 ### Keys
 
-| Key | Action |
-|-----|--------|
-| type | filter (anytime) |
-| `enter` | connect |
-| `ctrl-n` / `ctrl-p` | next / prev |
-| `ctrl-x` | kill active session |
-| `ctrl-f` | freeze active → preset |
-| `ctrl-e` | edit preset |
-| `ctrl-d` | delete preset |
-| `ctrl-t` | sticky template from preset (again: reset default) |
-| `?` | toggle full key help |
-| `esc` | quit |
+| Key                 | Action                                             |
+| ------------------- | -------------------------------------------------- |
+| type                | filter (anytime)                                   |
+| `enter`             | connect                                            |
+| `ctrl-n` / `ctrl-p` | next / prev                                        |
+| `ctrl-x`            | kill active session                                |
+| `ctrl-f`            | freeze active → preset                             |
+| `ctrl-e`            | edit preset                                        |
+| `ctrl-d`            | delete preset                                      |
+| `ctrl-t`            | sticky template from preset (again: reset default) |
+| `?`                 | toggle full key help                               |
+| `esc`               | quit                                               |
 
 ### Connect rules
 
-| Item | Behavior |
-|------|----------|
-| **Active** | switch / attach |
-| **Preset** | load layout if missing, then attach |
+| Item                | Behavior                                                   |
+| ------------------- | ---------------------------------------------------------- |
+| **Active**          | switch / attach                                            |
+| **Preset**          | load layout if missing, then attach                        |
 | **Create / Zoxide** | live → same-name preset → **active template** at that path |
 
 Default template (auto-seeded):
@@ -77,10 +79,7 @@ Sticky name: `templates/active`.
     {
       "name": "editor",
       "layout": "even-horizontal",
-      "panes": [
-        {"cwd": "/path", "cmd": "nvim"},
-        {"cwd": "/path"}
-      ]
+      "panes": [{ "cwd": "/path", "cmd": "nvim" }, { "cwd": "/path" }]
     }
   ]
 }
