@@ -81,28 +81,14 @@ func (s *Store) pragma() error {
 }
 
 func dataDir() (string, error) {
-	// Prefer gotomux; fall back to legacy dir names if they already exist.
-	base := func(root string) string {
-		candidates := []string{
-			filepath.Join(root, "gotomux"),
-			filepath.Join(root, "go-tomux"),
-			filepath.Join(root, "tmux_project"),
-		}
-		for _, c := range candidates {
-			if st, err := os.Stat(c); err == nil && st.IsDir() {
-				return c
-			}
-		}
-		return candidates[0]
-	}
 	if xdg := os.Getenv("XDG_DATA_HOME"); xdg != "" {
-		return base(xdg), nil
+		return filepath.Join(xdg, "gotomux"), nil
 	}
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return "", err
 	}
-	return base(filepath.Join(home, ".local", "share")), nil
+	return filepath.Join(home, ".local", "share", "gotomux"), nil
 }
 
 func (s *Store) Close() error { return s.db.Close() }

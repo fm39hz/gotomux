@@ -112,7 +112,7 @@ Usage is learned quietly: each connect increments opens; `ctrl-x` records a kill
 
 ```
 $XDG_DATA_HOME/gotomux/      # default ~/.local/share/gotomux
-  state.db                   # also accepts legacy .../go-tomux or .../tmux_project if present
+  state.db
   templates/
     default.json
     active

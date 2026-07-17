@@ -521,13 +521,9 @@ func TestSessionNameGenericPrefix(t *testing.T) {
 	if name != "foo-web" {
 		t.Fatalf("got %q", name)
 	}
-	// normal
-	if sessionName("/work/tmux_project") != "tmux-project" && sessionName("/work/tmux_project") != "tmux_project" {
-		// sanitize turns _ to -
-		n := sessionName("/work/tmux_project")
-		if n != "tmux-project" {
-			t.Fatalf("got %q", n)
-		}
+	// underscore → hyphen
+	if n := sessionName("/work/my_app"); n != "my-app" {
+		t.Fatalf("got %q", n)
 	}
 }
 
