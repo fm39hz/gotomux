@@ -27,8 +27,8 @@ import (
 //	  ]
 //	}
 //
-// layout: named only (even-horizontal|even-vertical|main-horizontal|main-vertical|tiled).
-// empty/missing → even-horizontal when panes > 1. Absolute tmux dumps never stored.
+// layout: named (even-horizontal|…) or tmux window_layout dump from freeze.
+// empty/missing → even-horizontal when panes > 1.
 
 type presetJSON struct {
 	Name    string       `json:"name"`
@@ -58,23 +58,29 @@ var namedLayouts = map[string]bool{
 
 func isNamedLayout(s string) bool { return namedLayouts[s] }
 
-// layoutForStore: keep named only; dump absolute sizes → empty (bake uses ratio default).
-func layoutForStore(layout string, nPanes int) string {
-	if nPanes <= 1 {
-		return ""
-	}
-	if isNamedLayout(layout) {
-		return layout
-	}
-	return "" // absolute dump dropped
+// isLayoutDump: tmux window_layout checksum dump (e.g. "ad85,158x35,0,0{...}").
+func isLayoutDump(s string) bool {
+	return strings.Contains(s, ",") && (strings.Contains(s, "{") || strings.Contains(s, "[") || strings.Contains(s, "x"))
 }
 
-// layoutForBake: named or default even-horizontal for multi-pane.
+// layoutForStore: named layouts + raw window_layout dumps (needed for 2x2 / mixed splits).
+// Single-pane → empty.
+func layoutForStore(layout string, nPanes int) string {
+	if nPanes <= 1 || layout == "" {
+		return ""
+	}
+	if isNamedLayout(layout) || isLayoutDump(layout) {
+		return layout
+	}
+	return ""
+}
+
+// layoutForBake: apply stored layout; multi-pane with nothing stored → even-horizontal.
 func layoutForBake(layout string, nPanes int) string {
 	if nPanes <= 1 {
 		return ""
 	}
-	if isNamedLayout(layout) {
+	if layout != "" {
 		return layout
 	}
 	return "even-horizontal"
@@ -129,8 +135,8 @@ func parsePreset(text string) (*Preset, error) {
 	}
 	p := &Preset{Name: j.Name, Cwd: j.Cwd}
 	for i, w := range j.Windows {
-		if w.Layout != "" && !isNamedLayout(w.Layout) {
-			return nil, fmt.Errorf("window %d: layout %q not named (use even-horizontal|even-vertical|main-horizontal|main-vertical|tiled)", i, w.Layout)
+		if w.Layout != "" && !isNamedLayout(w.Layout) && !isLayoutDump(w.Layout) {
+			return nil, fmt.Errorf("window %d: layout %q (use named layout or tmux window_layout dump)", i, w.Layout)
 		}
 		pw := PresetWindow{
 			Idx:    i,

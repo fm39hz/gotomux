@@ -35,14 +35,33 @@ func TestLayoutNamedOnly(t *testing.T) {
 	if layoutForStore("even-horizontal", 2) != "even-horizontal" {
 		t.Fatal("keep named")
 	}
-	if layoutForStore("ab12,40x20,0,0{20x20,0,0,1,20x20,20,0,2}", 2) != "" {
-		t.Fatal("drop absolute dump")
+	dump := "ad85,158x35,0,0{40x35,0,0,37,39x35,41,0,38}"
+	if layoutForStore(dump, 4) != dump {
+		t.Fatal("keep layout dump for multi-pane")
+	}
+	if layoutForStore(dump, 1) != "" {
+		t.Fatal("single pane drops layout")
 	}
 	if layoutForBake("", 2) != "even-horizontal" {
 		t.Fatal("default bake")
 	}
+	if layoutForBake(dump, 4) != dump {
+		t.Fatal("bake uses dump")
+	}
 	if layoutForBake("", 1) != "" {
 		t.Fatal("single pane no layout")
+	}
+}
+
+func TestJSONAllowsLayoutDump(t *testing.T) {
+	dump := "7efd,158x35,0,0[158x17,0,0,63,158x17,0,18,64]"
+	raw := `{"name":"x","windows":[{"name":"w","layout":"` + dump + `","panes":[{"cwd":"/a"},{"cwd":"/b"}]}]}`
+	p, err := parsePreset(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Windows[0].Layout != dump {
+		t.Fatalf("layout %q", p.Windows[0].Layout)
 	}
 }
 
@@ -78,13 +97,6 @@ func TestJSONPresetRoundtrip(t *testing.T) {
 	}
 	if p2.Windows[0].Layout != "even-horizontal" {
 		t.Fatalf("layout lost: %q", p2.Windows[0].Layout)
-	}
-}
-
-func TestJSONRejectAbsoluteLayout(t *testing.T) {
-	_, err := parsePreset(`{"name":"x","windows":[{"layout":"1x2,0,0","panes":[{"cwd":"/"}]}]}`)
-	if err == nil {
-		t.Fatal("want reject absolute layout")
 	}
 }
 

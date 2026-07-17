@@ -117,7 +117,7 @@ func (c *TmuxCtl) Freeze(name string) (*Preset, error) {
 		if pw.Cwd == "" {
 			pw.Cwd = p.Cwd
 		}
-		// never store absolute window_layout dump — bake uses ratio layout
+		// keep named layout or window_layout dump (structure for bake)
 		pw.Layout = layoutForStore(w.Layout, len(pw.Panes))
 		p.Windows = append(p.Windows, pw)
 	}
@@ -285,8 +285,8 @@ func validSessionName(name string) bool {
 }
 
 func (c *TmuxCtl) applyLayout(session string, w PresetWindow) {
-	// named layout only; absolute dumps dropped at freeze/parse.
-	// multi-pane with empty layout → even-horizontal (equal ratios).
+	// named layout or full window_layout dump from freeze.
+	// select-layout restores split tree (vertical / 2x2 / …) after panes exist.
 	layout := layoutForBake(w.Layout, len(w.Panes))
 	if layout == "" {
 		return
