@@ -105,7 +105,7 @@ func (m pickModel) View() string {
 		if i == m.cursor {
 			b.WriteString(styleCursor.Render("▸ " + line))
 		} else {
-			b.WriteString(styleNormal.Render("  " + line))
+			b.WriteString(stylePreset.Render("  " + line))
 		}
 		b.WriteByte('\n')
 	}

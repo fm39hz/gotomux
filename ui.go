@@ -69,11 +69,30 @@ const zoxCap = 40 // unfiltered list shows top-N zoxide only
 var (
 	stylePrompt = lipgloss.NewStyle().Foreground(lipgloss.Color("12")).Bold(true)
 	styleCursor = lipgloss.NewStyle().Foreground(lipgloss.Color("10")).Bold(true)
-	styleNormal = lipgloss.NewStyle().Foreground(lipgloss.Color("7"))
+	// weight: Active strongest → Preset → Create → Zoxide dimmest
+	styleActive = lipgloss.NewStyle().Foreground(lipgloss.Color("15")) // bright white
+	stylePreset = lipgloss.NewStyle().Foreground(lipgloss.Color("7"))  // normal
+	styleCreate = lipgloss.NewStyle().Foreground(lipgloss.Color("6"))  // cyan — action
+	styleZoxide = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))  // gray
 	styleDim    = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
 	styleStatus = lipgloss.NewStyle().Foreground(lipgloss.Color("11"))
 	styleHeader = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
 )
+
+func styleFor(k kind) lipgloss.Style {
+	switch k {
+	case kindActive:
+		return styleActive
+	case kindPreset:
+		return stylePreset
+	case kindCreate:
+		return styleCreate
+	case kindZoxide:
+		return styleZoxide
+	default:
+		return stylePreset
+	}
+}
 
 func newModel(ctl *TmuxCtl, store *Store, createName, createCwd string) model {
 	// always offer Create at top — enter bakes sticky template immediately
@@ -609,7 +628,7 @@ func (m model) View() string {
 			if i == m.cursor {
 				b.WriteString(styleCursor.Render("▸ " + line))
 			} else {
-				b.WriteString(styleNormal.Render("  " + line))
+				b.WriteString(styleFor(it.kind).Render("  " + line))
 			}
 			b.WriteByte('\n')
 			shown++
