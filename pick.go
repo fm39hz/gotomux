@@ -1,0 +1,115 @@
+package main
+
+import (
+	"strings"
+	"unicode"
+
+	tea "github.com/charmbracelet/bubbletea"
+)
+
+type listName string
+
+type pickModel struct {
+	all    []listName
+	view   []listName
+	cursor int
+	query  string
+	name   string
+	quit   bool
+}
+
+func runPick(names []listName) (string, error) {
+	if len(names) == 1 {
+		return string(names[0]), nil
+	}
+	m := pickModel{all: names}
+	m.refilter()
+	p := tea.NewProgram(m)
+	final, err := p.Run()
+	if err != nil {
+		return "", err
+	}
+	pm := final.(pickModel)
+	return pm.name, nil
+}
+
+func (m *pickModel) refilter() {
+	q := strings.ToLower(strings.TrimSpace(m.query))
+	m.view = m.view[:0]
+	for _, n := range m.all {
+		if q == "" || fuzzyMatch(q, strings.ToLower(string(n))) {
+			m.view = append(m.view, n)
+		}
+	}
+	if m.cursor >= len(m.view) {
+		m.cursor = len(m.view) - 1
+	}
+	if m.cursor < 0 {
+		m.cursor = 0
+	}
+}
+
+func (m pickModel) Init() tea.Cmd { return nil }
+
+func (m pickModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	switch msg := msg.(type) {
+	case tea.KeyMsg:
+		switch msg.String() {
+		case "ctrl+c", "esc":
+			m.quit = true
+			return m, tea.Quit
+		case "enter":
+			if len(m.view) > 0 {
+				m.name = string(m.view[m.cursor])
+				return m, tea.Quit
+			}
+		case "ctrl+n", "down":
+			if len(m.view) > 0 {
+				m.cursor = (m.cursor + 1) % len(m.view)
+			}
+		case "ctrl+p", "up":
+			if len(m.view) > 0 {
+				m.cursor--
+				if m.cursor < 0 {
+					m.cursor = len(m.view) - 1
+				}
+			}
+		case "backspace":
+			if len(m.query) > 0 {
+				r := []rune(m.query)
+				m.query = string(r[:len(r)-1])
+				m.refilter()
+			}
+		default:
+			if msg.Type == tea.KeyRunes {
+				for _, r := range msg.Runes {
+					if unicode.IsPrint(r) {
+						m.query += string(r)
+					}
+				}
+				m.refilter()
+			}
+		}
+	}
+	return m, nil
+}
+
+func (m pickModel) View() string {
+	var b strings.Builder
+	b.WriteString(stylePrompt.Render("❯ "))
+	b.WriteString(m.query)
+	b.WriteString(styleDim.Render("█"))
+	b.WriteString("\n")
+	b.WriteString(styleHeader.Render("  freeze session  ctrl-n/p · enter · esc"))
+	b.WriteString("\n")
+	for i, n := range m.view {
+		line := string(n)
+		if i == m.cursor {
+			b.WriteString(styleCursor.Render("▸ " + line))
+		} else {
+			b.WriteString(styleNormal.Render("  " + line))
+		}
+		b.WriteByte('\n')
+	}
+	return b.String()
+}
