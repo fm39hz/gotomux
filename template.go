@@ -7,7 +7,7 @@ import (
 	"strings"
 )
 
-// Templates live under $XDG_DATA_HOME/tmux_project/templates/
+// Templates live under $XDG_DATA_HOME/gotomux/templates/
 //
 //	default.json   — builtin shape (auto-seeded)
 //	<name>.json    — derived from a preset via ctrl-t

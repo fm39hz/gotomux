@@ -1,4 +1,4 @@
-module github.com/fm39hz/tmux_project
+module github.com/fm39hz/gotomux
 
 go 1.26.5
 

@@ -1,5 +1,5 @@
 # binary
-/tmux_project
+/gotomux
 *.exe
 *.test
 *.out

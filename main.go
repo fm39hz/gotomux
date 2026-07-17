@@ -28,12 +28,12 @@ func main() {
 			}
 			return
 		case "-h", "--help":
-			fmt.Println(`tmux_project — session picker
+			fmt.Println(`gotomux — session picker (go to mux)
 
 Usage:
-  tmux_project              interactive picker
-  tmux_project -f           freeze session (current if in tmux, else pick) → sqlite
-  tmux_project -e [name]    edit preset in $EDITOR
+  gotomux              interactive picker
+  gotomux -f           freeze session (current if in tmux, else pick) → sqlite
+  gotomux -e [name]    edit preset in $EDITOR
 
 Keys (fzf-style combobox — type to filter anytime):
   type          filter
@@ -47,7 +47,7 @@ Keys (fzf-style combobox — type to filter anytime):
   ctrl-u        clear query
   esc           quit
 
-Store: $XDG_DATA_HOME/tmux_project/state.db
+Store: $XDG_DATA_HOME/gotomux/state.db (legacy: .../tmux_project/)
 	Template: .../templates/{default|name}.json + active sticky (ctrl-t)
 Edit format: JSON {name,cwd,windows:[{name,layout,panes:[{cwd,cmd}]}]}`)
 			return
@@ -187,7 +187,7 @@ func editCLI(name string) error {
 func mustDataDir() string {
 	d, err := dataDir()
 	if err != nil {
-		return "~/.local/share/tmux_project"
+		return "~/.local/share/gotomux"
 	}
 	return d
 }

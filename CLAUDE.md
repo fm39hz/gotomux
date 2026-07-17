@@ -4,12 +4,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-Go CLI (`tmux_project`) for picking/creating tmux sessions and restoring saved layouts (tmuxp-like). Interactive fzf-style combobox via Bubble Tea; presets in SQLite.
+Go CLI (`gotomux`, module `github.com/fm39hz/gotomux`) for picking/creating tmux sessions and restoring saved layouts (tmuxp-like). Interactive fzf-style combobox via Bubble Tea; presets in SQLite.
 
 ## Commands
 
 ```bash
-go build -o tmux_project .   # binary (gitignored)
+go build -o gotomux .   # binary (gitignored)
 go run .                     # interactive picker
 go run . -f                  # freeze active session → sqlite
 go run . -e [name]           # edit preset in $EDITOR
@@ -51,7 +51,7 @@ Preset { Name, Cwd, Windows[] }
     PresetPane { Idx, Cwd, Cmd }  // Cmd empty = default shell
 ```
 
-SQLite: `$XDG_DATA_HOME/tmux_project/state.db` (default `~/.local/share/tmux_project/state.db`). Cascade deletes; soft-migrate adds `window.cwd` if missing.
+SQLite: `$XDG_DATA_HOME/gotomux/state.db` (default `~/.local/share/gotomux/state.db`). Cascade deletes; soft-migrate adds `window.cwd` if missing.
 
 ### Edit text format
 
