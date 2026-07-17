@@ -100,28 +100,6 @@ func run() error {
 	return err
 }
 
-// teaOpts: force /dev/tty so display-popup + default-shell=nu still get a real TTY.
-// Inside tmux (incl. popups) use alt-screen — more reliable than inline redraw there.
-func teaOpts() (opts []tea.ProgramOption, alt bool, err error) {
-	tty, err := os.OpenFile("/dev/tty", os.O_RDWR, 0)
-	if err != nil {
-		// fall back to defaults (stdin/stdout) — works in a normal terminal
-		if os.Getenv("TMUX") != "" {
-			return []tea.ProgramOption{tea.WithAltScreen()}, true, nil
-		}
-		return nil, false, nil
-	}
-	opts = []tea.ProgramOption{
-		tea.WithInput(tty),
-		tea.WithOutput(tty),
-	}
-	if os.Getenv("TMUX") != "" {
-		opts = append(opts, tea.WithAltScreen())
-		return opts, true, nil
-	}
-	return opts, false, nil
-}
-
 func connectItem(ctl *TmuxCtl, store *Store, it item) error {
 	switch it.kind {
 	case kindCreate, kindZoxide:
