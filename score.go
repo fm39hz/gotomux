@@ -1,183 +1,254 @@
 package main
 
 import (
-	"os"
 	"path/filepath"
 	"strings"
+	"unicode"
 )
 
-// scoreItem ranks one list entry. -1 = no match (only when q non-empty).
+// Ranking: lexicographic rankKey — not a single ad-hoc sum.
 //
-//	empty  → kind weight only
-//	typed  → name/basename quality + kind; full path only weak (avoids .config/* flood)
-func scoreItem(q string, it item) int {
-	if q == "" {
-		return kindScore(it.kind)
-	}
-	best := -1
-	// Primary: session name (hyphen segments count)
-	if s := scoreName(q, strings.ToLower(it.name)); s > best {
-		best = s
-	}
-	// Basename of path (zoxide folder name)
-	base := strings.ToLower(filepath.Base(it.path))
-	if base != "" && base != strings.ToLower(it.name) {
-		if s := scoreName(q, base); s > best {
-			best = s
-		}
-	}
-	// Full path: weak only — enough to keep a hit, not to outrank names
-	if p := strings.ToLower(it.path); p != "" {
-		if s := scorePathWeak(q, p); s > best {
-			best = s
-		}
-	}
-	if best < 0 {
-		return -1
-	}
-	return best + kindScore(it.kind)
+//	tier   — match quality band only (lower = better). Kind never outranks a better tier.
+//	kind   — domain preference within the same tier (higher = better).
+//	detail — within-tier match quality (higher = better).
+//	pathQ  — prefer shallower paths (higher = better): -depth.
+//	idx    — stable input order.
+//
+// Idle (empty q): tier=0 for all; sort by kind, then pathQ, then idx.
+//
+// Typed tiers:
+//
+//	0 token   — full name/basename == q, OR a hyphen segment == q
+//	1 prefix  — name/basename/segment HasPrefix(q)
+//	2 substr  — contiguous mid-string on those labels
+//	3 fuzzy   — rune subsequence on name/basename
+//	4 path    — match only via path segments (weakest)
+//
+// Product: Active "kho-cong" (token via segment) ranks above deep Zoxide "kho"
+// (token via full name) because same tier and kind(Active) > kind(Zoxide).
+
+const (
+	tierToken  int8 = 0
+	tierPrefix int8 = 1
+	tierSubstr int8 = 2
+	tierFuzzy  int8 = 3
+	tierPath   int8 = 4
+	tierNone   int8 = 127
+)
+
+const (
+	detailBase    int32 = 1_000_000
+	detailDensity int32 = 10_000
+	detailPosUnit int32 = 100
+	detailLenUnit int32 = 1
+	// Within token tier: full-label exact slightly above segment exact.
+	detailFullExact int32 = 5_000
+	detailSegExact  int32 = 2_000
+	detailFuzzyRun  int32 = 50
+	detailFuzzyHit  int32 = 10
+	detailFuzzyBnd  int32 = 20
+)
+
+type rankKey struct {
+	tier   int8
+	kind   int8
+	detail int32
+	pathQ  int8
+	idx    int
 }
 
-// kindScore: idle ranking + typed tie-break. Below one match tier step (~10k).
-func kindScore(k kind) int {
+// less reports whether a should sort before b (best first).
+func (a rankKey) less(b rankKey) bool {
+	if a.tier != b.tier {
+		return a.tier < b.tier
+	}
+	if a.kind != b.kind {
+		return a.kind > b.kind
+	}
+	if a.detail != b.detail {
+		return a.detail > b.detail
+	}
+	if a.pathQ != b.pathQ {
+		return a.pathQ > b.pathQ
+	}
+	return a.idx < b.idx
+}
+
+func kindRank(k kind) int8 {
 	switch k {
 	case kindCreate:
-		return 8_000
+		return 4
 	case kindActive:
-		return 6_000
+		return 3
 	case kindPreset:
-		return 4_000
+		return 2
 	default:
+		return 1
+	}
+}
+
+func pathQuality(p string) int8 {
+	if p == "" {
 		return 0
 	}
+	p = filepath.Clean(p)
+	d := 0
+	for _, r := range p {
+		if r == filepath.Separator {
+			d++
+		}
+	}
+	if d > 127 {
+		d = 127
+	}
+	return -int8(d)
 }
 
-// scoreName: match against a label (session name or folder basename).
-// Takes max(whole label, hyphen/underscore segments) so "confi" scores the
-// "config" segment inside "dotfiles-config", not a weak mid-string hit on the whole string.
-func scoreName(q, name string) int {
-	if name == "" {
-		return -1
-	}
-	best := -1
-	if s := scoreMatch(q, name); s >= 0 {
-		best = s + densityBonus(q, name)
-	}
-	for _, seg := range strings.FieldsFunc(name, func(r rune) bool {
-		return r == '-' || r == '_' || r == '.' || r == ' '
-	}) {
-		if seg == "" || seg == name {
-			continue
-		}
-		s := scoreMatch(q, seg)
-		if s < 0 {
-			continue
-		}
-		// segment hit: full tier on the segment + density on segment length
-		total := s + densityBonus(q, seg)
-		if total > best {
-			best = total
-		}
-	}
-	return best
+type fieldHit struct {
+	tier   int8
+	detail int32
 }
 
-// scorePathWeak: path hit only if a path segment matches; capped low.
-func scorePathWeak(q, path string) int {
-	best := -1
-	for _, seg := range strings.Split(path, string(os.PathSeparator)) {
-		if seg == "" {
-			continue
+func betterHit(a, b fieldHit) fieldHit {
+	if a.tier != b.tier {
+		if a.tier < b.tier {
+			return a
 		}
-		s := scoreMatch(q, strings.ToLower(seg))
-		if s < 0 {
-			continue
-		}
-		// cap so path never beats a real name prefix/exact
-		if s > 25_000 {
-			s = 25_000
-		}
-		s += densityBonus(q, seg) / 2
-		if s > best {
-			best = s
-		}
+		return b
 	}
-	if best < 0 {
-		return -1
+	if a.detail >= b.detail {
+		return a
 	}
-	return best
+	return b
 }
 
-func densityBonus(q, target string) int {
+func densityDetail(q, target string) int32 {
 	if len(target) == 0 {
 		return 0
 	}
-	// 0..5000 — "confi"/"config" ≈ 4166, "confi"/"dotfiles-config" whole is lower path
-	return 5000 * len(q) / len(target)
+	return detailDensity * int32(len(q)) / int32(len(target))
 }
 
-// scoreMatch: higher = better. -1 = no match.
-// exact > segment-boundary prefix > prefix > substring > fuzzy.
-func scoreMatch(query, text string) int {
-	if query == "" {
-		return 0
+func labelParts(label string) (whole string, segs []string) {
+	whole = strings.ToLower(strings.TrimSpace(label))
+	if whole == "" {
+		return "", nil
 	}
-	if text == query {
-		return 100_000
-	}
-	if strings.HasPrefix(text, query) {
-		rest := text[len(query):]
-		if rest == "" {
-			return 100_000
+	for _, seg := range strings.FieldsFunc(whole, func(r rune) bool {
+		return r == '-' || r == '_' || r == '.' || r == ' '
+	}) {
+		if seg != "" && seg != whole {
+			segs = append(segs, seg)
 		}
-		// longer completion after a clean prefix is fine; prefer denser via densityBonus
-		return 80_000 - (len(text) - len(query))
 	}
-	if i := strings.Index(text, query); i >= 0 {
-		// mid-string substring (not a leading prefix) — weaker
-		return 40_000 - i*20 - len(text)
-	}
-	return scoreFuzzy(query, text)
+	return whole, segs
 }
 
-// scoreFuzzy: rune subsequence with consecutive-run bonus. -1 if no match.
-func scoreFuzzy(query, text string) int {
+// matchOnLabel: best hit on session name or folder basename (never path-only tier).
+func matchOnLabel(q, label string) (fieldHit, bool) {
+	whole, segs := labelParts(label)
+	if whole == "" {
+		return fieldHit{tierNone, 0}, false
+	}
+	best := fieldHit{tierNone, 0}
+	ok := false
+
+	hit := func(text string, segment bool) {
+		if text == "" {
+			return
+		}
+		if text == q {
+			d := detailBase + densityDetail(q, text)
+			if segment {
+				d += detailSegExact
+				// slight preference for longer structured parent labels
+				d += int32(len(whole))
+			} else {
+				d += detailFullExact
+			}
+			best = betterHit(best, fieldHit{tierToken, d})
+			ok = true
+			return
+		}
+		if strings.HasPrefix(text, q) {
+			rest := len(text) - len(q)
+			d := detailBase + densityDetail(q, text) - int32(rest)*detailLenUnit
+			best = betterHit(best, fieldHit{tierPrefix, d})
+			ok = true
+			return
+		}
+		if i := strings.Index(text, q); i >= 0 {
+			d := detailBase + densityDetail(q, text) - int32(i)*detailPosUnit - int32(len(text))*detailLenUnit
+			best = betterHit(best, fieldHit{tierSubstr, d})
+			ok = true
+			return
+		}
+		if d, yes := fuzzyDetail(q, text); yes {
+			best = betterHit(best, fieldHit{tierFuzzy, d})
+			ok = true
+		}
+	}
+
+	hit(whole, false)
+	for _, seg := range segs {
+		hit(seg, true)
+	}
+	return best, ok
+}
+
+// matchOnPath: segments of path only → tierPath.
+func matchOnPath(q, path string) (fieldHit, bool) {
+	if path == "" {
+		return fieldHit{tierNone, 0}, false
+	}
+	best := fieldHit{tierNone, 0}
+	ok := false
+	for _, seg := range strings.Split(filepath.ToSlash(filepath.Clean(path)), "/") {
+		if seg == "" {
+			continue
+		}
+		h, yes := matchOnLabel(q, seg)
+		if !yes {
+			continue
+		}
+		// collapse whatever label tier into path-only band; keep detail
+		best = betterHit(best, fieldHit{tierPath, h.detail})
+		ok = true
+	}
+	return best, ok
+}
+
+func fuzzyDetail(query, text string) (int32, bool) {
 	qr, tr := []rune(query), []rune(text)
 	if len(qr) == 0 {
-		return 0
+		return detailBase, true
 	}
 	if len(qr) > len(tr) {
-		return -1
+		return 0, false
 	}
 	ti := 0
-	score := 0
-	prev := -2 // last match index
+	var score int32
+	prev := -2
 	first := -1
-	for _, q := range qr {
+	for _, ch := range qr {
 		found := false
 		for ; ti < len(tr); ti++ {
-			if tr[ti] != q {
+			if tr[ti] != ch {
 				continue
 			}
 			if first < 0 {
 				first = ti
 			}
-			// consecutive run
 			if ti == prev+1 {
-				score += 50
+				score += detailFuzzyRun
 			} else {
-				score += 10
-				// gap penalty
+				score += detailFuzzyHit
 				if prev >= 0 {
-					gap := ti - prev - 1
-					if gap > 0 {
-						score -= gap
-					}
+					score -= int32(ti - prev - 1)
 				}
 			}
-			// word-boundary / start bonus
-			if ti == 0 || tr[ti-1] == '/' || tr[ti-1] == '-' || tr[ti-1] == '_' || tr[ti-1] == ' ' {
-				score += 20
+			if ti == 0 || isBoundary(tr[ti-1]) {
+				score += detailFuzzyBnd
 			}
 			prev = ti
 			ti++
@@ -185,22 +256,104 @@ func scoreFuzzy(query, text string) int {
 			break
 		}
 		if !found {
-			return -1
+			return 0, false
 		}
 	}
-	// earlier first match, shorter text → better
-	score += 1000 - first*2
-	score -= len(tr)
+	score += detailBase/100 - int32(first)*2 - int32(len(tr))
 	if score < 0 {
 		score = 0
 	}
-	return score
+	return score, true
 }
 
-// fuzzyMatch kept for pick.go / tests — true if any match.
+func isBoundary(r rune) bool {
+	return r == '/' || r == '-' || r == '_' || r == '.' || r == ' ' || unicode.IsSpace(r)
+}
+
+// rankOf builds the sort key. ok=false → drop from results.
+func rankOf(q string, it item, idx int) (rankKey, bool) {
+	kr := kindRank(it.kind)
+	pq := pathQuality(it.path)
+	q = strings.ToLower(strings.TrimSpace(q))
+
+	if q == "" {
+		return rankKey{tier: 0, kind: kr, detail: 0, pathQ: pq, idx: idx}, true
+	}
+
+	best := fieldHit{tierNone, 0}
+	any := false
+
+	if h, ok := matchOnLabel(q, it.name); ok {
+		best, any = h, true
+	}
+	base := filepath.Base(it.path)
+	if base != "" && !strings.EqualFold(base, it.name) {
+		if h, ok := matchOnLabel(q, base); ok {
+			if !any {
+				best, any = h, true
+			} else {
+				best = betterHit(best, h)
+			}
+		}
+	}
+
+	if h, ok := matchOnPath(q, it.path); ok {
+		if !any {
+			// pure path hit
+			best, any = h, true
+		}
+		// if name already matched, path only affects pathQ — do not worsen/improve tier
+		_ = h
+	}
+
+	if !any || best.tier == tierNone {
+		return rankKey{}, false
+	}
+	return rankKey{
+		tier:   best.tier,
+		kind:   kr,
+		detail: best.detail,
+		pathQ:  pq,
+		idx:    idx,
+	}, true
+}
+
+// scoreItem: debug/total-order int (higher = better). Sorting uses rankKey.less.
+func scoreItem(q string, it item) int {
+	k, ok := rankOf(q, it, 0)
+	if !ok {
+		return -1
+	}
+	return int(127-k.tier)*100_000_000 +
+		int(k.kind)*1_000_000 +
+		int(k.detail) +
+		int(k.pathQ+127)
+}
+
+// fuzzyMatch: any match (pick.go).
 func fuzzyMatch(query, text string) bool {
 	if query == "" {
 		return true
 	}
-	return scoreMatch(query, text) >= 0
+	query = strings.ToLower(query)
+	text = strings.ToLower(text)
+	if _, ok := matchOnLabel(query, text); ok {
+		return true
+	}
+	if _, ok := matchOnPath(query, text); ok {
+		return true
+	}
+	return false
+}
+
+// scoreMatch: legacy helper for tests — higher = better match on a single label.
+func scoreMatch(query, text string) int {
+	if query == "" {
+		return 0
+	}
+	h, ok := matchOnLabel(query, text)
+	if !ok {
+		return -1
+	}
+	return int(127-h.tier)*100_000 + int(h.detail)
 }

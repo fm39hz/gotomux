@@ -120,26 +120,22 @@ func zoxideItems(zpaths []string, names, paths map[string]bool) []item {
 	return out
 }
 
-// rankItems sorts pool by scoreItem (empty query = kind weights only).
+// rankItems sorts pool by rankKey (tier > detail > kind > path depth > idx).
 func rankItems(q string, pool []item) []item {
 	type scored struct {
-		it    item
-		score int
-		idx   int
+		it item
+		k  rankKey
 	}
 	hits := make([]scored, 0, len(pool))
 	for i, it := range pool {
-		s := scoreItem(q, it)
-		if s < 0 {
+		k, ok := rankOf(q, it, i)
+		if !ok {
 			continue
 		}
-		hits = append(hits, scored{it, s, i})
+		hits = append(hits, scored{it, k})
 	}
 	sort.SliceStable(hits, func(a, b int) bool {
-		if hits[a].score != hits[b].score {
-			return hits[a].score > hits[b].score
-		}
-		return hits[a].idx < hits[b].idx
+		return hits[a].k.less(hits[b].k)
 	})
 	out := make([]item, len(hits))
 	for i, h := range hits {
