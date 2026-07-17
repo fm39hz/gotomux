@@ -201,7 +201,6 @@ func TestScoreItemPrefersNameAndActive(t *testing.T) {
 	q := "proj"
 	active := item{kind: kindActive, name: "proj", path: "/a/proj", title: "[Active] proj"}
 	zox := item{kind: kindZoxide, name: "other", path: "/z/proj-extra", title: "[Zoxide] other"}
-	// name exact-ish prefix on active should beat path hit on zoxide
 	sa, sz := scoreItem(q, active), scoreItem(q, zox)
 	if sa < 0 || sz < 0 {
 		t.Fatalf("scores %d %d", sa, sz)
@@ -209,12 +208,11 @@ func TestScoreItemPrefersNameAndActive(t *testing.T) {
 	if sa <= sz {
 		t.Fatalf("active name should win: active=%d zox=%d", sa, sz)
 	}
-	// better name match beats kind: zoxide named "proj" vs active weakly matching
+	// same-tier name match: Active kind beats Zoxide
 	zoxName := item{kind: kindZoxide, name: "proj", path: "/z/proj", title: "[Zoxide] proj"}
-	activeWeak := item{kind: kindActive, name: "zzz", path: "/a/something-proj-x", title: "[Active] zzz"}
-	if scoreItem(q, zoxName) <= scoreItem(q, activeWeak) {
-		t.Fatalf("strong name on zox should beat weak path on active: %d vs %d",
-			scoreItem(q, zoxName), scoreItem(q, activeWeak))
+	if scoreItem(q, active) <= scoreItem(q, zoxName) {
+		t.Fatalf("active exact name should beat zox exact name: %d vs %d",
+			scoreItem(q, active), scoreItem(q, zoxName))
 	}
 }
 
@@ -228,8 +226,21 @@ func TestKindScoreIdleOrder(t *testing.T) {
 	}
 }
 
+func TestScoreConfiPrefersPreset(t *testing.T) {
+	q := "confi"
+	preset := item{kind: kindPreset, name: "dotfiles-config", path: "/home/fm39hz/.config", title: "[Preset] dotfiles-config"}
+	zox := item{kind: kindZoxide, name: "config", path: "/home/fm39hz/.gemini/config", title: "[Zoxide] config"}
+	zoxChild := item{kind: kindZoxide, name: "nvim", path: "/home/fm39hz/.config/nvim", title: "[Zoxide] nvim"}
+	sp, sz := scoreItem(q, preset), scoreItem(q, zox)
+	if sp <= sz {
+		t.Fatalf("dotfiles-config should beat short zox config: preset=%d zox=%d", sp, sz)
+	}
+	if scoreItem(q, zoxChild) >= sp {
+		t.Fatalf("path child .config/nvim must not beat preset: child=%d preset=%d", scoreItem(q, zoxChild), sp)
+	}
+}
+
 func TestScoreKhoPrefersActive(t *testing.T) {
-	// typing "kho" with live kho-cong should beat zoxide dir literally named "kho"
 	q := "kho"
 	active := item{kind: kindActive, name: "kho-cong", path: "/home/fm39hz/Workspace/Tecapro/kho-cong", title: "[Active] kho-cong"}
 	zox := item{kind: kindZoxide, name: "kho", path: "/home/fm39hz/Workspace/Tecapro/kho-cong/workspace/deploy/kho", title: "[Zoxide] kho"}
