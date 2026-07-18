@@ -1,5 +1,8 @@
 # gotomux
 
+[![CI Status](https://img.shields.io/github/actions/workflow/status/fm39hz/gotomux/ci.yml?branch=master&style=flat-square)](https://github.com/fm39hz/gotomux/actions)
+[![License](https://img.shields.io/badge/license-MIT-blue.svg?style=flat-square)](LICENSE)
+
 **go to mux**, a fuzzy tmux session picker with presets, zoxide and sticky templates.
 
 Create / attach sessions, freeze live layouts to SQLite, bake a default (or sticky) template when opening a new project path. Built so you stop thinking about tmux and just jump into work.
