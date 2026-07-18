@@ -9,17 +9,18 @@ Go CLI (`gotomux`, module `github.com/fm39hz/gotomux`) for picking/creating tmux
 ## Commands
 
 ```bash
-go build -o gotomux .   # binary (gitignored)
-go run .                     # interactive picker
-go run . -f                  # freeze active session → sqlite
-go run . -e [name]           # edit preset in $EDITOR
-go run . -h
+make build          # ./gotomux
+make run            # picker; ARGS='-f' / '-e name' / '-h'
+make test           # go test ./...
+make install        # $(go env GOPATH)/bin
+make help           # all targets
 
-go test ./...
-go test ./internal/picker/ -run TestRank -v
+# raw go still fine:
+go build -o gotomux .
+go run . -f
 ```
 
-No Makefile, linter config, or CI.
+No linter config or CI.
 
 ## Architecture
 
