@@ -4,13 +4,13 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 
 	"github.com/GianlucaP106/gotmux/gotmux"
 	"github.com/fm39hz/gotomux/internal/project"
 	"github.com/fm39hz/gotomux/internal/store"
 )
-
 
 var namedLayouts = map[string]bool{
 	"even-horizontal": true,
@@ -48,7 +48,6 @@ func LayoutForBake(layout string, nPanes int) string {
 	return "even-horizontal"
 }
 
-
 type Ctl struct {
 	t *gotmux.Tmux
 }
@@ -83,16 +82,17 @@ func (c *Ctl) Has(name string) bool {
 	return c.t.HasSession(name)
 }
 
-// CurrentSession: name of session this client is attached to. Empty if outside tmux.
+// CurrentSession: attached session name, or empty outside tmux.
+// Uses gotmux Command (same socket path) — no extra raw exec import.
 func (c *Ctl) CurrentSession() string {
 	if os.Getenv("TMUX") == "" {
 		return ""
 	}
-	out, err := exec.Command("tmux", "display-message", "-p", "#S").Output()
+	out, err := c.t.Command("display-message", "-p", "#S")
 	if err != nil {
 		return ""
 	}
-	return strings.TrimSpace(string(out))
+	return strings.TrimSpace(out)
 }
 
 func (c *Ctl) Kill(name string) error {
@@ -111,54 +111,141 @@ func (c *Ctl) run(args ...string) error {
 	return nil
 }
 
-func (c *Ctl) Freeze(name string) (*store.Preset, error) {
-	s, err := c.t.GetSessionByName(name)
-	if err != nil {
-		return nil, err
+// runChain: one tmux client process, commands separated by "\;" (literal).
+// Uses exec directly — gotmux Command error strings are opaque and some
+// chained forms confuse its query builder.
+func (c *Ctl) runChain(parts ...[]string) error {
+	var args []string
+	first := true
+	for _, p := range parts {
+		if len(p) == 0 {
+			continue
+		}
+		if !first {
+			args = append(args, ";")
+		}
+		first = false
+		args = append(args, p...)
 	}
-	if s == nil {
+	if len(args) == 0 {
+		return nil
+	}
+	cmd := exec.Command("tmux", args...)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("tmux chain: %w (%s)", err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// freezeFmt: one list-panes -s covers all windows/panes of a session.
+const freezeFmt = "#{window_index}\t#{window_name}\t#{window_layout}\t#{pane_index}\t#{pane_current_path}\t#{pane_current_command}\t#{pane_start_command}\t#{pane_pid}\t#{pane_active}\t#{session_path}"
+
+// Freeze: 1× list-panes + 1× ps snapshot (portable). No nested ListWindows/ListPanes.
+func (c *Ctl) Freeze(name string) (*store.Preset, error) {
+	if !project.ValidSessionName(name) {
+		return nil, fmt.Errorf("invalid session name %q", name)
+	}
+	if !c.Has(name) {
 		return nil, fmt.Errorf("session %q not found", name)
 	}
 
-	p := &store.Preset{Name: name, Cwd: s.Path}
-	wins, err := s.ListWindows()
+	raw, err := c.t.Command("list-panes", "-s", "-t", "="+name, "-F", freezeFmt)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("list-panes: %w", err)
 	}
-	for _, w := range wins {
-		pw := store.PresetWindow{Idx: w.Index, Name: w.Name, Layout: w.Layout}
-		panes, err := w.ListPanes()
-		if err != nil {
-			return nil, err
+	lines := strings.Split(strings.TrimRight(raw, "\n"), "\n")
+	if len(lines) == 0 || (len(lines) == 1 && lines[0] == "") {
+		return nil, fmt.Errorf("session %q has no panes", name)
+	}
+
+	// Lazy: only snapshot processes when some pane still looks like a shell.
+	var procs *procIndex
+	needPS := false
+	for _, line := range lines {
+		if line == "" {
+			continue
 		}
-		for _, pn := range panes {
-			cwd := pn.CurrentPath
-			if cwd == "" {
-				cwd = pn.Path
-			}
-			cmd := detectPaneCmd(pn.CurrentCommand, pn.Pid)
-			if cmd == "" && pn.StartCommand != "" {
-				if b := binBase(pn.StartCommand); b != "" && !shellNames[b] {
-					cmd = b
-				}
-			}
-			pw.Panes = append(pw.Panes, store.PresetPane{
-				Idx: pn.Index,
-				Cwd: cwd,
-				Cmd: cmd,
-			})
-			if pw.Cwd == "" || pn.Active {
-				if cwd != "" {
-					pw.Cwd = cwd
-				}
+		parts := strings.Split(line, "\t")
+		for len(parts) < 10 {
+			parts = append(parts, "")
+		}
+		if base := binBase(parts[5]); base == "" || shellNames[base] {
+			if base := binBase(parts[6]); base == "" || shellNames[base] {
+				needPS = true
+				break
 			}
 		}
-		if pw.Cwd == "" {
-			pw.Cwd = p.Cwd
+	}
+	if needPS {
+		procs = loadProcIndex()
+	}
+
+	type winAcc struct {
+		idx    int
+		name   string
+		layout string
+		panes  []store.PresetPane
+		cwd    string
+	}
+	order := []int{}
+	byIdx := map[int]*winAcc{}
+	sessPath := ""
+
+	for _, line := range lines {
+		if line == "" {
+			continue
 		}
-		// keep named layout or window_layout dump (structure for bake)
-		pw.Layout = LayoutForStore(w.Layout, len(pw.Panes))
-		p.Windows = append(p.Windows, pw)
+		parts := strings.Split(line, "\t")
+		if len(parts) < 10 {
+			for len(parts) < 10 {
+				parts = append(parts, "")
+			}
+		}
+		wIdx, _ := strconv.Atoi(parts[0])
+		wName := parts[1]
+		wLayout := parts[2]
+		pIdx, _ := strconv.Atoi(parts[3])
+		pPath := parts[4]
+		pCur := parts[5]
+		pStart := parts[6]
+		pPid64, _ := strconv.ParseInt(parts[7], 10, 32)
+		pActive := parts[8] == "1"
+		if sessPath == "" {
+			sessPath = parts[9]
+		}
+
+		w, ok := byIdx[wIdx]
+		if !ok {
+			w = &winAcc{idx: wIdx, name: wName, layout: wLayout}
+			byIdx[wIdx] = w
+			order = append(order, wIdx)
+		}
+		cmd := detectPaneCmd(pCur, pStart, int32(pPid64), procs)
+		w.panes = append(w.panes, store.PresetPane{
+			Idx: pIdx,
+			Cwd: pPath,
+			Cmd: cmd,
+		})
+		if w.cwd == "" || pActive {
+			if pPath != "" {
+				w.cwd = pPath
+			}
+		}
+	}
+
+	p := &store.Preset{Name: name, Cwd: sessPath}
+	for _, wi := range order {
+		w := byIdx[wi]
+		if w.cwd == "" {
+			w.cwd = p.Cwd
+		}
+		p.Windows = append(p.Windows, store.PresetWindow{
+			Idx:    w.idx,
+			Name:   w.name,
+			Cwd:    w.cwd,
+			Layout: LayoutForStore(w.layout, len(w.panes)),
+			Panes:  w.panes,
+		})
 	}
 	if p.Cwd == "" && len(p.Windows) > 0 {
 		p.Cwd = p.Windows[0].Cwd
@@ -166,12 +253,9 @@ func (c *Ctl) Freeze(name string) (*store.Preset, error) {
 	return p, nil
 }
 
-// Load mirrors tmuxp semantics:
-//
-//	session start_directory
-//	window: panes[] each with start_directory + optional shell_command
-//
-// Uses raw tmux commands so shell_command works on new-session / new-window / split-window.
+// Load mirrors tmuxp: create session/windows/splits, pin names, select-layout.
+// One tmux client process; "\;" separators. Window targets use =sess:win
+// (automatic-rename is a window option — session-only -t fails).
 func (c *Ctl) Load(p *store.Preset) error {
 	if !project.ValidSessionName(p.Name) {
 		return fmt.Errorf("invalid session name %q", p.Name)
@@ -186,62 +270,59 @@ func (c *Ctl) Load(p *store.Preset) error {
 	}
 
 	wins := normalizeWindows(p.Windows, sessCwd)
-	w0 := wins[0]
-	p0 := w0.Panes[0]
+	var parts [][]string
 
-	// new-session -d -s NAME -c CWD -n WINNAME [cmd...]
-	args := []string{"new-session", "-d", "-s", p.Name, "-c", p0.Cwd}
+	appendWin := func(w store.PresetWindow, create []string) {
+		parts = append(parts, create)
+		t := sessionTarget(p.Name, w.Name)
+		// pin name: off automatic-rename + rename (window-scoped -t)
+		parts = append(parts, []string{"set-option", "-t", t, "automatic-rename", "off"})
+		if w.Name != "" {
+			parts = append(parts, []string{"rename-window", "-t", t, w.Name})
+		}
+		for _, pn := range w.Panes[1:] {
+			sp := []string{"split-window", "-t", t, "-h", "-c", pn.Cwd}
+			if pn.Cmd != "" {
+				sp = append(sp, cmdArgs(pn.Cmd)...)
+			}
+			parts = append(parts, sp)
+		}
+		if layout := LayoutForBake(w.Layout, len(w.Panes)); layout != "" {
+			parts = append(parts, []string{"select-layout", "-t", t, layout})
+		}
+	}
+
+	w0, p0 := wins[0], wins[0].Panes[0]
+	ns := []string{"new-session", "-d", "-s", p.Name, "-c", p0.Cwd}
 	if w0.Name != "" {
-		args = append(args, "-n", w0.Name)
+		ns = append(ns, "-n", w0.Name)
 	}
 	if p0.Cmd != "" {
-		args = append(args, cmdArgs(p0.Cmd)...)
+		ns = append(ns, cmdArgs(p0.Cmd)...)
 	}
-	if err := c.run(args...); err != nil {
-		return err
-	}
-	c.pinWindowName(p.Name, w0.Name)
-
-	if err := c.splitRest(p.Name, w0.Name, w0.Panes[1:]); err != nil {
-		return err
-	}
-	c.applyLayout(p.Name, w0)
+	appendWin(w0, ns)
 
 	for _, w := range wins[1:] {
 		pn := w.Panes[0]
-		args := []string{"new-window", "-t", p.Name, "-d", "-c", pn.Cwd}
+		nw := []string{"new-window", "-t", p.Name, "-d", "-c", pn.Cwd}
 		if w.Name != "" {
-			args = append(args, "-n", w.Name)
+			nw = append(nw, "-n", w.Name)
 		}
 		if pn.Cmd != "" {
-			args = append(args, cmdArgs(pn.Cmd)...)
+			nw = append(nw, cmdArgs(pn.Cmd)...)
 		}
-		if err := c.run(args...); err != nil {
-			return err
-		}
-		c.pinWindowName(p.Name, w.Name)
-		if err := c.splitRest(p.Name, w.Name, w.Panes[1:]); err != nil {
-			return err
-		}
-		c.applyLayout(p.Name, w)
+		appendWin(w, nw)
 	}
 
-	// focus first window (tmuxp focus:true on editor)
-	_ = c.run("select-window", "-t", sessionTarget(p.Name, wins[0].Name))
+	parts = append(parts, []string{"select-window", "-t", sessionTarget(p.Name, wins[0].Name)})
+
+	if err := c.runChain(parts...); err != nil {
+		_ = c.Kill(p.Name)
+		return err
+	}
 	return nil
 }
 
-// pinWindowName: match tmuxp automatic-rename:false so names don't become "nvim".
-func (c *Ctl) pinWindowName(session, winName string) {
-	if winName == "" {
-		return
-	}
-	t := sessionTarget(session, winName)
-	_ = c.run("set-option", "-t", t, "automatic-rename", "off")
-	_ = c.run("rename-window", "-t", t, winName)
-}
-
-// normalizeWindows: empty panes → one shell pane; fill missing cwds from window/session.
 func normalizeWindows(wins []store.PresetWindow, sessCwd string) []store.PresetWindow {
 	if len(wins) == 0 {
 		return []store.PresetWindow{{
@@ -274,24 +355,6 @@ func normalizeWindows(wins []store.PresetWindow, sessCwd string) []store.PresetW
 	return out
 }
 
-// splitRest: extra panes in same window (horizontal), each with own -c and optional cmd.
-func (c *Ctl) splitRest(session, winName string, panes []store.PresetPane) error {
-	if len(panes) == 0 {
-		return nil
-	}
-	target := sessionTarget(session, winName)
-	for _, pn := range panes {
-		args := []string{"split-window", "-t", target, "-h", "-c", pn.Cwd}
-		if pn.Cmd != "" {
-			args = append(args, cmdArgs(pn.Cmd)...)
-		}
-		if err := c.run(args...); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
 // sessionTarget: exact-name target ("=sess:win"). "=" disables prefix match.
 func sessionTarget(session, winName string) string {
 	if winName != "" {
@@ -300,25 +363,12 @@ func sessionTarget(session, winName string) string {
 	return "=" + session + ":0"
 }
 
-// cmdArgs splits pane Cmd into argv. Usually bare binary; allows "nvim file".
 func cmdArgs(cmd string) []string {
 	cmd = strings.TrimSpace(cmd)
 	if cmd == "" {
 		return nil
 	}
 	return strings.Fields(cmd)
-}
-
-
-func (c *Ctl) applyLayout(session string, w store.PresetWindow) {
-	// named layout or full window_layout dump from freeze.
-	// select-layout restores split tree (vertical / 2x2 / …) after panes exist.
-	layout := LayoutForBake(w.Layout, len(w.Panes))
-	if layout == "" {
-		return
-	}
-	target := sessionTarget(session, w.Name)
-	_ = c.run("select-layout", "-t", target, layout)
 }
 
 // Connect attaches or switches to session. Creates empty session if missing.
@@ -350,4 +400,3 @@ func (c *Ctl) ConnectPreset(p *store.Preset) error {
 	}
 	return c.Connect(p.Name, p.Cwd)
 }
-

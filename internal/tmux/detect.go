@@ -1,8 +1,7 @@
 package tmux
 
 import (
-	"bytes"
-	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -16,8 +15,7 @@ var shellNames = map[string]bool{
 	"tmux": true, "login": true,
 }
 
-// known tools we prefer to restore (binary base name)
-// empty map = restore any non-shell; keep set for docs / future filter
+// known tools we prefer when walking the pane process tree
 var restoreTools = map[string]bool{
 	"nvim": true, "vim": true, "vi": true, "hx": true, "helix": true,
 	"emacs": true, "nano": true, "micro": true,
@@ -30,16 +28,63 @@ var restoreTools = map[string]bool{
 	"ssh": true, "mosh": true,
 }
 
-// detectPaneCmd: prefer pane_current_command if non-shell; else walk /proc children.
-// Returns binary name only (e.g. "nvim") — load runs it in pane cwd.
-func detectPaneCmd(currentCmd string, pid int32) string {
+// procIndex: one ps snapshot for a whole Freeze (portable: Linux/macOS/BSD).
+type procIndex struct {
+	children map[int][]int
+	comm     map[int]string
+}
+
+// loadProcIndex runs a single `ps` — no /proc dependency.
+func loadProcIndex() *procIndex {
+	idx := &procIndex{
+		children: map[int][]int{},
+		comm:     map[int]string{},
+	}
+	// -axo: BSD/macOS + Linux procps; -eo: POSIX-ish fallback
+	out, err := exec.Command("ps", "-axo", "pid=,ppid=,comm=").Output()
+	if err != nil {
+		out, err = exec.Command("ps", "-eo", "pid=", "ppid=", "comm=").Output()
+		if err != nil {
+			return idx
+		}
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 3 {
+			continue
+		}
+		pid, err1 := strconv.Atoi(fields[0])
+		ppid, err2 := strconv.Atoi(fields[1])
+		if err1 != nil || err2 != nil {
+			continue
+		}
+		// comm may contain spaces on some ps — join rest
+		name := strings.ToLower(filepath.Base(strings.Join(fields[2:], " ")))
+		// strip macOS "-zsh" style
+		name = strings.TrimPrefix(name, "-")
+		idx.comm[pid] = name
+		idx.children[ppid] = append(idx.children[ppid], pid)
+	}
+	return idx
+}
+
+// detectPaneCmd: non-shell current → non-shell start → tool in process tree.
+// Returns binary base name only (e.g. "nvim").
+func detectPaneCmd(currentCmd, startCmd string, pid int32, procs *procIndex) string {
 	if base := binBase(currentCmd); base != "" && !shellNames[base] {
 		return base
 	}
-	if pid <= 0 {
+	if base := binBase(startCmd); base != "" && !shellNames[base] {
+		return base
+	}
+	if pid <= 0 || procs == nil {
 		return ""
 	}
-	return walkProc(int(pid), 4)
+	return procs.findTool(int(pid), 4)
 }
 
 func binBase(cmd string) string {
@@ -47,28 +92,38 @@ func binBase(cmd string) string {
 	if cmd == "" {
 		return ""
 	}
-	// "nvim" or "/usr/bin/nvim" or "-nu"
 	cmd = strings.TrimPrefix(cmd, "-")
-	return strings.ToLower(filepath.Base(strings.Fields(cmd)[0]))
+	fields := strings.Fields(cmd)
+	if len(fields) == 0 {
+		return ""
+	}
+	return strings.ToLower(filepath.Base(fields[0]))
 }
 
-func walkProc(rootPID, maxDepth int) string {
+// findTool: BFS children; prefer restoreTools, else first non-shell.
+func (p *procIndex) findTool(rootPID, maxDepth int) string {
 	type node struct{ pid, depth int }
 	q := []node{{rootPID, 0}}
 	seen := map[int]bool{rootPID: true}
+	var fallback string
 
 	for len(q) > 0 {
 		n := q[0]
 		q = q[1:]
 		if n.depth > 0 {
-			if name := procComm(n.pid); name != "" && restoreTools[name] {
-				return name // pass 1: nearest known tool
+			name := p.comm[n.pid]
+			if name == "" {
+				// continue walk
+			} else if restoreTools[name] {
+				return name
+			} else if fallback == "" && !shellNames[name] {
+				fallback = name
 			}
 		}
 		if n.depth >= maxDepth {
 			continue
 		}
-		for _, child := range procChildren(n.pid) {
+		for _, child := range p.children[n.pid] {
 			if seen[child] {
 				continue
 			}
@@ -76,89 +131,5 @@ func walkProc(rootPID, maxDepth int) string {
 			q = append(q, node{child, n.depth + 1})
 		}
 	}
-	// depth-0 non-shell already handled by caller; check children-only miss
-	// second pass: any non-shell in tree including if current was weird
-	q = []node{{rootPID, 0}}
-	seen = map[int]bool{rootPID: true}
-	for len(q) > 0 {
-		n := q[0]
-		q = q[1:]
-		name := procComm(n.pid)
-		if name != "" && !shellNames[name] {
-			return name
-		}
-		if n.depth >= maxDepth {
-			continue
-		}
-		for _, child := range procChildren(n.pid) {
-			if seen[child] {
-				continue
-			}
-			seen[child] = true
-			q = append(q, node{child, n.depth + 1})
-		}
-	}
-	return ""
-}
-
-func procComm(pid int) string {
-	b, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/comm")
-	if err != nil {
-		return ""
-	}
-	return strings.ToLower(string(bytes.TrimSpace(b)))
-}
-
-func procChildren(pid int) []int {
-	// /proc/<pid>/task/<pid>/children is linux-specific; fallback: scan /proc
-	b, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/task/" + strconv.Itoa(pid) + "/children")
-	if err == nil {
-		fields := strings.Fields(string(b))
-		out := make([]int, 0, len(fields))
-		for _, f := range fields {
-			if id, err := strconv.Atoi(f); err == nil {
-				out = append(out, id)
-			}
-		}
-		return out
-	}
-	// fallback: read /proc/*/stat ppid
-	ents, err := os.ReadDir("/proc")
-	if err != nil {
-		return nil
-	}
-	var out []int
-	want := strconv.Itoa(pid)
-	for _, e := range ents {
-		if !e.IsDir() {
-			continue
-		}
-		id, err := strconv.Atoi(e.Name())
-		if err != nil {
-			continue
-		}
-		stat, err := os.ReadFile("/proc/" + e.Name() + "/stat")
-		if err != nil {
-			continue
-		}
-		// stat: pid (comm) state ppid ...
-		ppid := parseStatPPID(stat)
-		if ppid == want {
-			out = append(out, id)
-		}
-	}
-	return out
-}
-
-func parseStatPPID(stat []byte) string {
-	// find ") " then fields: state ppid
-	i := bytes.LastIndex(stat, []byte(") "))
-	if i < 0 {
-		return ""
-	}
-	fields := bytes.Fields(stat[i+2:])
-	if len(fields) < 2 {
-		return ""
-	}
-	return string(fields[1])
+	return fallback
 }

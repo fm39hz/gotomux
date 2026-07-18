@@ -90,7 +90,7 @@ func TestLoadGrimoireShape(t *testing.T) {
 		}
 		win, _, path, cur, start, pidStr := parts[0], parts[1], parts[2], parts[3], parts[4], parts[5]
 		pid, _ := strconv.Atoi(pidStr)
-		tool := detectPaneCmd(cur, int32(pid))
+		tool := detectPaneCmd(cur, start, int32(pid), loadProcIndex())
 		if tool == "" && start != "" {
 			tool = binBase(start)
 		}
@@ -179,7 +179,7 @@ func TestLoadKhoCongShape(t *testing.T) {
 		}
 		win, path, cur, start, pidStr := parts[0], parts[1], parts[2], parts[3], parts[4]
 		pid, _ := strconv.Atoi(pidStr)
-		tool := detectPaneCmd(cur, int32(pid))
+		tool := detectPaneCmd(cur, start, int32(pid), loadProcIndex())
 		if tool == "" {
 			tool = binBase(start)
 		}
