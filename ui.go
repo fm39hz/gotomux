@@ -213,10 +213,8 @@ func (m *model) totalCount() int {
 }
 
 func (m model) Init() tea.Cmd {
-	if !m.zoxStale {
-		return nil // disk items fresh enough
-	}
-	return loadZoxideFreshCmd // background only
+	// always refresh full zoxide in background — cache only seeds paint
+	return loadZoxideFreshCmd
 }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {

@@ -6,17 +6,15 @@ import (
 	"time"
 )
 
-// Zoxide list is slow (~50–150ms). Cache pre-built items in SQLite (state.db)
-// so open paints Create/Active/Zoxide together without extra files.
+// Zoxide list is slow (~50–150ms + project walk). Cache pre-built items in
+// SQLite so open paints Create/Active/Zoxide from last run; full list rebuilds
+// in background and merges into the search pool (empty query still UI-caps).
 //
-//  1. loadZoxItemsSync reads DB (or memory).
-//  2. Background rebuildZoxItems runs zoxide + projectSession, SaveZoxItems.
-//  3. Cap paths before projectSession.
+//  1. loadZoxItemsSync reads DB (or memory) — first paint.
+//  2. Init always runs rebuildZoxItems (zoxide query -l + all paths).
+//  3. mergeZoxide swaps pool; rank on query sees low-frecency hits.
 
-const (
-	zoxCacheTTL  = 60 * time.Second
-	zoxPathLimit = 120
-)
+const zoxCacheTTL = 60 * time.Second // kept for reload() age checks only
 
 var (
 	zoxItemMem   []item
@@ -27,13 +25,6 @@ var (
 )
 
 func setZoxStore(s *Store) { zoxStore = s }
-
-func capZox(paths []string) []string {
-	if len(paths) > zoxPathLimit {
-		return paths[:zoxPathLimit]
-	}
-	return paths
-}
 
 func loadZoxItemsSync() ([]item, time.Duration, bool) {
 	zoxItemMu.Lock()
@@ -137,7 +128,8 @@ func rebuildZoxItems() []item {
 	if len(paths) == 0 {
 		return nil
 	}
-	items := zoxideItems(capZox(paths), map[string]bool{}, map[string]bool{})
+	// full list — low-rank paths stay searchable after merge; paint already done
+	items := zoxideItems(paths, map[string]bool{}, map[string]bool{})
 	if len(items) > 0 {
 		saveZoxItems(items)
 	}

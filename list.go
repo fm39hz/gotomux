@@ -30,7 +30,7 @@ type item struct {
 	cooccur int64
 }
 
-const zoxCap = 40 // unfiltered list shows top-N zoxide only
+const zoxCap = 40 // empty query: show top-N only; query uses full m.zox pool
 
 // collectBase: Create → Active → Presets(last_used). No zoxide.
 func collectBase(ctl *TmuxCtl, store *Store, create item) []item {

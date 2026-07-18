@@ -41,7 +41,7 @@ func BenchmarkReadyWithZoxide(b *testing.B) {
 		create := item{kind: kindCreate, title: name, name: name, path: root, desc: root}
 		base := collectBase(ctl, store, create)
 		n, p := occupancy(base)
-		_ = zoxideItems(capZox(zoxideList()), n, p)
+		_ = zoxideItems(zoxideList(), n, p)
 		store.Close()
 	}
 }
