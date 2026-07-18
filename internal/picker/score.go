@@ -6,6 +6,7 @@ import (
 	"unicode"
 
 	"github.com/fm39hz/gotomux/internal/store"
+	"golang.org/x/text/unicode/norm"
 )
 
 // Ranking: lexicographic rankKey (not a single ad-hoc sum).
@@ -182,23 +183,57 @@ func camelSplit(s string) []string {
 	return segs
 }
 
-// labelParts: whole lowercased label + delimiter segments + camel segments.
+// foldDiacritic: NFD → strip marks → lower; Vietnamese đ/Đ → d.
+// Match-time only — stored names stay as-is.
+func foldDiacritic(s string) string {
+	if s == "" {
+		return ""
+	}
+	// Fast path: pure ASCII letters/digits/- already lower.
+	ascii := true
+	for i := 0; i < len(s); i++ {
+		if s[i] >= 0x80 {
+			ascii = false
+			break
+		}
+	}
+	if ascii {
+		return strings.ToLower(s)
+	}
+	de := norm.NFD.String(s)
+	var b strings.Builder
+	b.Grow(len(de))
+	for _, r := range de {
+		if unicode.Is(unicode.Mn, r) {
+			continue // combining marks (acute, grave, horn, …)
+		}
+		switch r {
+		case 'đ', 'Đ':
+			b.WriteByte('d')
+		default:
+			b.WriteRune(unicode.ToLower(r))
+		}
+	}
+	return b.String()
+}
+
+// labelParts: whole folded label + delimiter segments + camel segments (all folded).
 func labelParts(label string) (whole string, segs []string) {
 	raw := strings.TrimSpace(label)
-	whole = strings.ToLower(raw)
+	whole = foldDiacritic(raw)
 	if whole == "" {
 		return "", nil
 	}
 	seen := map[string]bool{whole: true}
 	add := func(s string) {
-		s = strings.ToLower(s)
+		s = foldDiacritic(s)
 		if s == "" || seen[s] {
 			return
 		}
 		seen[s] = true
 		segs = append(segs, s)
 	}
-	// punctuation / path-ish split (on original for camel before lower)
+	// punctuation / path-ish split (on original for camel before fold)
 	for _, part := range strings.FieldsFunc(raw, func(r rune) bool {
 		return r == '-' || r == '_' || r == '.' || r == ' ' || r == '/'
 	}) {
@@ -220,6 +255,7 @@ func labelParts(label string) (whole string, segs []string) {
 }
 
 func matchOnLabel(q, label string) (fieldHit, bool) {
+	q = foldDiacritic(q)
 	whole, segs := labelParts(label)
 	if whole == "" {
 		return fieldHit{tierNone, 0}, false
@@ -427,7 +463,7 @@ func rankOf(q string, it Item, idx int) (rankKey, bool) {
 		return rankKey{tier: 0, kind: kr, detail: 0, recency: it.Recency, cooccur: it.Cooccur, pathQ: pq, idx: idx}, true
 	}
 
-	tokens := strings.Fields(strings.ToLower(q))
+	tokens := strings.Fields(foldDiacritic(q))
 	if len(tokens) == 0 {
 		return rankKey{tier: 0, kind: kr, detail: 0, recency: it.Recency, cooccur: it.Cooccur, pathQ: pq, idx: idx}, true
 	}

@@ -200,6 +200,44 @@ func TestFuzzyUTF8(t *testing.T) {
 	}
 }
 
+func TestFoldDiacritic(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"gotomux", "gotomux"},
+		{"Gôtomux", "gotomux"},
+		{"gôt", "got"},
+		{"Đà-Nẵng", "da-nang"},
+		{"THƯ", "thu"},
+		{"cafe", "cafe"},
+	}
+	for _, c := range cases {
+		if got := foldDiacritic(c.in); got != c.want {
+			t.Fatalf("fold(%q)=%q want %q", c.in, got, c.want)
+		}
+	}
+}
+
+func TestRankAccentInsensitive(t *testing.T) {
+	// gôt → gotomux (diacritic fold + prefix/fuzzy)
+	it := Item{Kind: KindActive, Name: "gotomux", Path: "/w/gotomux"}
+	for _, q := range []string{"got", "gôt", "GÔT", "gotomux", "gôtomux"} {
+		k, ok := rankOf(q, it, 0)
+		if !ok {
+			t.Fatalf("q=%q should match gotomux", q)
+		}
+		if k.tier > tierFuzzy {
+			t.Fatalf("q=%q tier too weak: %+v", q, k)
+		}
+	}
+	// đà-nẵng style name
+	dn := Item{Kind: KindZoxide, Name: "da-nang", Path: "/w/Đà-Nẵng"}
+	if _, ok := rankOf("đà", dn, 0); !ok {
+		t.Fatal("đà should fold-match da-nang")
+	}
+	if _, ok := rankOf("nang", dn, 0); !ok {
+		t.Fatal("nang should match da-nang segment")
+	}
+}
+
 func TestRankKeyOrderDoc(t *testing.T) {
 	// Within same tier, kind beats detail: Active fuzzy-ish vs Zoxide better detail still...
 	// Stronger: same tierToken, Active wins over Zoxide regardless of detail.
