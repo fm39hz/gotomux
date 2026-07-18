@@ -13,6 +13,9 @@
 .env
 .env.*
 
+# documentation
+docs/
+
 # arch packaging artifacts (keep PKGBUILD)
 dist/pkg/
 dist/src/

@@ -39,6 +39,7 @@ internal/
 
 `Source` = paint `Snapshot` + optional bg `Refresh`. Order (dedup first-wins): create → tmux → preset → zoxide.
 Add remote later: implement `Source`, register in `defaultSources`, connect by `Item.Src`/`Host`.
+Deferred plan: `docs/todo.md` (local stable first; no remote until day-to-day is boring).
 
 ### Data flow
 
