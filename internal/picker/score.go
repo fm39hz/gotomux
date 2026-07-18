@@ -19,7 +19,8 @@ import (
 //	pathQ   — shallower path (higher = better): -depth.
 //	idx     — stable input order.
 //
-// Idle (empty q): tier=0; sort kind → recency → cooccur → pathQ → idx.
+// Idle (empty q): tier=0; sort kind → recency (tmux last_attached/activity, usage max) → cooccur → pathQ → idx.
+// Inside tmux, current session recency is demoted so "just left" surfaces first.
 //
 // Frecency (usage table): opens with day-decay minus kill penalty — see frecencyScore.
 //

@@ -56,6 +56,10 @@ func (s *createSource) Snapshot() []Item {
 	if s.name == "" {
 		return nil
 	}
+	// Inside tmux: no Create — cwd spin-up is for outside; jump via zoxide/active.
+	if s.ctl != nil && s.ctl.CurrentSession() != "" {
+		return nil
+	}
 	if s.ctl != nil {
 		if live, err := s.ctl.ListLive(); err == nil {
 			for _, ls := range live {
@@ -93,6 +97,14 @@ func (s *tmuxSource) Snapshot() []Item {
 	}
 	out := make([]Item, 0, len(live))
 	for _, ls := range live {
+		// Recency: max(last_attached, activity, created) — "just left" / hot session
+		rec := ls.LastAttached
+		if ls.Activity > rec {
+			rec = ls.Activity
+		}
+		if ls.Created > rec {
+			rec = ls.Created
+		}
 		out = append(out, Item{
 			Src:     SrcTmux,
 			Kind:    KindActive,
@@ -101,6 +113,7 @@ func (s *tmuxSource) Snapshot() []Item {
 			Name:    ls.Name,
 			Path:    ls.Path,
 			Windows: ls.Windows,
+			Recency: rec,
 		})
 	}
 	return out
@@ -220,17 +233,29 @@ func flattenSources(order []Source, bySrc map[string][]Item, query string) []Ite
 }
 
 // applyRankMeta overlays usage + cooccur on all slots.
-func applyRankMeta(bySrc map[string][]Item, store *store.Store, pairs map[string]int64) {
-	if store == nil {
-		return
-	}
+func applyRankMeta(bySrc map[string][]Item, st *store.Store, pairs map[string]int64, ctxSession string) {
 	now := time.Now().Unix()
-	us, _ := store.AllUsage()
+	var us map[string]store.Usage
+	if st != nil {
+		us, _ = st.AllUsage()
+	}
 	for id, items := range bySrc {
 		if len(us) > 0 {
 			applyUsage(items, us, now)
 		}
 		applyCooccur(items, pairs)
+		// Inside tmux, idle list: demote the session you are already on so
+		// "just left" / other MRU actives surface first (smart-pane style).
+		if ctxSession != "" && id == SrcTmux {
+			for i := range items {
+				if items[i].Name == ctxSession && items[i].Kind == KindActive {
+					// keep kind Active but push below other actives with real recency
+					if items[i].Recency > 0 {
+						items[i].Recency = items[i].Recency / 4
+					}
+				}
+			}
+		}
 		bySrc[id] = items
 	}
 }

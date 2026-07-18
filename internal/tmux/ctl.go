@@ -12,6 +12,7 @@ import (
 	"github.com/fm39hz/gotomux/internal/store"
 )
 
+
 var namedLayouts = map[string]bool{
 	"even-horizontal": true,
 	"even-vertical":   true,
@@ -61,9 +62,13 @@ func New() (*Ctl, error) {
 }
 
 type LiveSession struct {
-	Name    string
-	Windows int
-	Path    string // session_path — for dedup vs zoxide
+	Name         string
+	Windows      int
+	Path         string // session_path — for dedup vs zoxide
+	LastAttached int64  // unix; 0 if unknown
+	Activity     int64  // unix last pane activity
+	Created      int64  // unix session created
+	Attached     int    // client count
 }
 
 func (c *Ctl) ListLive() ([]LiveSession, error) {
@@ -73,9 +78,34 @@ func (c *Ctl) ListLive() ([]LiveSession, error) {
 	}
 	out := make([]LiveSession, 0, len(ss))
 	for _, s := range ss {
-		out = append(out, LiveSession{Name: s.Name, Windows: s.Windows, Path: s.Path})
+		out = append(out, LiveSession{
+			Name:         s.Name,
+			Windows:      s.Windows,
+			Path:         s.Path,
+			LastAttached: parseUnix(s.LastAttached),
+			Activity:     parseUnix(s.Activity),
+			Created:      parseUnix(s.Created),
+			Attached:     s.Attached,
+		})
 	}
 	return out, nil
+}
+
+// parseUnix: tmux/gotmux often expose epoch seconds as decimal string.
+func parseUnix(s string) int64 {
+	s = strings.TrimSpace(s)
+	if s == "" || s == "0" {
+		return 0
+	}
+	// strip fractional if any
+	if i := strings.IndexByte(s, '.'); i >= 0 {
+		s = s[:i]
+	}
+	n, err := strconv.ParseInt(s, 10, 64)
+	if err != nil || n < 0 {
+		return 0
+	}
+	return n
 }
 
 func (c *Ctl) Has(name string) bool {

@@ -3,7 +3,7 @@
 [![CI](https://img.shields.io/github/actions/workflow/status/fm39hz/gotomux/ci.yml?branch=master&style=flat-square)](https://github.com/fm39hz/gotomux/actions)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg?style=flat-square)](LICENSE)
 
-**go to mux**, (yet) another fuzzy [tmux](https://github.com/tmux/tmux) session picker: live sessions, SQLite presets, optional [zoxide](https://github.com/ajeetdsouza/zoxide) paths, sticky templates, built so you stop thinking about tmux and just jump into work.
+**go to mux**, (yet) another fuzzy [tmux](https://github.com/tmux/tmux) session picker: live sessions, SQLite presets, optional [zoxide](https://github.com/ajeetdsouza/zoxide) paths, sticky templates. It help you to jump right into your work, then let tmux do its best on the rest of your workflow.
 
 ## Install
 

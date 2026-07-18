@@ -392,3 +392,29 @@ func TestPairCanonical(t *testing.T) {
 }
 
 
+
+func TestIdleMRUAndDemoteCurrent(t *testing.T) {
+	// empty query: higher Recency among Active wins; demote is applied in applyRankMeta
+	cur := Item{Kind: KindActive, Name: "here", Recency: 1000}
+	left := Item{Kind: KindActive, Name: "left", Recency: 900}
+	old := Item{Kind: KindActive, Name: "old", Recency: 100}
+	// without demote, cur first
+	got := rankItems("", []Item{old, cur, left})
+	if got[0].Name != "here" {
+		t.Fatalf("pre-demote want here first, got %s", got[0].Name)
+	}
+	by := map[string][]Item{SrcTmux: {old, cur, left}}
+	applyRankMeta(by, nil, nil, "here")
+	got = rankItems("", by[SrcTmux])
+	if got[0].Name != "left" {
+		t.Fatalf("after demote current, want left (just-left MRU), got %v", namesOf(got))
+	}
+}
+
+func namesOf(items []Item) []string {
+	var s []string
+	for _, it := range items {
+		s = append(s, it.Name)
+	}
+	return s
+}

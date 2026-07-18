@@ -93,7 +93,7 @@ func NewModel(ctl *tmux.Ctl, store *store.Store, createName, createCwd string) m
 	if store != nil && ctx != "" {
 		pairs, _ = store.PairScores(ctx, now)
 	}
-	applyRankMeta(bySrc, store, pairs)
+	applyRankMeta(bySrc, store, pairs, ctx)
 	m := model{
 		sources: srcs,
 		bySrc:   bySrc,
@@ -123,7 +123,7 @@ func (m *model) mergeSource(id string, items []Item) {
 		}
 	}
 	slot := map[string][]Item{id: items}
-	applyRankMeta(slot, m.store, m.pairs)
+	applyRankMeta(slot, m.store, m.pairs, m.ctx)
 	m.bySrc[id] = slot[id]
 }
 
@@ -416,7 +416,7 @@ func (m *model) reload() {
 	} else {
 		m.pairs = nil
 	}
-	applyRankMeta(m.bySrc, m.store, m.pairs)
+	applyRankMeta(m.bySrc, m.store, m.pairs, m.ctx)
 	m.refilter()
 }
 

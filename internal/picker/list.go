@@ -131,7 +131,10 @@ func applyUsage(items []Item, usages map[string]store.Usage, now int64) {
 			continue
 		}
 		if s := usageRecency(u, now); s > 0 {
-			items[i].Recency = s
+			// keep stronger of app frecency vs source stamp (tmux last_attached)
+			if s > items[i].Recency {
+				items[i].Recency = s
+			}
 		}
 	}
 }
