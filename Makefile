@@ -1,7 +1,7 @@
 BIN     := gotomux
 LDFLAGS := -s -w
 
-.PHONY: help build run test test-v bench install clean fmt vet
+.PHONY: help build run test test-v bench install clean fmt vet pkg pkg-install
 
 help: ## list targets
 	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN{FS=":.*?## "}; {printf "  %-12s %s\n", $$1, $$2}'
@@ -32,3 +32,11 @@ fmt: ## gofmt
 
 vet: ## go vet
 	go vet ./...
+
+pkg: ## build Arch package in dist/ (makepkg)
+	cd dist && makepkg -f --cleanbuild --skipinteg
+	@ls -1h dist/gotomux-*.pkg.tar.zst 2>/dev/null || true
+
+pkg-install: ## makepkg -si local package (needs sudo/pacman)
+	cd dist && makepkg -si --noconfirm --cleanbuild --skipinteg
+

@@ -12,3 +12,10 @@
 # local env
 .env
 .env.*
+
+# arch packaging artifacts (keep PKGBUILD)
+dist/pkg/
+dist/src/
+dist/srcpkg/
+dist/*.pkg.tar.*
+dist/*.log

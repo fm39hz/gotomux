@@ -14,6 +14,10 @@ import (
 	"github.com/fm39hz/gotomux/internal/tmux"
 )
 
+// version set by dist/PKGBUILD: -ldflags "-X main.version=..."
+var version = "dev"
+
+
 func main() {
 	if len(os.Args) > 1 {
 		switch os.Args[1] {
@@ -34,7 +38,7 @@ func main() {
 			}
 			return
 		case "-h", "--help":
-			fmt.Println(`gotomux — session picker (go to mux)
+			fmt.Printf(`gotomux — session picker (go to mux) (%s)
 
 Usage:
   gotomux              interactive picker
@@ -55,7 +59,8 @@ Keys (fzf-style combobox — type to filter anytime):
 
 Store: $XDG_DATA_HOME/gotomux/state.db
 	Template: .../templates/{default|name}.json + active sticky (ctrl-t)
-Edit format: JSON {name,cwd,windows:[{name,layout,panes:[{cwd,cmd}]}]}`)
+Edit format: JSON {name,cwd,windows:[{name,layout,panes:[{cwd,cmd}]}]}
+`, version)
 			return
 		}
 	}

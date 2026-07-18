@@ -15,6 +15,9 @@ import (
 //	w0 editor: 1 pane nvim @ root
 //	w1 test:   2 panes shell @ root and root/test
 func TestLoadGrimoireShape(t *testing.T) {
+	if testing.Short() {
+		t.Skip("live tmux")
+	}
 	ctl, err := New()
 	if err != nil {
 		t.Fatal(err)
@@ -118,6 +121,9 @@ func TestLoadGrimoireShape(t *testing.T) {
 
 // mirrors tmuxp/kho-cong.json shape
 func TestLoadKhoCongShape(t *testing.T) {
+	if testing.Short() {
+		t.Skip("live tmux")
+	}
 	ctl, err := New()
 	if err != nil {
 		t.Fatal(err)

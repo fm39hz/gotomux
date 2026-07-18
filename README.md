@@ -11,23 +11,56 @@ Create / attach sessions, freeze live layouts to SQLite, bake a default (or stic
 
 ## Install
 
+Pick one. Easiest first.
+
+### 1. `go install` (recommended if you have Go)
+
 ```bash
 go install github.com/fm39hz/gotomux@latest
 ```
 
-Binary: `$(go env GOPATH)/bin/gotomux` (keep that dir on `PATH`).
+Binary lands in `$(go env GOPATH)/bin`, put that on `PATH`.
 
-### From source
+Pin a version
+
+```bash
+go install github.com/fm39hz/gotomux@v0.1.0
+```
+
+### 2. Release binary (no Go toolchain)
+
+1. Open [Releases](https://github.com/fm39hz/gotomux/releases)
+2. Grab `gotomux_<ver>_linux_amd64.tar.gz` (or darwin / arm64)
+3. Extract and put `gotomux` on `PATH`
+
+```bash
+# example
+tar -xzf gotomux_*_linux_amd64.tar.gz
+sudo install -m755 gotomux /usr/local/bin/gotomux
+gotomux -h
+```
+
+Checksums: `checksums.txt` on the same release.
+
+### 3. Arch (local package)
 
 ```bash
 git clone https://github.com/fm39hz/gotomux.git
 cd gotomux
-go build -ldflags='-s -w' -o gotomux .
+make pkg
+sudo pacman -U dist/gotomux-*.pkg.tar.zst
 ```
 
-### Arch (AUR)
+AUR later.
 
-Later, for now build from source as above.
+### 4. From source
+
+```bash
+git clone https://github.com/fm39hz/gotomux.git
+cd gotomux
+make build    # → ./gotomux
+# or: make install
+```
 
 ## Usage
 
@@ -72,25 +105,26 @@ Sticky name: `templates/active`.
 
 List order is **lexicographic**, not a single “magic score”. Better match tier always wins over kind or usage.
 
-**Typed query** (what you type):
+| Priority | Field     | Meaning                                                   |
+| -------- | --------- | --------------------------------------------------------- |
+| 1        | `tier`    | match quality (exact → prefix → substr → fuzzy → path)    |
+| 2        | `kind`    | Create > Active > Preset > Zoxide                         |
+| 3        | `detail`  | density / position within tier                            |
+| 4        | `recency` | app frecency (opens/kills/time) or preset/zoxide fallback |
+| 5        | `cooccur` | sessions often used together with current session         |
+| 6        | `pathQ`   | shallower path preferred                                  |
 
-| Priority | Signal            | Notes                                                                        |
-| -------- | ----------------- | ---------------------------------------------------------------------------- |
-| 1        | **Match tier**    | token (exact / hyphen segment) → prefix → substring → fuzzy → path-only      |
-| 2        | **Kind**          | Active > Preset > Create > Zoxide _(within the same tier)_                   |
-| 3        | **Match detail**  | density, earlier hit, shorter leftover                                       |
-| 4        | **Frecency**      | opens with day-decay, minus kill penalty (`usage` table)                     |
-| 5        | **Co-occurrence** | sessions often opened while another is live (only if you’re already in tmux) |
-| 6        | **Path depth**    | shallower project roots preferred                                            |
-| 7        | **Stable index**  | original list order as last resort                                           |
+Empty query: kind → recency → cooccur. Typed multi-token queries are AND.
 
-- Multi-word query: **AND** (every token must match; tier = worst token).
-- Name segments: `-` / `_` / `.` / space, plus CamelCase (`API.Configuration` → `configuration`).
-- Empty query: no filter, sort by kind, then frecency / co-occur / path (Create stays easy to hit when idle).
+### Freeze / load
 
-Usage is learned quietly: each connect increments opens; `ctrl-x` records a kill. No extra UI.
+`-f` or `ctrl-f` snapshots windows/panes (cwd + detected cmd) into SQLite.
 
-### Preset JSON
+Load rebuilds with `new-session` / `new-window` / `split-window`, pins window names, restores layout (`select-layout`).
+
+### Edit format
+
+`gotomux -e` / `ctrl-e` opens pretty JSON:
 
 ```json
 {
@@ -108,28 +142,16 @@ Usage is learned quietly: each connect increments opens; `ctrl-x` records a kill
 
 `layout`: named (`even-horizontal`, …) or a tmux `window_layout` dump from freeze.
 
-### Data
+### Store
 
-```
-$XDG_DATA_HOME/gotomux/      # default ~/.local/share/gotomux
-  state.db                   # presets + usage + zoxide item cache
-  templates/
-    default.json
-    active
-```
+`$XDG_DATA_HOME/gotomux/state.db` (default `~/.local/share/gotomux/state.db`).
 
-### tmux bind example
-
-```tmux
-bind-key -n M-b display-popup -E -w 80% -h 70% "$HOME/go/bin/gotomux"
-bind-key -n C-f run-shell "$HOME/go/bin/gotomux -f >/dev/null 2>&1; tmux display-message 'froze #{session_name}'"
-```
-
-## Build / test
+## Dev
 
 ```bash
-go build -ldflags='-s -w' -o gotomux .
-go test ./...   # integration tests need a live tmux server
+make help
+make test
+make pkg          # Arch package in dist/
 ```
 
 ## License

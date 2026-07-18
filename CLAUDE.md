@@ -14,6 +14,7 @@ make run            # picker; ARGS='-f' / '-e name' / '-h'
 make test           # go test ./...
 make install        # $(go env GOPATH)/bin
 make help           # all targets
+make pkg            # Arch package → dist/*.pkg.tar.zst
 
 # raw go still fine:
 go build -o gotomux .
