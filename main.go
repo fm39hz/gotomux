@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/signal"
@@ -18,35 +19,37 @@ import (
 // version set by dist/PKGBUILD: -ldflags "-X main.version=..."
 var version = "dev"
 
-func main() {
-	// Ignore SIGINT (Ctrl+C): Bubble Tea handles ctrl+c as a key; a second
-	// SIGINT from spam must not kill the process mid-redraw (nu reports SIGINT).
-	signal.Ignore(os.Interrupt)
+// errCancel is user cancel (Esc / Ctrl+C in picker). Exit 0 — not a failure.
+var errCancel = errors.New("canceled")
 
-	if len(os.Args) > 1 {
-		switch os.Args[1] {
-		case "-f", "--freeze":
-			fname := ""
-			if len(os.Args) > 2 {
-				fname = os.Args[2]
-			}
-			if err := freezeCLI(fname); err != nil {
-				fmt.Fprintln(os.Stderr, err)
-				os.Exit(1)
-			}
-			return
-		case "-e", "--edit":
-			name := ""
-			if len(os.Args) > 2 {
-				name = os.Args[2]
-			}
-			if err := editCLI(name); err != nil {
-				fmt.Fprintln(os.Stderr, err)
-				os.Exit(1)
-			}
-			return
-		case "-h", "--help":
-			fmt.Printf(`gotomux — session picker (go to mux) (%s)
+func main() {
+	err := dispatch()
+	if err == nil || errors.Is(err, errCancel) {
+		os.Exit(0)
+	}
+	fmt.Fprintln(os.Stderr, err)
+	os.Exit(1)
+}
+
+func dispatch() error {
+	if len(os.Args) < 2 {
+		return runPicker()
+	}
+	switch os.Args[1] {
+	case "-f", "--freeze":
+		name := ""
+		if len(os.Args) > 2 {
+			name = os.Args[2]
+		}
+		return freezeCLI(name)
+	case "-e", "--edit":
+		name := ""
+		if len(os.Args) > 2 {
+			name = os.Args[2]
+		}
+		return editCLI(name)
+	case "-h", "--help":
+		fmt.Printf(`gotomux — session picker (go to mux) (%s)
 
 Usage:
   gotomux              interactive picker
@@ -63,30 +66,28 @@ Keys (fzf-style combobox — type to filter anytime):
   ctrl-d        delete preset
   ctrl-t        sticky shape from selection (create/zox use it)
   ctrl-u        clear query
-  esc           quit
+  esc / ctrl-c  cancel (exit 0)
 
 Store: $XDG_DATA_HOME/gotomux/state.db  (presets, shapes, sticky, usage)
-	Optional seed: $XDG_CONFIG_HOME/gotomux/layouts/*.json
+	Layouts: $XDG_CONFIG_HOME/gotomux/layouts/<id>.json (1-1 backup)
 Edit format: JSON {name,cwd,windows:[{name,layout,panes:[{cwd,cmd}]}]}
 `, version)
-			return
-		}
-	}
-
-	if err := run(); err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
+		return nil
+	default:
+		return fmt.Errorf("unknown flag %q (try -h)", os.Args[1])
 	}
 }
 
-func run() error {
+// runPicker: interactive phase owns SIGINT → cancel = errCancel (exit 0).
+// After Enter, SIGINT is released before connect so a stuck attach can be killed.
+func runPicker() error {
 	ctl, err := tmux.New()
 	if err != nil {
-		return err
+		return fmt.Errorf("tmux: %w", err)
 	}
 	st, err := store.Open()
 	if err != nil {
-		return err
+		return fmt.Errorf("open store: %w", err)
 	}
 	defer st.Close()
 	picker.BindStore(st)
@@ -103,8 +104,28 @@ func run() error {
 	if err != nil {
 		return err
 	}
+
+	// --- phase: picker owns SIGINT ---
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt)
 	p := tea.NewProgram(m, opts...)
-	final, err := p.Run()
+
+	// SIGINT → same intent as Esc / ctrl+c key: quit without connect.
+	sigDone := make(chan struct{})
+	go func() {
+		select {
+		case <-sigCh:
+			p.Quit()
+		case <-sigDone:
+		}
+	}()
+
+	final, runErr := p.Run()
+	close(sigDone)
+	signal.Stop(sigCh)
+	// drain any pending SIGINT so disposition is clean for shell after exit
+	drainSignals(sigCh)
+
 	if fm, ok := final.(interface {
 		Done() picker.Result
 		FrameLines() int
@@ -112,16 +133,40 @@ func run() error {
 		if !alt {
 			picker.ClearInline(fm.FrameLines())
 		}
-		if err != nil {
-			return err
+		// cancel intents → exit 0
+		if runErr != nil {
+			if errors.Is(runErr, tea.ErrInterrupted) {
+				return errCancel
+			}
+			return runErr
 		}
 		res := fm.Done()
-		if res.Action != picker.ActionConnect {
-			return nil
+		switch res.Action {
+		case picker.ActionConnect:
+			// --- phase: connect — SIGINT back to default (user may kill stuck attach) ---
+			return connectItem(ctl, st, res.Item)
+		default:
+			// ActionQuit / ActionNone = user cancel
+			return errCancel
 		}
-		return connectItem(ctl, st, res.Item)
 	}
-	return err
+	if runErr != nil {
+		if errors.Is(runErr, tea.ErrInterrupted) {
+			return errCancel
+		}
+		return runErr
+	}
+	return errCancel
+}
+
+func drainSignals(ch <-chan os.Signal) {
+	for {
+		select {
+		case <-ch:
+		default:
+			return
+		}
+	}
 }
 
 func connectItem(ctl *tmux.Ctl, st *store.Store, it picker.Item) error {
@@ -166,6 +211,7 @@ func connectItem(ctl *tmux.Ctl, st *store.Store, it picker.Item) error {
 	return nil
 }
 
+// freezeCLI: pick/resolve name freely (cancel = exit 0); hold SIGINT only for ACID write.
 func freezeCLI(name string) error {
 	ctl, err := tmux.New()
 	if err != nil {
@@ -193,15 +239,23 @@ func freezeCLI(name string) error {
 			items = append(items, s.Name)
 		}
 		name, err = picker.Pick(items)
-		if err != nil || name == "" {
+		if err != nil {
 			return err
 		}
+		if name == "" {
+			return errCancel
+		}
 	}
+
+	// --- ACID: freeze + save must not be half-killed by SIGINT spam ---
+	stop := holdSIGINT()
 	p, err := ctl.Freeze(name)
 	if err != nil {
+		stop()
 		return fmt.Errorf("freeze %q: %w", name, err)
 	}
 	sid, created, err := template.FreezeSave(st, p, false)
+	stop()
 	if err != nil {
 		return fmt.Errorf("save freeze %q: %w", name, err)
 	}
@@ -222,6 +276,7 @@ func freezeCLI(name string) error {
 }
 
 func editCLI(name string) error {
+	// Editor owns TTY/signals while running; only hold SIGINT around setup/save.
 	st, err := store.Open()
 	if err != nil {
 		return fmt.Errorf("open store: %w", err)
@@ -229,7 +284,6 @@ func editCLI(name string) error {
 	defer st.Close()
 
 	ctl, ctlErr := tmux.New()
-	// Prefer explicit name; else current tmux session (run-shell has no TTY for pick).
 	if name == "" && ctlErr == nil && ctl != nil {
 		name = ctl.CurrentSession()
 	}
@@ -243,21 +297,49 @@ func editCLI(name string) error {
 		return nil
 	}
 
-	// no preset yet → freeze into DB first
 	if _, err := st.Get(name); err != nil {
 		if ctlErr != nil {
 			return fmt.Errorf("preset %q not found and tmux unavailable: %v", name, ctlErr)
 		}
+		stop := holdSIGINT()
 		p, err := ctl.Freeze(name)
 		if err != nil {
+			stop()
 			return fmt.Errorf("freeze %q for edit: %w", name, err)
 		}
 		if _, _, err := template.FreezeSave(st, p, false); err != nil {
+			stop()
 			return fmt.Errorf("save freeze for edit: %w", err)
 		}
+		stop()
 	}
+	// Editor phase: default SIGINT (user cancels inside nvim)
 	if err := template.Edit(st, name, picker.Pick); err != nil {
 		return fmt.Errorf("edit %q: %w", name, err)
 	}
 	return nil
 }
+
+// holdSIGINT prevents default terminate during a short critical section (freeze tx).
+// Stop restores default when the section ends.
+func holdSIGINT() (stop func()) {
+	ch := make(chan os.Signal, 1)
+	signal.Notify(ch, os.Interrupt)
+	done := make(chan struct{})
+	go func() {
+		for {
+			select {
+			case <-ch:
+				// discard — critical section must finish ACID
+			case <-done:
+				return
+			}
+		}
+	}()
+	return func() {
+		signal.Stop(ch)
+		close(done)
+		drainSignals(ch)
+	}
+}
+

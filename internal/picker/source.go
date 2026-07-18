@@ -244,15 +244,13 @@ func applyRankMeta(bySrc map[string][]Item, st *store.Store, pairs map[string]in
 			applyUsage(items, us, now)
 		}
 		applyCooccur(items, pairs)
-		// Inside tmux, idle list: demote the session you are already on so
-		// "just left" / other MRU actives surface first (smart-pane style).
+		// Inside tmux, idle list: current session is where you already are.
+		// Zero its recency so "just left" (highest last_attached) and other
+		// MRU actives surface first. Kind stays Active so typed match still works.
 		if ctxSession != "" && id == SrcTmux {
 			for i := range items {
 				if items[i].Name == ctxSession && items[i].Kind == KindActive {
-					// keep kind Active but push below other actives with real recency
-					if items[i].Recency > 0 {
-						items[i].Recency = items[i].Recency / 4
-					}
+					items[i].Recency = 0
 				}
 			}
 		}
