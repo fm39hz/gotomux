@@ -100,7 +100,7 @@ func NewModel(ctl *tmux.Ctl, store *store.Store, createName, createCwd string) m
 		ctl:     ctl,
 		store:   store,
 		maxShow: 12,
-		tmpl:    template.ReadActiveName(),
+		tmpl:    template.ReadSticky(store),
 		started: time.Now(),
 		ctx:     ctx,
 		pairs:   pairs,
@@ -193,30 +193,47 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.help = !m.help
 			return m, nil
 
-		case "ctrl+t": // sticky template from preset; else reset default
+		case "ctrl+t": // sticky ← shape from selection; Create/Zox use it
 			if len(m.view) > 0 {
 				it := m.view[m.cursor]
-				if it.Kind == KindPreset {
-					p, err := m.store.Get(it.Name)
-					if err != nil {
+				var p *store.Preset
+				var err error
+				switch it.Kind {
+				case KindPreset:
+					p, err = m.store.Get(it.Name)
+				case KindActive:
+					p, err = m.ctl.Freeze(it.Name)
+				default:
+					if err := template.ResetActive(m.store); err != nil {
 						m.status = err.Error()
-						return m, nil
+					} else {
+						m.tmpl = "default"
+						m.status = "sticky: default"
 					}
-					name, err := template.SetActiveFromPreset(p)
-					if err != nil {
-						m.status = err.Error()
-						return m, nil
-					}
-					m.tmpl = name
-					m.status = "tmpl: " + name + "  (create/zoxide use this)"
 					return m, nil
 				}
+				if err != nil {
+					m.status = err.Error()
+					return m, nil
+				}
+				id, created, err := template.StickFrom(m.store, p)
+				if err != nil {
+					m.status = err.Error()
+					return m, nil
+				}
+				m.tmpl = id
+				if created {
+					m.status = "sticky ← " + it.Name + "  (new)"
+				} else {
+					m.status = "sticky ← " + it.Name
+				}
+				return m, nil
 			}
-			if err := template.ResetActive(); err != nil {
+			if err := template.ResetActive(m.store); err != nil {
 				m.status = err.Error()
 			} else {
 				m.tmpl = "default"
-				m.status = "tmpl: default"
+				m.status = "sticky: default"
 			}
 			return m, nil
 
@@ -277,40 +294,69 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m, nil
 
-		case "ctrl+f": // freeze live session → overwrite preset
+		case "ctrl+f": // freeze instance + remember pure shape (dedupe)
 			if len(m.view) > 0 {
 				it := m.view[m.cursor]
 				name := it.Name
-				// Active always live; Preset freezes only if session currently exists
 				if it.Kind == KindActive || (it.Kind == KindPreset && m.ctl.Has(name)) {
 					p, err := m.ctl.Freeze(name)
 					if err != nil {
 						m.status = err.Error()
-					} else if err := m.store.Save(p); err != nil {
+						return m, nil
+					}
+					sid, created, err := template.FreezeSave(m.store, p, false)
+					if err != nil {
 						m.status = err.Error()
+						return m, nil
+					}
+					if created {
+						m.status = "froze " + name + " · shape " + sid
+					} else if sid != "" {
+						m.status = "froze " + name + " · shape " + sid + " (exists)"
 					} else {
 						m.status = "froze " + name
-						m.reload()
 					}
+					m.reload()
 				} else if it.Kind == KindPreset {
 					m.status = "session not running — attach first"
 				}
 			}
 			return m, nil
 
-		case "ctrl+e": // edit preset in $EDITOR
-			if len(m.view) > 0 {
-				it := m.view[m.cursor]
-				if it.Kind == KindPreset {
-					cmd, err := m.beginEdit(it.Name)
-					if err != nil {
-						m.status = err.Error()
-						return m, nil
-					}
-					// wipe inline frame before ReleaseTerminal — else editor return duplicates UI
-					ClearInline(m.FrameLines())
-					return m, cmd
+		case "ctrl+e": // edit preset (Active: freeze to preset first)
+			if len(m.view) == 0 {
+				return m, nil
+			}
+			it := m.view[m.cursor]
+			switch it.Kind {
+			case KindActive:
+				// ensure instance row exists so edit has something to open
+				p, err := m.ctl.Freeze(it.Name)
+				if err != nil {
+					m.status = err.Error()
+					return m, nil
 				}
+				if _, _, err := template.FreezeSave(m.store, p, false); err != nil {
+					m.status = err.Error()
+					return m, nil
+				}
+				cmd, err := m.beginEdit(it.Name)
+				if err != nil {
+					m.status = err.Error()
+					return m, nil
+				}
+				ClearInline(m.FrameLines())
+				return m, cmd
+			case KindPreset:
+				cmd, err := m.beginEdit(it.Name)
+				if err != nil {
+					m.status = err.Error()
+					return m, nil
+				}
+				ClearInline(m.FrameLines())
+				return m, cmd
+			default:
+				m.status = "edit: pick Active or Preset"
 			}
 			return m, nil
 
@@ -412,19 +458,7 @@ func (m *model) beginEdit(name string) (tea.Cmd, error) {
 	m.editPath = path
 	m.editOld = name
 
-	ed := os.Getenv("EDITOR")
-	if ed == "" {
-		ed = os.Getenv("VISUAL")
-	}
-	if ed == "" {
-		ed = "nvim"
-	}
-	var c *exec.Cmd
-	if fields := strings.Fields(ed); len(fields) > 1 {
-		c = exec.Command(fields[0], append(fields[1:], path)...)
-	} else {
-		c = exec.Command(ed, path)
-	}
+	c := editorCmd(path)
 	c.Stdin = os.Stdin
 	c.Stdout = os.Stdout
 	c.Stderr = os.Stderr
@@ -452,6 +486,26 @@ func (m *model) beginEdit(name string) (tea.Cmd, error) {
 		}
 		return editDoneMsg{name: np.Name}
 	}), nil
+}
+
+
+// editorCmd opens path in $EDITOR, or nvim --server $NVIM when already inside nvim.
+func editorCmd(path string) *exec.Cmd {
+	if srv := os.Getenv("NVIM"); srv != "" {
+		// open in existing nvim (new buffer); wait until buffer wiped/closed via --remote-wait
+		return exec.Command("nvim", "--server", srv, "--remote-wait", path)
+	}
+	ed := os.Getenv("EDITOR")
+	if ed == "" {
+		ed = os.Getenv("VISUAL")
+	}
+	if ed == "" {
+		ed = "nvim"
+	}
+	if fields := strings.Fields(ed); len(fields) > 1 {
+		return exec.Command(fields[0], append(fields[1:], path)...)
+	}
+	return exec.Command(ed, path)
 }
 
 func trimLastWord(s string) string {

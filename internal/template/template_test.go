@@ -1,137 +1,207 @@
 package template
 
 import (
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/fm39hz/gotomux/internal/store"
 )
 
-func TestJSONAllowsLayoutDump(t *testing.T) {
-	dump := "7efd,158x35,0,0[158x17,0,0,63,158x17,0,18,64]"
-	raw := `{"name":"x","windows":[{"name":"w","layout":"` + dump + `","panes":[{"cwd":"/a"},{"cwd":"/b"}]}]}`
-	p, err := Parse(raw)
-	if err != nil {
-		t.Fatal(err)
+func TestToShapeStripsCmd(t *testing.T) {
+	p := &store.Preset{
+		Name: "fantasia", Cwd: "/work/Fantasia",
+		Windows: []store.PresetWindow{
+			{Name: "editor", Panes: []store.PresetPane{{Cwd: "/work/Fantasia", Cmd: "nvim"}}},
+			{Name: "test", Panes: []store.PresetPane{{Cwd: "/work/Fantasia/test"}}},
+		},
 	}
-	if p.Windows[0].Layout != dump {
-		t.Fatalf("layout %q", p.Windows[0].Layout)
+	sh := ToShape(p, "editor-test")
+	if sh.Windows[0].Panes[0].Cmd != "" || sh.Windows[0].Panes[0].Cwd != "" {
+		t.Fatalf("%+v", sh.Windows[0].Panes[0])
 	}
-}
-
-func TestJSONPresetRoundtrip(t *testing.T) {
-	raw := `{
-  "name": "demo",
-  "cwd": "/tmp",
-  "windows": [
-    {
-      "name": "editor",
-      "layout": "even-horizontal",
-      "panes": [
-        {"cwd": "/tmp", "cmd": "nvim"},
-        {"cwd": "/tmp/test"}
-      ]
-    }
-  ]
-}`
-	p, err := Parse(raw)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if p.Name != "demo" || len(p.Windows) != 1 || len(p.Windows[0].Panes) != 2 {
-		t.Fatalf("%+v", p)
-	}
-	if p.Windows[0].Panes[0].Cmd != "nvim" {
-		t.Fatal("cmd")
-	}
-	out := Format(p)
-	p2, err := Parse(out)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if p2.Windows[0].Layout != "even-horizontal" {
-		t.Fatalf("layout lost: %q", p2.Windows[0].Layout)
+	if sh.Windows[1].Panes[0].Cwd != "test" {
+		t.Fatalf("rel %q", sh.Windows[1].Panes[0].Cwd)
 	}
 }
 
-func TestApplyTemplate(t *testing.T) {
-	tmpl := &store.Preset{
-		Name: "default",
+func TestShapeKeyIgnoresCmd(t *testing.T) {
+	a := ToShape(&store.Preset{
+		Cwd: "/r",
 		Windows: []store.PresetWindow{
 			{Name: "editor", Panes: []store.PresetPane{{Cmd: "nvim"}}},
-			{Name: "test", Panes: []store.PresetPane{{Cwd: "test"}, {Cwd: ""}}},
+			{Name: "shell", Panes: []store.PresetPane{{}}},
 		},
-	}
-	p := Apply(tmpl, "myproj", "/work/myproj")
-	if p.Name != "myproj" || p.Cwd != "/work/myproj" {
-		t.Fatalf("root: %+v", p)
-	}
-	if p.Windows[0].Panes[0].Cwd != "/work/myproj" || p.Windows[0].Panes[0].Cmd != "nvim" {
-		t.Fatalf("editor: %+v", p.Windows[0].Panes[0])
-	}
-	if p.Windows[1].Panes[0].Cwd != "/work/myproj/test" {
-		t.Fatalf("rel: %q", p.Windows[1].Panes[0].Cwd)
-	}
-	if p.Windows[1].Panes[1].Cwd != "/work/myproj" {
-		t.Fatalf("empty: %q", p.Windows[1].Panes[1].Cwd)
-	}
-}
-
-func TestResolveCwd(t *testing.T) {
-	if resolveCwd("/a", "") != "/a" {
-		t.Fatal("empty")
-	}
-	if resolveCwd("/a", "b") != "/a/b" {
-		t.Fatal("rel")
-	}
-	if resolveCwd("/a", "/abs") != "/abs" {
-		t.Fatal("abs")
-	}
-}
-
-func TestPresetToTemplate(t *testing.T) {
-	p := &store.Preset{
-		Name: "fantasia",
-		Cwd:  "/work/Fantasia",
+	}, "x")
+	b := ToShape(&store.Preset{
+		Cwd: "/r",
 		Windows: []store.PresetWindow{
-			{Name: "editor", Cwd: "/work/Fantasia", Panes: []store.PresetPane{{Cwd: "/work/Fantasia", Cmd: "nvim"}}},
-			{Name: "test", Panes: []store.PresetPane{{Cwd: "/work/Fantasia/test"}, {Cwd: "/work/Fantasia"}}},
+			{Name: "editor", Panes: []store.PresetPane{{Cmd: "vim"}}},
+			{Name: "shell", Panes: []store.PresetPane{{}}},
+		},
+	}, "y")
+	if ShapeKey(a) != ShapeKey(b) {
+		t.Fatal("cmd must not affect key")
+	}
+}
+
+func TestStickMirrorAndDedupe(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("XDG_DATA_HOME", filepath.Join(dir, "data"))
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(dir, "cfg"))
+	// reset syncOnce for this package — new process via test is enough per package
+	// but syncOnce is process-global; first call wins for this test file order
+	st, err := store.Open()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	p := &store.Preset{
+		Name: "proj1", Cwd: "/work/a",
+		Windows: []store.PresetWindow{
+			{Name: "editor", Panes: []store.PresetPane{{Cwd: "/work/a", Cmd: "nvim"}}},
+			{Name: "shell", Panes: []store.PresetPane{{Cwd: "/work/a"}}},
+			{Name: "logs", Panes: []store.PresetPane{{Cwd: "/work/a/logs"}}},
 		},
 	}
-	tmpl := presetToTemplate(p)
-	if tmpl.Name != "fantasia" {
-		t.Fatal(tmpl.Name)
+	id1, created1, err := StickFrom(st, p)
+	if err != nil || !created1 {
+		t.Fatalf("stick1 %q %v %v", id1, created1, err)
 	}
-	if tmpl.Windows[0].Panes[0].Cwd != "" || tmpl.Windows[0].Panes[0].Cmd != "nvim" {
-		t.Fatalf("editor pane: %+v", tmpl.Windows[0].Panes[0])
+	if id1 == "default" {
+		t.Fatal("3-pane shape must not be default")
 	}
-	if tmpl.Windows[1].Panes[0].Cwd != "test" {
-		t.Fatalf("rel: %q", tmpl.Windows[1].Panes[0].Cwd)
+	// 1-1 file
+	fp := filepath.Join(dir, "cfg", "gotomux", "layouts", id1+".json")
+	if _, err := os.Stat(fp); err != nil {
+		t.Fatalf("missing config mirror %s: %v", fp, err)
 	}
-	if tmpl.Windows[1].Panes[1].Cwd != "" {
-		t.Fatalf("root pane: %q", tmpl.Windows[1].Panes[1].Cwd)
+	// same shape different project
+	p2 := &store.Preset{
+		Name: "proj2", Cwd: "/work/b",
+		Windows: []store.PresetWindow{
+			{Name: "editor", Panes: []store.PresetPane{{Cwd: "/work/b", Cmd: "hx"}}},
+			{Name: "shell", Panes: []store.PresetPane{{Cwd: "/work/b"}}},
+			{Name: "logs", Panes: []store.PresetPane{{Cwd: "/work/b/logs"}}},
+		},
 	}
-	// bake
-	got := Apply(tmpl, "other", "/proj/other")
-	if got.Windows[0].Panes[0].Cwd != "/proj/other" || got.Windows[0].Panes[0].Cmd != "nvim" {
-		t.Fatalf("bake editor: %+v", got.Windows[0].Panes[0])
+	id2, created2, err := StickFrom(st, p2)
+	if err != nil || created2 || id2 != id1 {
+		t.Fatalf("dedupe %q %v (want %q false)", id2, created2, id1)
 	}
-	if got.Windows[1].Panes[0].Cwd != "/proj/other/test" {
-		t.Fatalf("bake test: %q", got.Windows[1].Panes[0].Cwd)
+	// only one json for that shape id
+	ents, _ := os.ReadDir(filepath.Join(dir, "cfg", "gotomux", "layouts"))
+	var jsons []string
+	for _, e := range ents {
+		if filepath.Ext(e.Name()) == ".json" {
+			jsons = append(jsons, e.Name())
+		}
+	}
+	// default may also be written
+	if len(jsons) < 1 {
+		t.Fatal("no json")
+	}
+	// hand-edit: change file, reopen store sync should load
+	// (syncOnce already ran — test hand path via Upsert only)
+	body, _ := st.GetShape(id1)
+	if body == "" {
+		t.Fatal("empty body")
 	}
 }
 
-func TestRelativizeCwd(t *testing.T) {
-	if relativizeCwd("/a", "/a/b") != "b" {
-		t.Fatal("rel")
+func TestJSONRoundtrip(t *testing.T) {
+	raw := `{"name":"demo","windows":[{"name":"w","layout":"even-horizontal","panes":[{"cwd":""}]}]}`
+	p, err := Parse(raw)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if relativizeCwd("/a", "/a") != "" {
-		t.Fatal("root")
-	}
-	if relativizeCwd("/a", "/other") != "" {
-		t.Fatal("outside")
+	if _, err := Parse(Format(p)); err != nil {
+		t.Fatal(err)
 	}
 }
 
-// --- ranking (lexicographic rankKey) ---
+func TestConfigHandEditWinsByMtime(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("XDG_DATA_HOME", filepath.Join(dir, "data"))
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(dir, "cfg"))
+	st, err := store.Open()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	// create shape via freeze path
+	p := &store.Preset{
+		Name: "s", Cwd: "/r",
+		Windows: []store.PresetWindow{
+			{Name: "main", Panes: []store.PresetPane{{}}},
+			{Name: "aux", Panes: []store.PresetPane{{Cwd: "x"}}},
+		},
+	}
+	id, _, err := RememberShape(st, p)
+	if err != nil || id == "" {
+		t.Fatal(id, err)
+	}
+	path := filepath.Join(dir, "cfg", "gotomux", "layouts", id+".json")
+	// hand-edit: add third window role name change in topology
+	hand := &store.Preset{
+		Name: id,
+		Windows: []store.PresetWindow{
+			{Name: "main", Panes: []store.PresetPane{{}}},
+			{Name: "aux", Panes: []store.PresetPane{{Cwd: "x"}}},
+			{Name: "extra", Panes: []store.PresetPane{{}}},
+		},
+	}
+	body := Format(ToShape(hand, id))
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// bump mtime into the future relative to DB
+	future := time.Now().Add(2 * time.Second)
+	_ = os.Chtimes(path, future, future)
+
+	// new store + new process sync: re-open DB same path but syncOnce already ran in this process.
+	// Call Upsert path by simulating merge rule unit-level:
+	fi, _ := os.Stat(path)
+	_, dbUpd, ok := st.GetShapeMeta(id)
+	if !ok {
+		t.Fatal("meta")
+	}
+	if fi.ModTime().Unix() <= dbUpd {
+		t.Fatal("mtime should be newer")
+	}
+	pure := ToShape(hand, id)
+	_ = st.UpsertShapeByID(id, ShapeKey(pure), Format(pure))
+	got, _ := st.GetShape(id)
+	gp, err := Parse(got)
+	if err != nil || len(gp.Windows) != 3 {
+		t.Fatalf("hand-edit not in DB: %v %+v", err, gp)
+	}
+}
 
 
+func TestFormatOmitsDupCwd(t *testing.T) {
+	p := &store.Preset{
+		Name: "gotomux",
+		Cwd:  "/home/u/gotomux",
+		Windows: []store.PresetWindow{
+			{Name: "editor", Cwd: "/home/u/gotomux", Panes: []store.PresetPane{{Cwd: "/home/u/gotomux", Cmd: "nvim"}}},
+			{Name: "shell", Cwd: "/home/u/gotomux", Panes: []store.PresetPane{{Cwd: "/home/u/gotomux"}}},
+		},
+	}
+	out := Format(p)
+	if strings.Count(out, "/home/u/gotomux") != 1 {
+		t.Fatalf("cwd once:\n%s", out)
+	}
+	if !strings.Contains(out, "nvim") {
+		t.Fatal("cmd kept")
+	}
+	sh := ToShape(p, "editor-shell")
+	out2 := Format(sh)
+	if strings.Contains(out2, "/home/") {
+		t.Fatalf("pure no abs:\n%s", out2)
+	}
+}

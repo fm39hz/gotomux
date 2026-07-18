@@ -63,3 +63,44 @@ func TestSessionAliasKey(t *testing.T) {
 	}
 }
 
+
+func TestSaveFreezeAtomic(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("XDG_DATA_HOME", dir)
+	st, err := Open()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	p := &Preset{
+		Name: "zz-acid",
+		Cwd:  "/tmp/zz-acid",
+		Windows: []PresetWindow{
+			{Name: "w", Panes: []PresetPane{{Cwd: "/tmp/zz-acid", Cmd: "true"}}},
+		},
+	}
+	// pure shape body minimal
+	body := `{"name":"w","windows":[{"name":"w","panes":[{"cwd":""}]}]}`
+	sid, created, err := st.SaveFreeze(p, "w", "keyacid01", body, true)
+	if err != nil || !created || sid == "" {
+		t.Fatalf("savefreeze %q %v %v", sid, created, err)
+	}
+	if _, err := st.Get("zz-acid"); err != nil {
+		t.Fatal("preset missing after commit")
+	}
+	if st.StickyID() != sid {
+		t.Fatalf("sticky %q want %q", st.StickyID(), sid)
+	}
+	// same key again: no new shape, preset still updates
+	p.Windows[0].Panes[0].Cmd = "false"
+	sid2, created2, err := st.SaveFreeze(p, "w", "keyacid01", body, false)
+	if err != nil || created2 || sid2 != sid {
+		t.Fatalf("dedupe %q %v %v", sid2, created2, err)
+	}
+	got, _ := st.Get("zz-acid")
+	if got.Windows[0].Panes[0].Cmd != "false" {
+		t.Fatal("preset not updated")
+	}
+	_ = st.Delete("zz-acid")
+}

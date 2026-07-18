@@ -52,34 +52,44 @@ type paneJSON struct {
 	Cmd string `json:"cmd,omitempty"`
 }
 
+// Format writes compact JSON for edit/hand-edit.
+// Omits cwd when it equals session root (or empty for pure shapes).
+// Pure shapes (no abs root): empty pane cwd omitted; cmds stripped by ToShape before Format.
 func Format(p *store.Preset) string {
-	j := presetJSON{Name: p.Name, Cwd: p.Cwd}
+	root := p.Cwd
+	j := presetJSON{Name: p.Name}
+	if root != "" {
+		j.Cwd = root
+	}
 	for _, w := range p.Windows {
 		wj := windowJSON{
 			Name:   w.Name,
-			Cwd:    w.Cwd,
 			Layout: tmux.LayoutForStore(w.Layout, len(w.Panes)),
 		}
-		if len(w.Panes) == 0 {
-			cwd := w.Cwd
+		// window cwd only if different from session root
+		if w.Cwd != "" && w.Cwd != root {
+			wj.Cwd = w.Cwd
+		}
+		panes := w.Panes
+		if len(panes) == 0 {
+			panes = []store.PresetPane{{}}
+		}
+		for _, pn := range panes {
+			pj := paneJSON{Cmd: pn.Cmd}
+			cwd := pn.Cwd
 			if cwd == "" {
-				cwd = p.Cwd
+				cwd = w.Cwd
 			}
-			wj.Panes = []paneJSON{{Cwd: cwd}}
-		} else {
-			for _, pn := range w.Panes {
-				cwd := pn.Cwd
-				if cwd == "" {
-					cwd = w.Cwd
-				}
-				wj.Panes = append(wj.Panes, paneJSON{Cwd: cwd, Cmd: pn.Cmd})
+			// omit cwd when same as session root or empty (shape relative "")
+			if cwd != "" && cwd != root {
+				pj.Cwd = cwd
 			}
+			wj.Panes = append(wj.Panes, pj)
 		}
 		j.Windows = append(j.Windows, wj)
 	}
 	b, err := json.MarshalIndent(j, "", "  ")
 	if err != nil {
-		// should not happen for plain strings
 		return fmt.Sprintf(`{"name":%q}`, p.Name)
 	}
 	return string(b) + "\n"
@@ -180,22 +190,11 @@ func Edit(st *store.Store, name string, pick func([]string) (string, error)) err
 	}
 	tmp.Close()
 
-	editor := os.Getenv("EDITOR")
-	if editor == "" {
-		editor = os.Getenv("VISUAL")
+	cmd := editorCommand(path)
+	// editorCommand already attaches /dev/tty when present (tmux run-shell / popup)
+	if cmd.Stdin == nil {
+		cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
 	}
-	if editor == "" {
-		editor = "nvim"
-	}
-	var cmd *exec.Cmd
-	if fields := strings.Fields(editor); len(fields) > 1 {
-		cmd = exec.Command(fields[0], append(fields[1:], path)...)
-	} else {
-		cmd = exec.Command(editor, path)
-	}
-	cmd.Stdin = os.Stdin
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("editor: %w", err)
 	}
@@ -217,4 +216,31 @@ func Edit(st *store.Store, name string, pick func([]string) (string, error)) err
 	outDir, _ := store.DataDir()
 	fmt.Println("saved", np.Name, "→", filepath.Join(outDir, "state.db"))
 	return nil
+}
+
+func editorCommand(path string) *exec.Cmd {
+	var cmd *exec.Cmd
+	if srv := os.Getenv("NVIM"); srv != "" {
+		cmd = exec.Command("nvim", "--server", srv, "--remote-wait", path)
+	} else {
+		ed := os.Getenv("EDITOR")
+		if ed == "" {
+			ed = os.Getenv("VISUAL")
+		}
+		if ed == "" {
+			ed = "nvim"
+		}
+		if fields := strings.Fields(ed); len(fields) > 1 {
+			cmd = exec.Command(fields[0], append(fields[1:], path)...)
+		} else {
+			cmd = exec.Command(ed, path)
+		}
+	}
+	// tmux run-shell: stdin is not a TTY — attach controlling terminal when possible
+	if tty, err := os.OpenFile("/dev/tty", os.O_RDWR, 0); err == nil {
+		cmd.Stdin = tty
+		cmd.Stdout = tty
+		cmd.Stderr = tty
+	}
+	return cmd
 }

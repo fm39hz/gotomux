@@ -29,10 +29,12 @@ make pkg       # Arch: dist/*.pkg.tar.zst
 ```tmux
 # adjust path if needed
 bind-key C-b display-popup -E -w 80% -h 70% "$HOME/go/bin/gotomux"
+bind-key C-e display-popup -E -w 90% -h 90% "$HOME/go/bin/gotomux -e"
 bind-key -n C-f run-shell "$HOME/go/bin/gotomux -f >/dev/null 2>&1; tmux display-message 'Froze #{session_name}'"
 ```
 
-`tmux source-file` your config. `M-b` = picker (popup, tmux 3.2+), `C-f` = freeze current session.
+`tmux source-file` your config.  
+`C-b` = picker, `C-f` = freeze, `C-e` = edit current session preset (`-e` defaults to `#{session_name}` inside tmux).
 
 CLI:
 
@@ -53,19 +55,19 @@ gotomux -h
 | `ctrl-x`            | kill active                 |
 | `ctrl-f`            | freeze → preset             |
 | `ctrl-e` / `ctrl-d` | edit / delete preset        |
-| `ctrl-t`            | sticky template from preset |
+| `ctrl-t`            | sticky shape from selection |
 | `?` / `esc`         | help / quit                 |
 
 ### Behaviour
 
-| Item            | Enter                                                    |
-| --------------- | -------------------------------------------------------- |
-| Active          | attach / switch                                          |
-| Preset          | load if missing, then attach                             |
-| Create / Zoxide | live → same-name preset → sticky template @ project root |
+| Item            | Enter                                                 |
+| --------------- | ----------------------------------------------------- |
+| Active          | attach / switch                                       |
+| Preset          | load if missing, then attach                          |
+| Create / Zoxide | live → same-name preset → sticky shape @ project root |
 
-Presets: `$XDG_DATA_HOME/gotomux/state.db`  
-Templates: `…/templates/{default,name}.json` + sticky `active`
+State: `$XDG_DATA_HOME/gotomux/state.db` (presets · shapes · sticky · usage)  
+Layouts: `$XDG_CONFIG_HOME/gotomux/layouts/<id>.json`, 1-1 reflect with DB (backup / git / hand-edit)
 
 ## Roadmap
 

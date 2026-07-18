@@ -247,6 +247,27 @@ CREATE TABLE IF NOT EXISTS zox_item (
 );`); err != nil {
 		return err
 	}
+	if _, err = s.db.Exec(`
+CREATE TABLE IF NOT EXISTS shape (
+  id         TEXT PRIMARY KEY,
+  key        TEXT NOT NULL UNIQUE,
+  body       TEXT NOT NULL,
+  created_at INTEGER NOT NULL DEFAULT 0,
+  updated_at INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS sticky (
+  id       INTEGER PRIMARY KEY CHECK (id = 1),
+  shape_id TEXT NOT NULL DEFAULT 'default'
+);`); err != nil {
+		return err
+	}
+	// old DBs: shape without updated_at (CREATE IF NOT EXISTS does not alter)
+	var shapeHasUpdated int
+	_ = s.db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('shape') WHERE name='updated_at'`).Scan(&shapeHasUpdated)
+	if shapeHasUpdated == 0 {
+		_, _ = s.db.Exec(`ALTER TABLE shape ADD COLUMN updated_at INTEGER NOT NULL DEFAULT 0`)
+		_, _ = s.db.Exec(`UPDATE shape SET updated_at = created_at WHERE updated_at = 0`)
+	}
 	_, err = s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_session_last_used ON session(last_used DESC)`)
 	return err
 }
@@ -350,6 +371,9 @@ func (s *Store) Get(name string) (*Preset, error) {
 }
 
 func (s *Store) Save(p *Preset) error {
+	if p == nil {
+		return fmt.Errorf("nil preset")
+	}
 	if !project.ValidSessionName(p.Name) {
 		return fmt.Errorf("invalid session name %q", p.Name)
 	}
@@ -358,50 +382,12 @@ func (s *Store) Save(p *Preset) error {
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
-
-	now := time.Now().Unix()
-	// Replace any prior row for this freeze: exact name, same project cwd, or
-	// legacy alias (tmuxproject vs tmux-project after sanitize change).
-	if err := deleteSessionsForSave(tx, p.Name, p.Cwd); err != nil {
+	if err := savePresetTx(tx, p); err != nil {
 		return err
-	}
-	if _, err := tx.Exec(
-		`INSERT INTO session(name, cwd, created_at, last_used) VALUES(?,?,?,?)`,
-		p.Name, p.Cwd, now, now,
-	); err != nil {
-		return err
-	}
-	for i, w := range p.Windows {
-		widx := w.Idx
-		if widx == 0 {
-			widx = i
-		}
-		res, err := tx.Exec(
-			`INSERT INTO window(session, idx, name, cwd, layout) VALUES(?,?,?,?,?)`,
-			p.Name, widx, w.Name, w.Cwd, w.Layout,
-		)
-		if err != nil {
-			return err
-		}
-		wid, err := res.LastInsertId()
-		if err != nil {
-			return err
-		}
-		for j, pn := range w.Panes {
-			pidx := pn.Idx
-			if pidx == 0 {
-				pidx = j
-			}
-			if _, err := tx.Exec(
-				`INSERT INTO pane(window_id, idx, cwd, cmd) VALUES(?,?,?,?)`,
-				wid, pidx, pn.Cwd, pn.Cmd,
-			); err != nil {
-				return err
-			}
-		}
 	}
 	return tx.Commit()
 }
+
 
 // deleteSessionsForSave removes presets that this Save should replace.
 func deleteSessionsForSave(tx *sql.Tx, name, cwd string) error {
@@ -666,6 +652,307 @@ ON CONFLICT(id) DO UPDATE SET updated = excluded.updated
 		}
 	}
 	return tx.Commit()
+}
+
+// ShapeRow is a pure layout blob (JSON body) keyed for dedupe.
+type ShapeRow struct {
+	ID   string
+	Key  string
+	Body string
+}
+
+
+// SaveFreeze: ONE transaction — instance preset tree + pure shape (dedupe by key).
+// setSticky true → sticky points at resulting shape id in same tx.
+// Call writeConfigMirror only AFTER this returns nil (post-commit).
+func (s *Store) SaveFreeze(p *Preset, shapeID, shapeKey, shapeBody string, setSticky bool) (outShapeID string, shapeCreated bool, err error) {
+	if p == nil {
+		return "", false, fmt.Errorf("nil preset")
+	}
+	if !project.ValidSessionName(p.Name) {
+		return "", false, fmt.Errorf("invalid session name %q", p.Name)
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return "", false, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if err := savePresetTx(tx, p); err != nil {
+		return "", false, err
+	}
+	outShapeID, shapeCreated, err = putShapeTx(tx, shapeID, shapeKey, shapeBody)
+	if err != nil {
+		return "", false, err
+	}
+	if setSticky {
+		if err := setStickyTx(tx, outShapeID); err != nil {
+			return "", false, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return "", false, err
+	}
+	return outShapeID, shapeCreated, nil
+}
+
+// StickShape: pure shape + sticky pointer in ONE transaction.
+func (s *Store) StickShape(shapeID, shapeKey, shapeBody string) (outID string, created bool, err error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return "", false, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	outID, created, err = putShapeTx(tx, shapeID, shapeKey, shapeBody)
+	if err != nil {
+		return "", false, err
+	}
+	if err := setStickyTx(tx, outID); err != nil {
+		return "", false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return "", false, err
+	}
+	return outID, created, nil
+}
+
+// RememberShapeOnly: shape upsert only, one tx.
+func (s *Store) RememberShapeOnly(shapeID, shapeKey, shapeBody string) (outID string, created bool, err error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return "", false, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	outID, created, err = putShapeTx(tx, shapeID, shapeKey, shapeBody)
+	if err != nil {
+		return "", false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return "", false, err
+	}
+	return outID, created, nil
+}
+
+func setStickyTx(tx *sql.Tx, shapeID string) error {
+	if shapeID == "" {
+		shapeID = "default"
+	}
+	_, err := tx.Exec(`
+INSERT INTO sticky(id, shape_id) VALUES(1, ?)
+ON CONFLICT(id) DO UPDATE SET shape_id = excluded.shape_id
+`, shapeID)
+	return err
+}
+
+func putShapeTx(tx *sql.Tx, id, key, body string) (outID string, created bool, err error) {
+	if key == "" || body == "" {
+		return "", false, fmt.Errorf("shape needs key and body")
+	}
+	var exist string
+	err = tx.QueryRow(`SELECT id FROM shape WHERE key = ?`, key).Scan(&exist)
+	if err == nil && exist != "" {
+		return exist, false, nil
+	}
+	if id == "" {
+		id = key
+		if len(id) > 32 {
+			id = id[:32]
+		}
+	}
+	now := time.Now().Unix()
+	_, err = tx.Exec(`INSERT INTO shape(id, key, body, created_at, updated_at) VALUES(?,?,?,?,?)`, id, key, body, now, now)
+	if err != nil {
+		if e2 := tx.QueryRow(`SELECT id FROM shape WHERE key = ?`, key).Scan(&exist); e2 == nil && exist != "" {
+			return exist, false, nil
+		}
+		id2 := id + "-" + key[:min6(key)]
+		_, err = tx.Exec(`INSERT INTO shape(id, key, body, created_at, updated_at) VALUES(?,?,?,?,?)`, id2, key, body, now, now)
+		if err != nil {
+			if e2 := tx.QueryRow(`SELECT id FROM shape WHERE key = ?`, key).Scan(&exist); e2 == nil && exist != "" {
+				return exist, false, nil
+			}
+			return "", false, err
+		}
+		return id2, true, nil
+	}
+	return id, true, nil
+}
+
+func min6(key string) int {
+	if len(key) < 6 {
+		return len(key)
+	}
+	return 6
+}
+
+func savePresetTx(tx *sql.Tx, p *Preset) error {
+	now := time.Now().Unix()
+	if err := deleteSessionsForSave(tx, p.Name, p.Cwd); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(
+		`INSERT INTO session(name, cwd, created_at, last_used) VALUES(?,?,?,?)`,
+		p.Name, p.Cwd, now, now,
+	); err != nil {
+		return err
+	}
+	for i, w := range p.Windows {
+		widx := w.Idx
+		if widx == 0 {
+			widx = i
+		}
+		res, err := tx.Exec(
+			`INSERT INTO window(session, idx, name, cwd, layout) VALUES(?,?,?,?,?)`,
+			p.Name, widx, w.Name, w.Cwd, w.Layout,
+		)
+		if err != nil {
+			return err
+		}
+		wid, err := res.LastInsertId()
+		if err != nil {
+			return err
+		}
+		for j, pn := range w.Panes {
+			pidx := pn.Idx
+			if pidx == 0 {
+				pidx = j
+			}
+			if _, err := tx.Exec(
+				`INSERT INTO pane(window_id, idx, cwd, cmd) VALUES(?,?,?,?)`,
+				wid, pidx, pn.Cwd, pn.Cmd,
+			); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// GetShapeByKey returns shape id+body if key exists.
+func (s *Store) GetShapeByKey(key string) (id, body string, ok bool) {
+	if key == "" {
+		return "", "", false
+	}
+	err := s.db.QueryRow(`SELECT id, body FROM shape WHERE key = ?`, key).Scan(&id, &body)
+	return id, body, err == nil && id != ""
+}
+
+
+// GetShapeMeta returns body + updated_at for merge decisions.
+func (s *Store) GetShapeMeta(id string) (body string, updated int64, ok bool) {
+	if id == "" {
+		return "", 0, false
+	}
+	err := s.db.QueryRow(`SELECT body, COALESCE(updated_at, created_at, 0) FROM shape WHERE id = ?`, id).Scan(&body, &updated)
+	return body, updated, err == nil && body != ""
+}
+
+// GetShape returns body by id.
+func (s *Store) GetShape(id string) (body string, ok bool) {
+	if id == "" {
+		return "", false
+	}
+	err := s.db.QueryRow(`SELECT body FROM shape WHERE id = ?`, id).Scan(&body)
+	return body, err == nil && body != ""
+}
+
+// PutShape inserts if key unknown. If key exists, returns existing id without rewrite
+// (topology dedupe). Use UpsertShapeByID to update body when user edits by id.
+func (s *Store) PutShape(id, key, body string) (outID string, created bool, err error) {
+	if key == "" || body == "" {
+		return "", false, fmt.Errorf("shape needs key and body")
+	}
+	if exist, _, ok := s.GetShapeByKey(key); ok {
+		return exist, false, nil
+	}
+	if id == "" {
+		id = key
+		if len(id) > 32 {
+			id = id[:32]
+		}
+	}
+	now := time.Now().Unix()
+	_, err = s.db.Exec(
+		`INSERT INTO shape(id, key, body, created_at, updated_at) VALUES(?,?,?,?,?)`,
+		id, key, body, now, now,
+	)
+	if err != nil {
+		if exist, _, ok := s.GetShapeByKey(key); ok {
+			return exist, false, nil
+		}
+		id2 := id + "-" + key[:6]
+		_, err = s.db.Exec(
+			`INSERT INTO shape(id, key, body, created_at, updated_at) VALUES(?,?,?,?,?)`,
+			id2, key, body, now, now,
+		)
+		if err != nil {
+			if exist, _, ok := s.GetShapeByKey(key); ok {
+				return exist, false, nil
+			}
+			return "", false, err
+		}
+		return id2, true, nil
+	}
+	return id, true, nil
+}
+
+// UpsertShapeByID writes/updates shape at stable id (hand-edit / re-export path).
+// Also updates key to match body fingerprint.
+func (s *Store) UpsertShapeByID(id, key, body string) error {
+	if id == "" || body == "" {
+		return fmt.Errorf("shape id and body required")
+	}
+	if key == "" {
+		key = id
+	}
+	now := time.Now().Unix()
+	_, err := s.db.Exec(`
+INSERT INTO shape(id, key, body, created_at, updated_at) VALUES(?,?,?,?,?)
+ON CONFLICT(id) DO UPDATE SET
+  key = excluded.key,
+  body = excluded.body,
+  updated_at = excluded.updated_at
+`, id, key, body, now, now)
+	return err
+}
+
+// ListShapes returns all shape ids (for export).
+func (s *Store) ListShapes() ([]string, error) {
+	rows, err := s.db.Query(`SELECT id FROM shape ORDER BY id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		out = append(out, id)
+	}
+	return out, rows.Err()
+}
+
+// StickyID returns sticky shape id (default if unset).
+func (s *Store) StickyID() string {
+	var id string
+	err := s.db.QueryRow(`SELECT shape_id FROM sticky WHERE id = 1`).Scan(&id)
+	if err != nil || id == "" {
+		return "default"
+	}
+	return id
+}
+
+// SetSticky points sticky at shape id.
+func (s *Store) SetSticky(shapeID string) error {
+	if shapeID == "" {
+		shapeID = "default"
+	}
+	_, err := s.db.Exec(`
+INSERT INTO sticky(id, shape_id) VALUES(1, ?)
+ON CONFLICT(id) DO UPDATE SET shape_id = excluded.shape_id
+`, shapeID)
+	return err
 }
 
 func (s *Store) String() string {

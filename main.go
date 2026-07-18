@@ -53,12 +53,12 @@ Keys (fzf-style combobox — type to filter anytime):
   ctrl-f        freeze → sqlite
   ctrl-e        edit preset
   ctrl-d        delete preset
-  ctrl-t        sticky template from preset (again: default)
+  ctrl-t        sticky shape from selection (create/zox use it)
   ctrl-u        clear query
   esc           quit
 
-Store: $XDG_DATA_HOME/gotomux/state.db
-	Template: .../templates/{default|name}.json + active sticky (ctrl-t)
+Store: $XDG_DATA_HOME/gotomux/state.db  (presets, shapes, sticky, usage)
+	Optional seed: $XDG_CONFIG_HOME/gotomux/layouts/*.json
 Edit format: JSON {name,cwd,windows:[{name,layout,panes:[{cwd,cmd}]}]}
 `, version)
 			return
@@ -181,11 +181,20 @@ func freezeCLI() error {
 	if err != nil {
 		return err
 	}
-	if err := st.Save(p); err != nil {
+	sid, created, err := template.FreezeSave(st, p, false)
+	if err != nil {
 		return err
 	}
 	dir, _ := store.DataDir()
-	fmt.Println("froze", name, "→", filepath.Join(dir, "state.db"))
+	msg := fmt.Sprintf("froze %s → %s", name, filepath.Join(dir, "state.db"))
+	if sid != "" {
+		if created {
+			msg += " · shape " + sid
+		} else {
+			msg += " · shape " + sid + " (exists)"
+		}
+	}
+	fmt.Println(msg)
 	return nil
 }
 
@@ -195,5 +204,32 @@ func editCLI(name string) error {
 		return err
 	}
 	defer st.Close()
+
+	ctl, _ := tmux.New()
+	// run-shell has no TTY for fzf pick — default to current tmux session.
+	if name == "" && ctl != nil {
+		name = ctl.CurrentSession()
+	}
+	if name == "" {
+		// only interactive pick when we can open a TTY
+		if _, err := os.OpenFile("/dev/tty", os.O_RDWR, 0); err != nil {
+			return fmt.Errorf("gotomux -e: pass a session name, or run inside tmux (run-shell has no TTY for picker)")
+		}
+		return template.Edit(st, "", picker.Pick)
+	}
+
+	// no preset yet → freeze current layout into DB first (like ctrl-e on Active)
+	if _, err := st.Get(name); err != nil {
+		if ctl == nil {
+			return fmt.Errorf("preset %q not found and no tmux", name)
+		}
+		p, err := ctl.Freeze(name)
+		if err != nil {
+			return err
+		}
+		if _, _, err := template.FreezeSave(st, p, false); err != nil {
+			return err
+		}
+	}
 	return template.Edit(st, name, picker.Pick)
 }
