@@ -617,6 +617,7 @@ func (s *Store) LoadZoxItems() (items []item, updated int64, ok bool) {
 		if it.name == "" {
 			continue
 		}
+		it.src = srcZoxide
 		it.kind = kindZoxide
 		it.title = title
 		if it.title == "" {

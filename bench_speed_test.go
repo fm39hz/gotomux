@@ -19,8 +19,7 @@ func BenchmarkReadyNoZoxide(b *testing.B) {
 		cwd, _ := os.Getwd()
 		root := findProjectRoot(cwd)
 		name := sessionName(root)
-		create := item{kind: kindCreate, title: name, name: name, path: root, desc: root}
-		_ = collectBase(ctl, store, create)
+		_ = snapshotAll(defaultSources(ctl, store, name, root))
 		store.Close()
 	}
 }
@@ -38,10 +37,8 @@ func BenchmarkReadyWithZoxide(b *testing.B) {
 		cwd, _ := os.Getwd()
 		root := findProjectRoot(cwd)
 		name := sessionName(root)
-		create := item{kind: kindCreate, title: name, name: name, path: root, desc: root}
-		base := collectBase(ctl, store, create)
-		n, p := occupancy(base)
-		_ = zoxideItems(zoxideList(), n, p)
+		_ = snapshotAll(defaultSources(ctl, store, name, root))
+		_ = zoxideItems(zoxideList(), nil, nil)
 		store.Close()
 	}
 }

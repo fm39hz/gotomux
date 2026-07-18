@@ -27,15 +27,13 @@ type result struct {
 }
 
 type model struct {
-	base     []item // active + optional create + presets (no zoxide)
-	zox      []item // zoxide items (seeded from disk cache)
-	zoxStale bool   // need background zoxide refresh
+	sources  []Source
+	bySrc    map[string][]item // Snapshot/Refresh slots keyed by Source.ID
 	view     []item
 	cursor   int
 	query    string
 	ctl      *TmuxCtl
 	store    *Store
-	create   item
 	status   string
 	done     result
 	width    int
@@ -79,116 +77,49 @@ func styleFor(k kind) lipgloss.Style {
 }
 
 func newModel(ctl *TmuxCtl, store *Store, createName, createCwd string) model {
-	// always offer Create at top — enter bakes sticky template immediately
-	create := item{
-		kind:  kindCreate,
-		title: fmt.Sprintf("[Create] %s", createName),
-		desc:  createCwd,
-		name:  createName,
-		path:  createCwd,
-	}
-	base := collectBase(ctl, store, create)
-	now := time.Now().Unix()
-	if us, err := store.AllUsage(); err == nil {
-		applyUsage(base, us, now)
-	}
+	srcs := defaultSources(ctl, store, createName, createCwd)
+	bySrc := snapshotAll(srcs)
 	ctx := ""
 	if ctl != nil {
 		ctx = ctl.CurrentSession()
 	}
+	now := time.Now().Unix()
 	var pairs map[string]int64
 	if store != nil && ctx != "" {
 		pairs, _ = store.PairScores(ctx, now)
-		applyCooccur(base, pairs)
 	}
-	// Seed zoxide from prebuilt item cache — same frame as Create/Active (no walk).
-	var zox []item
-	zoxItems, zoxAge, zoxOK := loadZoxItemsSync()
-	if zoxOK {
-		zox = dedupeZoxAgainst(zoxItems, base)
-		if store != nil {
-			if us, err := store.AllUsage(); err == nil {
-				applyUsage(zox, us, now)
-			}
-			applyCooccur(zox, pairs)
-		}
-	}
+	applyRankMeta(bySrc, store, pairs)
 	m := model{
-		base:     base,
-		zox:      zox,
-		ctl:      ctl,
-		store:    store,
-		create:   create,
-		maxShow:  12,
-		tmpl:     readActiveTemplateName(),
-		started:  time.Now(),
-		ctx:      ctx,
-		pairs:    pairs,
-		zoxStale: zoxItemsStale(zoxAge, zoxOK),
+		sources: srcs,
+		bySrc:   bySrc,
+		ctl:     ctl,
+		store:   store,
+		maxShow: 12,
+		tmpl:    readActiveTemplateName(),
+		started: time.Now(),
+		ctx:     ctx,
+		pairs:   pairs,
 	}
 	m.refilter()
 	return m
 }
 
-// zoxideMsg: background refresh finished (pre-built items).
-type zoxideMsg struct {
-	items []item
-}
-
-func loadZoxideFreshCmd() tea.Msg {
-	return zoxideMsg{items: rebuildZoxItems()}
-}
-
-func dedupeZoxAgainst(items, base []item) []item {
-	names, pths := occupancy(base)
-	out := make([]item, 0, len(items))
-	for _, it := range items {
-		nr := normPath(it.path)
-		if names[it.name] || (nr != "" && pths[nr]) {
-			continue
-		}
-		names[it.name] = true
-		if nr != "" {
-			pths[nr] = true
-		}
-		out = append(out, it)
-	}
-	return out
-}
-
-func (m *model) mergeZoxide(items []item) {
-	m.zox = dedupeZoxAgainst(items, m.base)
-	if m.store != nil {
-		now := time.Now().Unix()
-		if us, err := m.store.AllUsage(); err == nil {
-			applyUsage(m.zox, us, now)
-		}
-		applyCooccur(m.zox, m.pairs)
-	}
-	m.zoxStale = false
-}
-
 func (m *model) pool() []item {
-	q := strings.TrimSpace(m.query)
-	var out []item
-	for _, it := range m.base {
-		// Create only when query empty — sticky-tmpl enter without filter noise
-		if it.kind == kindCreate && q != "" {
-			continue
+	return flattenSources(m.sources, m.bySrc, strings.TrimSpace(m.query))
+}
+
+func (m *model) mergeSource(id string, items []item) {
+	if m.bySrc == nil {
+		m.bySrc = map[string][]item{}
+	}
+	for i := range items {
+		if items[i].src == "" {
+			items[i].src = id
 		}
-		out = append(out, it)
 	}
-	if len(m.zox) == 0 {
-		return out
-	}
-	if q == "" {
-		n := zoxCap
-		if n > len(m.zox) {
-			n = len(m.zox)
-		}
-		return append(out, m.zox[:n]...)
-	}
-	return append(out, m.zox...)
+	slot := map[string][]item{id: items}
+	applyRankMeta(slot, m.store, m.pairs)
+	m.bySrc[id] = slot[id]
 }
 
 func (m *model) refilter() {
@@ -209,22 +140,24 @@ func (m *model) refilterFromQuery() {
 }
 
 func (m *model) totalCount() int {
-	return len(m.base) + len(m.zox)
+	return countSources(m.bySrc)
 }
 
 func (m model) Init() tea.Cmd {
-	// always refresh full zoxide in background — cache only seeds paint
-	return loadZoxideFreshCmd
+	cmds := refreshCmds(m.sources)
+	if len(cmds) == 0 {
+		return nil
+	}
+	return tea.Batch(cmds...)
 }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
-	case zoxideMsg:
+	case sourceMsg:
 		if len(msg.items) == 0 {
-			m.zoxStale = false
 			return m, nil
 		}
-		m.mergeZoxide(msg.items)
+		m.mergeSource(msg.id, msg.items)
 		m.refilter()
 		return m, nil
 
@@ -421,31 +354,18 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m *model) reload() {
-	m.base = collectBase(m.ctl, m.store, m.create)
-	if items, age, ok := loadZoxItemsSync(); ok {
-		m.zox = dedupeZoxAgainst(items, m.base)
-		m.zoxStale = zoxItemsStale(age, true)
+	// re-snapshot every source (truth for sync sources; cache for zoxide)
+	m.bySrc = snapshotAll(m.sources)
+	now := time.Now().Unix()
+	if m.ctl != nil {
+		m.ctx = m.ctl.CurrentSession()
+	}
+	if m.store != nil && m.ctx != "" {
+		m.pairs, _ = m.store.PairScores(m.ctx, now)
 	} else {
-		m.zox = nil
-		m.zoxStale = true
+		m.pairs = nil
 	}
-	if m.store != nil {
-		now := time.Now().Unix()
-		if us, err := m.store.AllUsage(); err == nil {
-			applyUsage(m.base, us, now)
-			applyUsage(m.zox, us, now)
-		}
-		if m.ctl != nil {
-			m.ctx = m.ctl.CurrentSession()
-		}
-		if m.ctx != "" {
-			m.pairs, _ = m.store.PairScores(m.ctx, now)
-		} else {
-			m.pairs = nil
-		}
-		applyCooccur(m.base, m.pairs)
-		applyCooccur(m.zox, m.pairs)
-	}
+	applyRankMeta(m.bySrc, m.store, m.pairs)
 	m.refilter()
 }
 

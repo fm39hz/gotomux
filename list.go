@@ -16,6 +16,8 @@ const (
 )
 
 type item struct {
+	src     string // Source.ID(); remote later: "tmux@host"
+	host    string // "" = local; set for remote sources
 	kind    kind
 	title   string
 	desc    string
@@ -30,54 +32,7 @@ type item struct {
 	cooccur int64
 }
 
-const zoxCap = 40 // empty query: show top-N only; query uses full m.zox pool
-
-// collectBase: Create → Active → Presets(last_used). No zoxide.
-func collectBase(ctl *TmuxCtl, store *Store, create item) []item {
-	seenName := map[string]bool{}
-	var items []item
-
-	live, _ := ctl.ListLive()
-	liveNames := map[string]bool{}
-	for _, s := range live {
-		liveNames[s.Name] = true
-	}
-
-	if create.name != "" && !liveNames[create.name] {
-		seenName[create.name] = true
-		items = append(items, create)
-	}
-
-	for _, s := range live {
-		seenName[s.Name] = true
-		items = append(items, item{
-			kind:    kindActive,
-			title:   fmt.Sprintf("[Active] %s", s.Name),
-			desc:    fmt.Sprintf("%d windows", s.Windows),
-			name:    s.Name,
-			path:    s.Path,
-			windows: s.Windows,
-		})
-	}
-
-	if meta, err := store.ListMeta(); err == nil {
-		for _, m := range meta {
-			if seenName[m.Name] {
-				continue
-			}
-			seenName[m.Name] = true
-			items = append(items, item{
-				kind:    kindPreset,
-				title:   fmt.Sprintf("[Preset] %s", m.Name),
-				desc:    "saved layout",
-				name:    m.Name,
-				path:    m.Cwd,
-				recency: m.LastUsed,
-			})
-		}
-	}
-	return items
-}
+const zoxCap = 40 // empty query: show top-N zoxide only; query uses full pool
 
 func normPath(p string) string {
 	if p == "" {
@@ -98,10 +53,15 @@ func occupancy(items []item) (names, paths map[string]bool) {
 	return names, paths
 }
 
-// zoxideItems: skip if session name OR project root already covered.
-// Path is project root (not the raw zoxide hit) so connect never creates a "src" session.
-// recency: earlier in zoxide list (higher frecency) → larger recency.
+// zoxideItems: collapse path → project root; recency from zoxide order.
+// names/paths seed dedupe (usually empty at rebuild; cross-src dedupe in flatten).
 func zoxideItems(zpaths []string, names, paths map[string]bool) []item {
+	if names == nil {
+		names = map[string]bool{}
+	}
+	if paths == nil {
+		paths = map[string]bool{}
+	}
 	var out []item
 	n := len(zpaths)
 	for i, p := range zpaths {
@@ -119,9 +79,10 @@ func zoxideItems(zpaths []string, names, paths map[string]bool) []item {
 		}
 		desc := p
 		if nr != "" && normPath(p) != nr {
-			desc = root // show root when zoxide pointed at a subdir
+			desc = root
 		}
 		out = append(out, item{
+			src:     srcZoxide,
 			kind:    kindZoxide,
 			title:   fmt.Sprintf("[Zoxide] %s", name),
 			desc:    desc,
@@ -158,7 +119,6 @@ func rankItems(q string, pool []item) []item {
 }
 
 // applyUsage overlays app frecency onto items when usage rows exist.
-// Fallback recency (preset last_used / zoxide order) kept if no usage yet.
 func applyUsage(items []item, usages map[string]Usage, now int64) {
 	if len(usages) == 0 {
 		return

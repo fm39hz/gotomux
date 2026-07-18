@@ -6,15 +6,8 @@ import (
 	"time"
 )
 
-// Zoxide list is slow (~50–150ms + project walk). Cache pre-built items in
-// SQLite so open paints Create/Active/Zoxide from last run; full list rebuilds
-// in background and merges into the search pool (empty query still UI-caps).
-//
-//  1. loadZoxItemsSync reads DB (or memory) — first paint.
-//  2. Init always runs rebuildZoxItems (zoxide query -l + all paths).
-//  3. mergeZoxide swaps pool; rank on query sees low-frecency hits.
-
-const zoxCacheTTL = 60 * time.Second // kept for reload() age checks only
+// Zoxide truth is `zoxide query -l`. Cache (mem + SQLite) only seeds paint.
+// zoxideSource.Refresh always rebuilds full list into the search pool.
 
 var (
 	zoxItemMem   []item
@@ -68,10 +61,6 @@ func saveZoxItems(items []item) {
 	zoxItemMem = items
 	zoxItemMemAt = time.Now()
 	zoxItemMu.Unlock()
-}
-
-func zoxItemsStale(age time.Duration, ok bool) bool {
-	return !ok || age >= zoxCacheTTL
 }
 
 func zoxideQueryFresh() []string {
@@ -129,7 +118,7 @@ func rebuildZoxItems() []item {
 		return nil
 	}
 	// full list — low-rank paths stay searchable after merge; paint already done
-	items := zoxideItems(paths, map[string]bool{}, map[string]bool{})
+	items := zoxideItems(paths, nil, nil)
 	if len(items) > 0 {
 		saveZoxItems(items)
 	}
@@ -147,17 +136,4 @@ func zoxideList() []string {
 		return out
 	}
 	return zoxideQueryFresh()
-}
-
-func zoxideListCachedOnly() []string {
-	if items, _, ok := loadZoxItemsSync(); ok {
-		out := make([]string, 0, len(items))
-		for _, it := range items {
-			if it.path != "" {
-				out = append(out, it.path)
-			}
-		}
-		return out
-	}
-	return nil
 }
