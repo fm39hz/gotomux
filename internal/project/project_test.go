@@ -76,5 +76,3 @@ func TestProjectSessionSubdir(t *testing.T) {
 		t.Fatalf("name %q", name)
 	}
 }
-
-

@@ -13,7 +13,6 @@ import (
 	"github.com/fm39hz/gotomux/internal/store"
 )
 
-
 var namedLayouts = map[string]bool{
 	"even-horizontal": true,
 	"even-vertical":   true,
@@ -127,16 +126,27 @@ func (c *Ctl) CurrentSession() string {
 }
 
 func (c *Ctl) Kill(name string) error {
-	s, err := c.t.GetSessionByName(name)
-	if err != nil || s == nil {
-		return err
+	if name == "" {
+		return fmt.Errorf("kill: empty session name")
 	}
-	return s.Kill()
+	s, err := c.t.GetSessionByName(name)
+	if err != nil {
+		return fmt.Errorf("kill %q: %w", name, err)
+	}
+	if s == nil {
+		return fmt.Errorf("kill %q: session not found", name)
+	}
+	if err := s.Kill(); err != nil {
+		return fmt.Errorf("kill %q: %w", name, err)
+	}
+	return nil
 }
 
 func (c *Ctl) run(args ...string) error {
-	_, err := c.t.Command(args...)
-	if err != nil {
+	if len(args) == 0 {
+		return fmt.Errorf("tmux: empty command")
+	}
+	if _, err := c.t.Command(args...); err != nil {
 		return fmt.Errorf("tmux %s: %w", strings.Join(args, " "), err)
 	}
 	return nil
@@ -298,7 +308,11 @@ func (c *Ctl) Load(p *store.Preset) error {
 
 	sessCwd := p.Cwd
 	if sessCwd == "" {
-		sessCwd, _ = os.Getwd()
+		var err error
+		sessCwd, err = os.Getwd()
+		if err != nil {
+			return fmt.Errorf("load %q: cwd: %w", p.Name, err)
+		}
 	}
 	base := c.windowBaseIndex()
 
@@ -349,8 +363,8 @@ func (c *Ctl) Load(p *store.Preset) error {
 	parts = append(parts, []string{"select-window", "-t", sessionIndexTarget(p.Name, base)})
 
 	if err := c.runChain(parts...); err != nil {
-		_ = c.Kill(p.Name)
-		return err
+		_ = c.Kill(p.Name) // best-effort cleanup of half-created session
+		return fmt.Errorf("load %q: %w", p.Name, err)
 	}
 	return nil
 }
@@ -421,14 +435,6 @@ func normalizeWindows(wins []store.PresetWindow, sessCwd string) []store.PresetW
 	return out
 }
 
-// sessionTarget: exact-name target ("=sess:win"). "=" disables prefix match.
-func sessionTarget(session, winName string) string {
-	if winName != "" {
-		return "=" + session + ":" + winName
-	}
-	return "=" + session + ":0"
-}
-
 func cmdArgs(cmd string) []string {
 	cmd = strings.TrimSpace(cmd)
 	if cmd == "" {
@@ -444,25 +450,41 @@ func (c *Ctl) Connect(name, cwd string) error {
 	}
 	if !c.Has(name) {
 		if cwd == "" {
-			cwd, _ = os.Getwd()
+			var err error
+			cwd, err = os.Getwd()
+			if err != nil {
+				return fmt.Errorf("connect %q: cwd: %w", name, err)
+			}
 		}
 		if err := c.run("new-session", "-d", "-s", name, "-c", cwd); err != nil {
-			return err
+			return fmt.Errorf("create session %q: %w", name, err)
 		}
 	}
 	s, err := c.t.GetSessionByName(name)
 	if err != nil {
-		return err
+		return fmt.Errorf("get session %q: %w", name, err)
+	}
+	if s == nil {
+		return fmt.Errorf("session %q not found after create", name)
 	}
 	if os.Getenv("TMUX") != "" {
-		return c.t.SwitchClient(&gotmux.SwitchClientOptions{TargetSession: name})
+		if err := c.t.SwitchClient(&gotmux.SwitchClientOptions{TargetSession: name}); err != nil {
+			return fmt.Errorf("switch to %q: %w", name, err)
+		}
+		return nil
 	}
-	return s.Attach()
+	if err := s.Attach(); err != nil {
+		return fmt.Errorf("attach %q: %w", name, err)
+	}
+	return nil
 }
 
 func (c *Ctl) ConnectPreset(p *store.Preset) error {
+	if p == nil {
+		return fmt.Errorf("connect preset: nil")
+	}
 	if err := c.Load(p); err != nil {
-		return err
+		return fmt.Errorf("load preset %q: %w", p.Name, err)
 	}
 	return c.Connect(p.Name, p.Cwd)
 }

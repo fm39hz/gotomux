@@ -391,8 +391,6 @@ func TestPairCanonical(t *testing.T) {
 	}
 }
 
-
-
 func TestIdleMRUAndDemoteCurrent(t *testing.T) {
 	// empty query: higher Recency among Active wins; demote is applied in applyRankMeta
 	cur := Item{Kind: KindActive, Name: "here", Recency: 1000}

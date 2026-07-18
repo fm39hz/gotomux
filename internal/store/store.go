@@ -388,7 +388,6 @@ func (s *Store) Save(p *Preset) error {
 	return tx.Commit()
 }
 
-
 // deleteSessionsForSave removes presets that this Save should replace.
 func deleteSessionsForSave(tx *sql.Tx, name, cwd string) error {
 	// exact name
@@ -582,7 +581,6 @@ SELECT a, b, n, last FROM pair WHERE a = ? OR b = ?
 	return out, rows.Err()
 }
 
-
 // ZoxRow is a cached zoxide picker row (no UI types).
 type ZoxRow struct {
 	Name    string
@@ -660,7 +658,6 @@ type ShapeRow struct {
 	Key  string
 	Body string
 }
-
 
 // SaveFreeze: ONE transaction — instance preset tree + pure shape (dedupe by key).
 // setSticky true → sticky points at resulting shape id in same tx.
@@ -835,7 +832,6 @@ func (s *Store) GetShapeByKey(key string) (id, body string, ok bool) {
 	err := s.db.QueryRow(`SELECT id, body FROM shape WHERE key = ?`, key).Scan(&id, &body)
 	return id, body, err == nil && id != ""
 }
-
 
 // GetShapeMeta returns body + updated_at for merge decisions.
 func (s *Store) GetShapeMeta(id string) (body string, updated int64, ok bool) {

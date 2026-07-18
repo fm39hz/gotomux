@@ -125,6 +125,9 @@ func run() error {
 }
 
 func connectItem(ctl *tmux.Ctl, st *store.Store, it picker.Item) error {
+	if ctl == nil {
+		return fmt.Errorf("connect: nil tmux")
+	}
 	var err error
 	switch it.Kind {
 	case picker.KindCreate, picker.KindZoxide:
@@ -132,16 +135,23 @@ func connectItem(ctl *tmux.Ctl, st *store.Store, it picker.Item) error {
 	case picker.KindActive:
 		err = ctl.Connect(it.Name, "")
 	case picker.KindPreset:
+		if st == nil {
+			return fmt.Errorf("connect preset: nil store")
+		}
 		p, errGet := st.Get(it.Name)
 		if errGet != nil {
-			return errGet
+			return fmt.Errorf("preset %q: %w", it.Name, errGet)
 		}
-		_ = st.Touch(it.Name)
+		_ = st.Touch(it.Name) // best-effort ranking signal
 		err = ctl.ConnectPreset(p)
 	default:
-		return fmt.Errorf("unknown item kind")
+		return fmt.Errorf("unknown item kind %v", it.Kind)
 	}
-	if err == nil && st != nil {
+	if err != nil {
+		return err
+	}
+	// ranking telemetry — never fail the connect
+	if st != nil {
 		_ = st.RecordOpen(it.Name)
 		if live, e := ctl.ListLive(); e == nil {
 			names := make([]string, 0, len(live))
@@ -153,17 +163,17 @@ func connectItem(ctl *tmux.Ctl, st *store.Store, it picker.Item) error {
 			st.RecordPairsWithLive(it.Name, names)
 		}
 	}
-	return err
+	return nil
 }
 
 func freezeCLI(name string) error {
 	ctl, err := tmux.New()
 	if err != nil {
-		return err
+		return fmt.Errorf("tmux: %w", err)
 	}
 	st, err := store.Open()
 	if err != nil {
-		return err
+		return fmt.Errorf("open store: %w", err)
 	}
 	defer st.Close()
 
@@ -189,13 +199,16 @@ func freezeCLI(name string) error {
 	}
 	p, err := ctl.Freeze(name)
 	if err != nil {
-		return err
+		return fmt.Errorf("freeze %q: %w", name, err)
 	}
 	sid, created, err := template.FreezeSave(st, p, false)
 	if err != nil {
-		return err
+		return fmt.Errorf("save freeze %q: %w", name, err)
 	}
-	dir, _ := store.DataDir()
+	dir, err := store.DataDir()
+	if err != nil {
+		dir = "(state.db)"
+	}
 	msg := fmt.Sprintf("froze %s → %s", name, filepath.Join(dir, "state.db"))
 	if sid != "" {
 		if created {
@@ -211,35 +224,40 @@ func freezeCLI(name string) error {
 func editCLI(name string) error {
 	st, err := store.Open()
 	if err != nil {
-		return err
+		return fmt.Errorf("open store: %w", err)
 	}
 	defer st.Close()
 
-	ctl, _ := tmux.New()
-	// run-shell has no TTY for fzf pick — default to current tmux session.
-	if name == "" && ctl != nil {
+	ctl, ctlErr := tmux.New()
+	// Prefer explicit name; else current tmux session (run-shell has no TTY for pick).
+	if name == "" && ctlErr == nil && ctl != nil {
 		name = ctl.CurrentSession()
 	}
 	if name == "" {
-		// only interactive pick when we can open a TTY
 		if _, err := os.OpenFile("/dev/tty", os.O_RDWR, 0); err != nil {
-			return fmt.Errorf("gotomux -e: pass a session name, or run inside tmux (run-shell has no TTY for picker)")
+			return fmt.Errorf("edit: need session name or interactive TTY (use display-popup for binds)")
 		}
-		return template.Edit(st, "", picker.Pick)
+		if err := template.Edit(st, "", picker.Pick); err != nil {
+			return fmt.Errorf("edit: %w", err)
+		}
+		return nil
 	}
 
-	// no preset yet → freeze current layout into DB first (like ctrl-e on Active)
+	// no preset yet → freeze into DB first
 	if _, err := st.Get(name); err != nil {
-		if ctl == nil {
-			return fmt.Errorf("preset %q not found and no tmux", name)
+		if ctlErr != nil {
+			return fmt.Errorf("preset %q not found and tmux unavailable: %v", name, ctlErr)
 		}
 		p, err := ctl.Freeze(name)
 		if err != nil {
-			return err
+			return fmt.Errorf("freeze %q for edit: %w", name, err)
 		}
 		if _, _, err := template.FreezeSave(st, p, false); err != nil {
-			return err
+			return fmt.Errorf("save freeze for edit: %w", err)
 		}
 	}
-	return template.Edit(st, name, picker.Pick)
+	if err := template.Edit(st, name, picker.Pick); err != nil {
+		return fmt.Errorf("edit %q: %w", name, err)
+	}
+	return nil
 }

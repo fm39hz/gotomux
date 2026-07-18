@@ -63,7 +63,6 @@ func TestSessionAliasKey(t *testing.T) {
 	}
 }
 
-
 func TestSaveFreezeAtomic(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("XDG_DATA_HOME", dir)

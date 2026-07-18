@@ -487,7 +487,6 @@ func (m *model) beginEdit(name string) (tea.Cmd, error) {
 	}), nil
 }
 
-
 // editorCmd opens path in $EDITOR (default nvim).
 func editorCmd(path string) *exec.Cmd {
 	ed := os.Getenv("EDITOR")

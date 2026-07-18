@@ -1,6 +1,7 @@
 package picker
 
 import (
+	"fmt"
 	"strings"
 	"unicode"
 
@@ -25,10 +26,12 @@ func Pick(names []string) (string, error) {
 	p := tea.NewProgram(m)
 	final, err := p.Run()
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("pick: %w", err)
 	}
-	pm := final.(pickModel)
-	// prompt + header + len(view) lines
+	pm, ok := final.(pickModel)
+	if !ok {
+		return "", fmt.Errorf("pick: unexpected model type %T", final)
+	}
 	ClearInline(2 + len(pm.view))
 	return pm.name, nil
 }

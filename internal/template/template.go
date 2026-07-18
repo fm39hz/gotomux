@@ -124,7 +124,7 @@ func syncConfigToDB(st *store.Store) {
 				}
 			}
 		}
-		ensureDefault(st)
+		_ = ensureDefault(st)
 		// DB → missing files
 		ids, _ := st.ListShapes()
 		for _, id := range ids {
@@ -136,14 +136,6 @@ func syncConfigToDB(st *store.Store) {
 			}
 		}
 	})
-}
-
-func ensureDefault(st *store.Store) {
-	def := builtinDefault()
-	key := ShapeKey(def)
-	body := Format(def)
-	_ = st.UpsertShapeByID("default", key, body)
-	writeConfigMirror("default", body)
 }
 
 func relativizeCwd(root, cwd string) string {
@@ -200,7 +192,9 @@ func ToShape(p *store.Preset, id string) *store.Preset {
 }
 
 // ShapeKey fingerprints pure topology only:
-//   window count · per-window (pane count + relative cwds + layout kind)
+//
+//	window count · per-window (pane count + relative cwds + layout kind)
+//
 // Window *labels* are not part of the key (automatic-rename paths must not fork ids).
 func ShapeKey(p *store.Preset) string {
 	if p == nil {
@@ -284,33 +278,27 @@ func roleWindowName(name string, idx int) string {
 	return out
 }
 
-// putShapeBoth: DB + config 1-1. id is always shape-<ShapeKey> (opaque).
-// Dedupe by key: reuse existing row id (should already be shape-<key>).
-func putShapeBoth(st *store.Store, _ string, pure *store.Preset) (outID string, created bool, err error) {
-	if pure == nil {
-		return "", false, fmt.Errorf("nil shape")
+// shapeBody prepares pure shape id/key/body for DB.
+// default builtin keeps id "default"; everything else is shape-<key>.
+func shapeBody(p *store.Preset, forceDefault bool) (id, key, body string) {
+	pure := ToShape(p, "tmp")
+	key = ShapeKey(pure)
+	if forceDefault {
+		id = "default"
+	} else {
+		id = shapeIDFrom(pure, key)
 	}
-	// normalize window roles before key so body and key match
-	key := ShapeKey(pure)
-	id := shapeIDFrom(pure, key) // shape-<16hex>
 	pure.Name = id
-	body := Format(pure)
-	if existID, existBody, ok := st.GetShapeByKey(key); ok {
-		writeConfigMirror(existID, existBody)
-		return existID, false, nil
+	return id, key, Format(pure)
+}
+
+func mirrorAfter(st *store.Store, id string) {
+	if st == nil || id == "" {
+		return
 	}
-	outID, created, err = st.PutShape(id, key, body)
-	if err != nil {
-		return "", false, err
+	if b, ok := st.GetShape(id); ok {
+		writeConfigMirror(id, b)
 	}
-	// force body name == outID
-	if outID != id {
-		pure.Name = outID
-		body = Format(pure)
-		_ = st.UpsertShapeByID(outID, key, body)
-	}
-	writeConfigMirror(outID, body)
-	return outID, created, nil
 }
 
 func ReadSticky(st *store.Store) string {
@@ -325,8 +313,7 @@ func ReadSticky(st *store.Store) string {
 	return id
 }
 
-func ReadActiveName() string { return "default" }
-
+// LoadActive loads sticky pure shape from DB (SSoT).
 func LoadActive(st *store.Store) (*store.Preset, string, error) {
 	if st == nil {
 		return builtinDefault(), "default", nil
@@ -338,86 +325,96 @@ func LoadActive(st *store.Store) (*store.Preset, string, error) {
 	}
 	body, ok := st.GetShape(id)
 	if !ok {
-		ensureDefaultBoth(st)
+		if err := ensureDefault(st); err != nil {
+			return builtinDefault(), "default", fmt.Errorf("ensure default shape: %w", err)
+		}
 		return builtinDefault(), "default", nil
 	}
 	p, err := Parse(body)
 	if err != nil {
+		// corrupt shape row — fall back without hiding that we did
+		if err2 := ensureDefault(st); err2 != nil {
+			return builtinDefault(), "default", fmt.Errorf("parse shape %q: %w (and ensure default: %v)", id, err, err2)
+		}
 		return builtinDefault(), "default", nil
 	}
 	return p, id, nil
 }
 
-func ensureDefaultBoth(st *store.Store) {
+func ensureDefault(st *store.Store) error {
+	if st == nil {
+		return fmt.Errorf("nil store")
+	}
 	def := builtinDefault()
-	_, _, _ = putShapeBoth(st, "default", def)
-	_ = st.SetSticky("default")
+	id, key, body := shapeBody(def, true)
+	// Upsert by id so "default" stays stable (not shape-<key>)
+	if err := st.UpsertShapeByID(id, key, body); err != nil {
+		return err
+	}
+	writeConfigMirror(id, body)
+	return nil
 }
 
-// StickFrom: sticky from selection. DB: one tx (shape + sticky). Config mirror after commit.
+// StickFrom: one DB tx (shape + sticky), then config mirror.
 func StickFrom(st *store.Store, p *store.Preset) (id string, created bool, err error) {
 	if st == nil {
-		return "", false, fmt.Errorf("no store")
+		return "", false, fmt.Errorf("stick: nil store")
 	}
 	if p == nil {
-		return "", false, fmt.Errorf("nothing to stick")
+		return "", false, fmt.Errorf("stick: nil preset")
 	}
 	syncConfigToDB(st)
-	pure := ToShape(p, "tmp")
-	outID, created, err := putShapeBoth(st, "", pure)
+	id, key, body := shapeBody(p, false)
+	outID, created, err := st.StickShape(id, key, body)
 	if err != nil {
-		return "", false, err
+		return "", false, fmt.Errorf("stick shape: %w", err)
 	}
-	if err := st.SetSticky(outID); err != nil {
-		return "", false, err
-	}
+	mirrorAfter(st, outID)
 	return outID, created, nil
 }
 
-// RememberShape: pure shape only (when instance already saved). Prefer FreezeSave.
+// RememberShape: shape only (tests / rare). Prefer FreezeSave for freeze path.
 func RememberShape(st *store.Store, p *store.Preset) (id string, created bool, err error) {
 	if st == nil || p == nil {
 		return "", false, nil
 	}
 	syncConfigToDB(st)
-	return putShapeBoth(st, "", ToShape(p, "tmp"))
+	id, key, body := shapeBody(p, false)
+	outID, created, err := st.RememberShapeOnly(id, key, body)
+	if err != nil {
+		return "", false, fmt.Errorf("remember shape: %w", err)
+	}
+	mirrorAfter(st, outID)
+	return outID, created, nil
 }
 
-// FreezeSave: instance + shape in ONE DB transaction; then config mirror.
-// setSticky: also point sticky at shape (ctrl-t path can use StickFrom instead).
+// FreezeSave: instance + shape in ONE DB transaction; config mirror after commit.
 func FreezeSave(st *store.Store, p *store.Preset, setSticky bool) (shapeID string, shapeCreated bool, err error) {
 	if st == nil || p == nil {
-		return "", false, fmt.Errorf("freeze save: nil")
+		return "", false, fmt.Errorf("freeze save: nil store or preset")
 	}
 	syncConfigToDB(st)
-	pure := ToShape(p, "tmp")
-	key := ShapeKey(pure)
-	id := shapeIDFrom(pure, key)
-	pure.Name = id
-	body := Format(pure)
-	// if key exists, SaveFreeze still updates preset instance; shape row reused
+	id, key, body := shapeBody(p, false)
 	shapeID, shapeCreated, err = st.SaveFreeze(p, id, key, body, setSticky)
 	if err != nil {
-		return "", false, err
+		return "", false, fmt.Errorf("freeze save: %w", err)
 	}
-	if b, ok := st.GetShape(shapeID); ok {
-		writeConfigMirror(shapeID, b)
-	}
+	mirrorAfter(st, shapeID)
 	return shapeID, shapeCreated, nil
-}
-
-func SetActiveFromPreset(st *store.Store, p *store.Preset) (string, error) {
-	id, _, err := StickFrom(st, p)
-	return id, err
 }
 
 func ResetActive(st *store.Store) error {
 	if st == nil {
-		return nil
+		return fmt.Errorf("reset sticky: nil store")
 	}
 	syncConfigToDB(st)
-	ensureDefaultBoth(st)
-	return st.SetSticky("default")
+	if err := ensureDefault(st); err != nil {
+		return err
+	}
+	if err := st.SetSticky("default"); err != nil {
+		return fmt.Errorf("set sticky default: %w", err)
+	}
+	return nil
 }
 
 func Apply(tmpl *store.Preset, name, root string) *store.Preset {
@@ -458,21 +455,33 @@ func resolveCwd(root, cwd string) string {
 }
 
 func ConnectProject(ctl *tmux.Ctl, st *store.Store, name, cwd string) error {
+	if ctl == nil {
+		return fmt.Errorf("connect project: nil tmux")
+	}
+	if name == "" {
+		return fmt.Errorf("connect project: empty session name")
+	}
 	if ctl.Has(name) {
-		return ctl.Connect(name, "")
+		if err := ctl.Connect(name, ""); err != nil {
+			return fmt.Errorf("attach %q: %w", name, err)
+		}
+		return nil
 	}
 	if st != nil {
 		if p, err := st.Get(name); err == nil {
-			_ = st.Touch(name)
-			return ctl.ConnectPreset(p)
+			_ = st.Touch(name) // best-effort recency
+			if err := ctl.ConnectPreset(p); err != nil {
+				return fmt.Errorf("load preset %q: %w", name, err)
+			}
+			return nil
 		}
 	}
-	tmpl, _, err := LoadActive(st)
+	tmpl, sid, err := LoadActive(st)
 	if err != nil {
-		return err
+		return fmt.Errorf("load sticky shape: %w", err)
 	}
-	return ctl.ConnectPreset(Apply(tmpl, name, cwd))
+	if err := ctl.ConnectPreset(Apply(tmpl, name, cwd)); err != nil {
+		return fmt.Errorf("bake sticky %q as %q: %w", sid, name, err)
+	}
+	return nil
 }
-
-func presetToTemplate(p *store.Preset) *store.Preset { return ToShape(p, p.Name) }
-func builtinDefaultTemplate() *store.Preset            { return builtinDefault() }

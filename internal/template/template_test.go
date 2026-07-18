@@ -182,7 +182,6 @@ func TestConfigHandEditWinsByMtime(t *testing.T) {
 	}
 }
 
-
 func TestFormatOmitsDupCwd(t *testing.T) {
 	p := &store.Preset{
 		Name: "gotomux",

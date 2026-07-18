@@ -30,5 +30,3 @@ func TestLayoutNamedOnly(t *testing.T) {
 		t.Fatal("single pane no layout")
 	}
 }
-
-
