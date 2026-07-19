@@ -68,8 +68,8 @@ Keys (fzf-style combobox - type to filter anytime):
   esc / ctrl-c  cancel (exit 0)
 
 Store:  $XDG_DATA_HOME/gotomux/state.db  (presets, shapes, sticky, usage)
-Shapes: $XDG_CONFIG_HOME/gotomux/shapes/<id>.json (1-1 backup)
-Edit:   JSON {name,cwd,windows:[{name,split,panes:[{cwd,cmd}]}]}
+Shapes: $XDG_CONFIG_HOME/gotomux/shapes/<label>--<id>.json (backup)
+Edit:   JSON {id,label,windows:[{name,split,panes:[{cmd}]}]}
 `, version)
 		return nil
 	default:
