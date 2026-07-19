@@ -5,6 +5,7 @@ import (
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+
 	"github.com/fm39hz/gotomux/internal/store"
 	"github.com/fm39hz/gotomux/internal/tmux"
 )
@@ -18,11 +19,9 @@ const (
 )
 
 // Source feeds the picker. Snapshot seeds paint; Refresh is optional truth update.
-// Add a source: implement this + register in defaultSources; connect via kind/src.
 type Source interface {
 	ID() string
 	Snapshot() []Item
-	// Refresh: Cmd -> sourceMsg; nil means Snapshot is already complete.
 	Refresh() tea.Cmd
 }
 
@@ -32,11 +31,22 @@ type sourceMsg struct {
 	items []Item
 }
 
+// tmuxSnapshot: share one live list across sources that need it.
+var tmuxSnapshot []tmux.LiveSession
+
 // defaultSources order = dedup priority (first wins name/path).
+// tmuxSnapshot is captured once per Snapshot cycle.
 func defaultSources(ctl *tmux.Ctl, store *store.Store, createName, createCwd string) []Source {
+	// snapshot tmux once for all sources this paint
+	tmuxSnapshot = nil
+	if ctl != nil {
+		if live, err := ctl.ListLive(); err == nil && len(live) > 0 {
+			tmuxSnapshot = live
+		}
+	}
 	return []Source{
-		&createSource{ctl: ctl, name: createName, cwd: createCwd},
-		&tmuxSource{ctl: ctl},
+		&createSource{ctl: ctl, name: createName, cwd: createCwd, live: tmuxSnapshot},
+		&tmuxSource{live: tmuxSnapshot},
 		&presetSource{store: store},
 		&zoxideSource{},
 	}
@@ -48,6 +58,7 @@ type createSource struct {
 	ctl  *tmux.Ctl
 	name string
 	cwd  string
+	live []tmux.LiveSession
 }
 
 func (s *createSource) ID() string { return SrcCreate }
@@ -56,18 +67,22 @@ func (s *createSource) Snapshot() []Item {
 	if s.name == "" {
 		return nil
 	}
-	// Inside tmux: no Create - cwd spin-up is for outside; jump via zoxide/active.
-	if s.ctl != nil && s.ctl.CurrentSession() != "" {
-		return nil
-	}
-	if s.ctl != nil {
-		if live, err := s.ctl.ListLive(); err == nil {
-			for _, ls := range live {
-				if ls.Name == s.name {
-					return nil
-				}
+	// Inside tmux: no Create (jump via active/zoxide).
+	if len(s.live) > 0 {
+		for _, ls := range s.live {
+			if ls.Name == s.name {
+				return nil
 			}
 		}
+		return nil
+	}
+	if s.ctl == nil {
+		return nil
+	}
+	// no live sessions found by our snapshot guard, but ctl may still reply
+	// edge: use the shared list; if empty, skip create
+	if len(s.live) == 0 {
+		// outside tmux with no sessions at all → still show Create
 	}
 	return []Item{{
 		Src:   SrcCreate,
@@ -81,23 +96,17 @@ func (s *createSource) Snapshot() []Item {
 
 func (s *createSource) Refresh() tea.Cmd { return nil }
 
-// --- local tmux ---
+// --- local tmux (uses shared snapshot) ---
 
-type tmuxSource struct{ ctl *tmux.Ctl }
+type tmuxSource struct {
+	live []tmux.LiveSession
+}
 
 func (s *tmuxSource) ID() string { return SrcTmux }
 
 func (s *tmuxSource) Snapshot() []Item {
-	if s.ctl == nil {
-		return nil
-	}
-	live, err := s.ctl.ListLive()
-	if err != nil {
-		return nil
-	}
-	out := make([]Item, 0, len(live))
-	for _, ls := range live {
-		// Recency: max(last_attached, activity, created) - "just left" / hot session
+	out := make([]Item, 0, len(s.live))
+	for _, ls := range s.live {
 		rec := ls.LastAttached
 		if ls.Activity > rec {
 			rec = ls.Activity
@@ -163,7 +172,6 @@ func (s *zoxideSource) Snapshot() []Item {
 	if !ok {
 		return nil
 	}
-	// ensure src tag (older cache rows may lack it)
 	for i := range items {
 		items[i].Src = SrcZoxide
 		items[i].Kind = KindZoxide
@@ -198,7 +206,6 @@ func refreshCmds(srcs []Source) []tea.Cmd {
 }
 
 // flattenSources: source-order merge with name/path dedup (first wins).
-// emptyQuery: hide create; cap zoxide to zoxCap. query: full pools.
 func flattenSources(order []Source, bySrc map[string][]Item, query string) []Item {
 	q := query != ""
 	names := map[string]bool{}
@@ -244,9 +251,6 @@ func applyRankMeta(bySrc map[string][]Item, st *store.Store, pairs map[string]in
 			applyUsage(items, us, now)
 		}
 		applyCooccur(items, pairs)
-		// Inside tmux, idle list: current session is where you already are.
-		// Zero its recency so "just left" (highest last_attached) and other
-		// MRU actives surface first. Kind stays Active so typed match still works.
 		if ctxSession != "" && id == SrcTmux {
 			for i := range items {
 				if items[i].Name == ctxSession && items[i].Kind == KindActive {

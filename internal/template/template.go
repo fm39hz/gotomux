@@ -174,7 +174,8 @@ var syncOnce sync.Once
 //	  - mtime <= DB.updated_at -> DB wins, rewrite file from DB (backup catch-up)
 //	DB id without file -> write mirror (backup fill)
 //
-// Freeze/sticky never read config on hot path after this once.
+// Import config -> DB once per process. Does not rebuild shapes/ tree.
+// Full disk reconcile: mirrorAfter / reconcileConfigShapes after mutations only.
 func syncConfigToDB(st *store.Store) {
 	if st == nil {
 		return
@@ -250,7 +251,7 @@ func syncConfigToDB(st *store.Store) {
 			}
 		}
 		_ = ensureDefault(st)
-		reconcileConfigShapes(st)
+		// Do NOT full-reconcile on open - rewrite of shapes/ is freeze/stick only.
 	})
 }
 
@@ -481,11 +482,17 @@ func mirrorAfter(st *store.Store, _ string) {
 	reconcileConfigShapes(st)
 }
 
+// ensureShapesReady imports hand-edited config once per process (no full reconcile).
+// Call before freeze/stick/load-active that must see config files.
+func ensureShapesReady(st *store.Store) {
+	syncConfigToDB(st)
+}
+
 func ReadSticky(st *store.Store) string {
 	if st == nil {
 		return "default"
 	}
-	syncConfigToDB(st)
+	// Hot path: DB only. Config import is deferred to mutation / LoadActive.
 	id := st.StickyID()
 	if id == "" {
 		return "default"
@@ -493,14 +500,14 @@ func ReadSticky(st *store.Store) string {
 	return id
 }
 
-// StickyLabel: human slug for UI (algorithmic from shape body).
+// StickyLabel: human slug for UI - DB read only (no shapes/ rewrite).
 func StickyLabel(st *store.Store) string {
-	id := ReadSticky(st)
-	if id == "" || id == "default" {
+	if st == nil {
 		return "default"
 	}
-	if st == nil {
-		return id
+	id := st.StickyID()
+	if id == "" || id == "default" {
+		return "default"
 	}
 	body, ok := st.GetShape(id)
 	if !ok {
@@ -519,7 +526,7 @@ func LoadActive(st *store.Store) (*store.Preset, string, error) {
 	if st == nil {
 		return builtinDefault(), "default", nil
 	}
-	syncConfigToDB(st)
+	ensureShapesReady(st)
 	id := st.StickyID()
 	if id == "" {
 		id = "default"
@@ -570,7 +577,7 @@ func StickFrom(st *store.Store, p *store.Preset) (id string, created bool, err e
 	if p == nil {
 		return "", false, fmt.Errorf("stick: nil preset")
 	}
-	syncConfigToDB(st)
+	ensureShapesReady(st)
 	id, key, body := shapeBody(p, false)
 	outID, created, err := st.StickShape(id, key, body)
 	if err != nil {
@@ -586,7 +593,7 @@ func RememberShape(st *store.Store, p *store.Preset) (id string, created bool, e
 	if st == nil || p == nil {
 		return "", false, nil
 	}
-	syncConfigToDB(st)
+	ensureShapesReady(st)
 	id, key, body := shapeBody(p, false)
 	outID, created, err := st.RememberShapeOnly(id, key, body)
 	if err != nil {
@@ -602,7 +609,7 @@ func FreezeSave(st *store.Store, p *store.Preset, setSticky bool) (shapeID strin
 	if st == nil || p == nil {
 		return "", false, fmt.Errorf("freeze save: nil store or preset")
 	}
-	syncConfigToDB(st)
+	ensureShapesReady(st)
 	id, key, body := shapeBody(p, false)
 	shapeID, shapeCreated, err = st.SaveFreeze(p, id, key, body, setSticky)
 	if err != nil {
@@ -634,7 +641,7 @@ func ResetActive(st *store.Store) error {
 	if st == nil {
 		return fmt.Errorf("reset sticky: nil store")
 	}
-	syncConfigToDB(st)
+	ensureShapesReady(st)
 	if err := ensureDefault(st); err != nil {
 		return err
 	}
