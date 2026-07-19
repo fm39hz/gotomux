@@ -124,10 +124,20 @@ func TestStickMirrorAndDedupe(t *testing.T) {
 	if id1 == "default" {
 		t.Fatal("3-pane shape must not be default")
 	}
-	// 1-1 file
-	fp := filepath.Join(dir, "cfg", "gotomux", "shapes", id1+".json")
-	if _, err := os.Stat(fp); err != nil {
-		t.Fatalf("missing config mirror %s: %v", fp, err)
+	// mirror file uses label--suffix.json (id lives inside JSON)
+	ents0, _ := os.ReadDir(filepath.Join(dir, "cfg", "gotomux", "shapes"))
+	found := false
+	for _, e := range ents0 {
+		if strings.HasSuffix(e.Name(), ".json") && e.Name() != "default.json" {
+			raw, _ := os.ReadFile(filepath.Join(dir, "cfg", "gotomux", "shapes", e.Name()))
+			if strings.Contains(string(raw), id1) {
+				found = true
+				break
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("missing config mirror containing id %s in %v", id1, ents0)
 	}
 	// same shape different project
 	p2 := &store.Preset{
@@ -195,7 +205,20 @@ func TestConfigHandEditWinsByMtime(t *testing.T) {
 	if err != nil || id == "" {
 		t.Fatal(id, err)
 	}
-	path := filepath.Join(dir, "cfg", "gotomux", "shapes", id+".json")
+	// find mirrored file for id (label--suffix.json)
+	var path string
+	entsH, _ := os.ReadDir(filepath.Join(dir, "cfg", "gotomux", "shapes"))
+	for _, e := range entsH {
+		raw, _ := os.ReadFile(filepath.Join(dir, "cfg", "gotomux", "shapes", e.Name()))
+		if strings.Contains(string(raw), id) {
+			path = filepath.Join(dir, "cfg", "gotomux", "shapes", e.Name())
+			break
+		}
+	}
+	if path == "" {
+		// write new label-style path
+		path = filepath.Join(dir, "cfg", "gotomux", "shapes", "hand--test.json")
+	}
 	// hand-edit: add third window role name change in topology
 	hand := &store.Preset{
 		Name: id,

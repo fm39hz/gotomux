@@ -62,21 +62,49 @@ func configShapesDir() string {
 	return dir
 }
 
-func shapeFilePath(id string) string {
+// shapeFilePath: human label slug + short id suffix for uniqueness.
+// default → default.json; others → <label>--<8hex>.json
+func shapeFilePath(id, label string) string {
 	dir := configShapesDir()
 	if dir == "" || id == "" {
 		return ""
 	}
-	return filepath.Join(dir, id+".json")
+	if id == "default" {
+		return filepath.Join(dir, "default.json")
+	}
+	lab := LabelFileSlug(label)
+	if lab == "" || lab == "shape" {
+		lab = "shape"
+	}
+	// short stable suffix from id (shape-<16hex> → last 8)
+	suf := id
+	if strings.HasPrefix(id, "shape-") && len(id) >= 14 {
+		suf = id[len(id)-8:]
+	} else if len(suf) > 8 {
+		suf = suf[len(suf)-8:]
+	}
+	return filepath.Join(dir, lab+"--"+suf+".json")
 }
 
-// writeConfigMirror: best-effort 1-1 file for id (no error to caller on fail).
+// writeConfigMirror: product JSON; filename from label, id inside body.
 func writeConfigMirror(id, body string) {
-	path := shapeFilePath(id)
-	if path == "" || body == "" {
+	if id == "" || body == "" {
+		return
+	}
+	label := ""
+	if p, err := Parse(body); err == nil {
+		label = ShapeLabel(p)
+	}
+	path := shapeFilePath(id, label)
+	if path == "" {
 		return
 	}
 	_ = os.MkdirAll(filepath.Dir(path), 0o755)
+	// drop legacy id-only filename if different path
+	legacy := filepath.Join(filepath.Dir(path), id+".json")
+	if legacy != path {
+		_ = os.Remove(legacy)
+	}
 	_ = os.WriteFile(path, []byte(body), 0o644)
 }
 
@@ -105,7 +133,6 @@ func syncConfigToDB(st *store.Store) {
 					if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
 						continue
 					}
-					id := strings.TrimSuffix(e.Name(), ".json")
 					path := filepath.Join(dir, e.Name())
 					raw, err := os.ReadFile(path)
 					if err != nil {
@@ -119,6 +146,30 @@ func syncConfigToDB(st *store.Store) {
 					pr, err := Parse(string(raw))
 					if err != nil {
 						continue // corrupt hand-edit: leave DB alone
+					}
+					// id from body field preferred; fallback filename stem / legacy shape-*
+					id := pr.Name
+					if !isShapeID(id) {
+						stem := strings.TrimSuffix(e.Name(), ".json")
+						if isShapeID(stem) {
+							id = stem
+						} else if i := strings.LastIndex(stem, "--"); i >= 0 {
+							suf := stem[i+2:]
+							id = "shape-" + suf // may be 8 hex; Upsert by this if exists
+							// try resolve full id from DB list by suffix
+							if ids, _ := st.ListShapes(); len(ids) > 0 {
+								for _, cand := range ids {
+									if strings.HasSuffix(cand, suf) || cand == id {
+										id = cand
+										break
+									}
+								}
+							}
+						} else if stem == "default" {
+							id = "default"
+						} else {
+							continue // unknown file naming
+						}
 					}
 					pure := ToShape(pr, id)
 					pure.Name = id
@@ -341,6 +392,27 @@ func ReadSticky(st *store.Store) string {
 		return "default"
 	}
 	return id
+}
+
+// StickyLabel: human slug for UI (algorithmic from shape body).
+func StickyLabel(st *store.Store) string {
+	id := ReadSticky(st)
+	if id == "" || id == "default" {
+		return "default"
+	}
+	if st == nil {
+		return id
+	}
+	body, ok := st.GetShape(id)
+	if !ok {
+		return id
+	}
+	p, err := Parse(body)
+	if err != nil {
+		return id
+	}
+	p = ToShape(p, id)
+	return ShapeLabel(p)
 }
 
 // LoadActive loads sticky pure shape from DB (SSoT).

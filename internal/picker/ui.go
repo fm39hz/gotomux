@@ -100,7 +100,7 @@ func NewModel(ctl *tmux.Ctl, store *store.Store, createName, createCwd string) m
 		ctl:     ctl,
 		store:   store,
 		maxShow: 12,
-		tmpl:    template.ReadSticky(store),
+		tmpl:    template.StickyLabel(store),
 		started: time.Now(),
 		ctx:     ctx,
 		pairs:   pairs,
@@ -221,11 +221,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.status = err.Error()
 					return m, nil
 				}
-				m.tmpl = id
+				m.tmpl = template.StickyLabel(m.store)
+				if m.tmpl == "" || m.tmpl == id {
+					m.tmpl = template.ShapeLabel(template.ToShape(p, id))
+				}
 				if created {
-					m.status = "sticky ← " + it.Name + "  (new)"
+					m.status = "sticky ← " + m.tmpl + "  (new)"
 				} else {
-					m.status = "sticky ← " + it.Name
+					m.status = "sticky ← " + m.tmpl
 				}
 				return m, nil
 			}

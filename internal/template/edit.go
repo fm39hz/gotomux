@@ -35,7 +35,10 @@ import (
 // Legacy key "layout" accepted on parse; dumps classified to split class.
 
 type presetJSON struct {
-	Name    string       `json:"name"`
+	// Shape product: id (stable) + label (human). Instance: name = session.
+	ID      string       `json:"id,omitempty"`
+	Label   string       `json:"label,omitempty"`
+	Name    string       `json:"name,omitempty"`
 	Cwd     string       `json:"cwd,omitempty"`
 	Windows []windowJSON `json:"windows"`
 }
@@ -66,9 +69,21 @@ func (w windowJSON) splitValue() string {
 // Window split uses product key "split" (not tmux's "layout").
 func Format(p *store.Preset) string {
 	root := p.Cwd
-	j := presetJSON{Name: p.Name}
-	if root != "" {
-		j.Cwd = root
+	j := presetJSON{}
+	if isShapeID(p.Name) || (p.Cwd == "" && looksLikeShapeTree(p)) {
+		// pure shape: id inside, label for humans
+		j.ID = p.Name
+		if j.ID == "" || j.ID == "tmp" {
+			j.ID = "shape"
+		}
+		j.Label = ShapeLabel(p)
+		// keep name = label for legacy readers; id is canonical
+		j.Name = j.Label
+	} else {
+		j.Name = p.Name
+		if root != "" {
+			j.Cwd = root
+		}
 	}
 	for _, w := range p.Windows {
 		wj := windowJSON{
@@ -107,16 +122,25 @@ func Parse(text string) (*store.Preset, error) {
 	if err := json.Unmarshal([]byte(text), &j); err != nil {
 		return nil, fmt.Errorf("json: %w", err)
 	}
-	if j.Name == "" {
-		return nil, fmt.Errorf("missing name")
+	name := j.Name
+	if j.ID != "" {
+		// shape file: runtime identity is id; label is display
+		name = j.ID
 	}
-	if !project.ValidSessionName(j.Name) {
-		return nil, fmt.Errorf("invalid name %q (no colon/control)", j.Name)
+	if name == "" && j.Label != "" {
+		name = j.Label
+	}
+	if name == "" {
+		return nil, fmt.Errorf("missing id/name")
+	}
+	// shape ids and labels are both safe; session names stricter
+	if j.ID == "" && !project.ValidSessionName(name) {
+		return nil, fmt.Errorf("invalid name %q (no colon/control)", name)
 	}
 	if len(j.Windows) == 0 {
 		return nil, fmt.Errorf("need at least one window")
 	}
-	p := &store.Preset{Name: j.Name, Cwd: j.Cwd}
+	p := &store.Preset{Name: name, Cwd: j.Cwd}
 	for i, w := range j.Windows {
 		nPanes := len(w.Panes)
 		if nPanes == 0 {
@@ -161,6 +185,28 @@ func Parse(text string) (*store.Preset, error) {
 		p.Windows = append(p.Windows, pw)
 	}
 	return p, nil
+}
+
+
+func isShapeID(s string) bool {
+	return s == "default" || strings.HasPrefix(s, "shape-")
+}
+
+func looksLikeShapeTree(p *store.Preset) bool {
+	if p == nil || p.Cwd != "" {
+		return false
+	}
+	for _, w := range p.Windows {
+		if w.Cwd != "" {
+			return false
+		}
+		for _, pn := range w.Panes {
+			if pn.Cwd != "" {
+				return false
+			}
+		}
+	}
+	return len(p.Windows) > 0
 }
 
 // CommitEdit saves preset and, on rename, deletes old name + rebinds ranking telemetry.
