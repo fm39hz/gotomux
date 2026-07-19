@@ -91,21 +91,76 @@ func writeConfigMirror(id, body string) {
 	if id == "" || body == "" {
 		return
 	}
-	label := ""
-	if p, err := Parse(body); err == nil {
-		label = ShapeLabel(p)
-	}
+	label := shapeLabelFromBody(id, body)
 	path := shapeFilePath(id, label)
 	if path == "" {
 		return
 	}
 	_ = os.MkdirAll(filepath.Dir(path), 0o755)
-	// drop legacy id-only filename if different path
-	legacy := filepath.Join(filepath.Dir(path), id+".json")
-	if legacy != path {
-		_ = os.Remove(legacy)
-	}
 	_ = os.WriteFile(path, []byte(body), 0o644)
+}
+
+func shapeLabelFromBody(id, body string) string {
+	if pr, err := Parse(body); err == nil {
+		pr = ToShape(pr, id)
+		pr.Name = id
+		return ShapeLabel(pr)
+	}
+	if id == "default" {
+		return "default"
+	}
+	return "shape"
+}
+
+// reconcileConfigShapes rebuilds shapes/ from DB (SSoT):
+// normalize bodies, write label--suffix.json, delete orphan/legacy files.
+// Runs on sync and after freeze/stick — silent, no UI.
+func reconcileConfigShapes(st *store.Store) {
+	if st == nil {
+		return
+	}
+	dir := configShapesDir()
+	if dir == "" {
+		return
+	}
+	_ = os.MkdirAll(dir, 0o755)
+	ids, err := st.ListShapes()
+	if err != nil {
+		return
+	}
+	keep := map[string]bool{}
+	for _, id := range ids {
+		body, ok := st.GetShape(id)
+		if !ok {
+			continue
+		}
+		if clean := normalizeShapeBody(id, body); clean != "" {
+			if clean != body {
+				pure := mustParseShape(id, clean)
+				_ = st.UpsertShapeByID(id, ShapeKey(pure), clean)
+				body = clean
+			}
+		}
+		label := shapeLabelFromBody(id, body)
+		path := shapeFilePath(id, label)
+		if path == "" {
+			continue
+		}
+		_ = os.WriteFile(path, []byte(body), 0o644)
+		keep[filepath.Base(path)] = true
+	}
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	for _, e := range ents {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
+			continue
+		}
+		if !keep[e.Name()] {
+			_ = os.Remove(filepath.Join(dir, e.Name()))
+		}
+	}
 }
 
 var syncOnce sync.Once
@@ -194,22 +249,7 @@ func syncConfigToDB(st *store.Store) {
 			}
 		}
 		_ = ensureDefault(st)
-		// rewrite every shape to product format (no dumps/cwd soup)
-		ids, _ := st.ListShapes()
-		for _, id := range ids {
-			body, ok := st.GetShape(id)
-			if !ok {
-				continue
-			}
-			if clean := normalizeShapeBody(id, body); clean != "" {
-				if clean != body {
-					pure := mustParseShape(id, clean)
-					_ = st.UpsertShapeByID(id, ShapeKey(pure), clean)
-				}
-				body = clean
-			}
-			writeConfigMirror(id, body)
-		}
+		reconcileConfigShapes(st)
 	})
 }
 
@@ -373,13 +413,8 @@ func shapeBody(p *store.Preset, forceDefault bool) (id, key, body string) {
 	return id, key, Format(pure)
 }
 
-func mirrorAfter(st *store.Store, id string) {
-	if st == nil || id == "" {
-		return
-	}
-	if b, ok := st.GetShape(id); ok {
-		writeConfigMirror(id, b)
-	}
+func mirrorAfter(st *store.Store, _ string) {
+	reconcileConfigShapes(st)
 }
 
 func ReadSticky(st *store.Store) string {
