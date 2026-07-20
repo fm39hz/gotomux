@@ -2,6 +2,7 @@ package picker
 
 import (
 	"fmt"
+	"os"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -68,7 +69,11 @@ func (s *createSource) Snapshot() []Item {
 	if s.name == "" {
 		return nil
 	}
-	// Inside tmux OR session already exists: hide Create (jump via active/zoxide).
+	// Inside tmux: hide Create, user already has a session (switch via active).
+	if os.Getenv("TMUX") != "" {
+		return nil
+	}
+	// Session already exists: hide Create
 	for _, ls := range s.live {
 		if ls.Name == s.name {
 			return nil
