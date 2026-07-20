@@ -177,11 +177,23 @@ func (s *zoxideSource) Refresh() tea.Cmd {
 	}
 }
 
-// snapshotAll: ordered Snapshot from every source (raw, no cross-dedupe).
+// snapshotAll calls Snapshot on every source in parallel goroutines.
 func snapshotAll(srcs []Source) map[string][]Item {
-	out := make(map[string][]Item, len(srcs))
+	type slot struct {
+		id    string
+		items []Item
+	}
+	ch := make(chan slot, len(srcs))
 	for _, s := range srcs {
-		out[s.ID()] = s.Snapshot()
+		s := s
+		go func() {
+			ch <- slot{s.ID(), s.Snapshot()}
+		}()
+	}
+	out := make(map[string][]Item, len(srcs))
+	for range srcs {
+		r := <-ch
+		out[r.id] = r.items
 	}
 	return out
 }

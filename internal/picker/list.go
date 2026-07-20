@@ -37,6 +37,8 @@ type Item struct {
 	Recency int64
 	// Cooccur: decayed pair score with current session.
 	Cooccur int64
+	// GitBranch: current branch if Path is a git repo; "" otherwise.
+	GitBranch string
 }
 
 const zoxCap = 40 // empty query: show top-N zoxide only; query uses full pool

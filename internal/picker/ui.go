@@ -96,6 +96,7 @@ func NewModel(ctl *tmux.Ctl, store *store.Store, createName, createCwd string) m
 		pairs, _ = store.PairScores(ctx, now)
 	}
 	applyRankMeta(bySrc, store, pairs, ctx)
+	enrichAllSync(bySrc)
 	m := model{
 		sources:    srcs,
 		bySrc:      bySrc,
@@ -139,6 +140,9 @@ func (m *model) refilter() {
 	}
 	if m.cursor < 0 {
 		m.cursor = 0
+	}
+	for i := range m.view {
+		setGitBranch(&m.view[i])
 	}
 }
 
@@ -418,6 +422,7 @@ func (m *model) reload() {
 		m.pairs = nil
 	}
 	applyRankMeta(m.bySrc, m.store, m.pairs, m.ctx)
+	enrichAllSync(m.bySrc)
 	m.refilter()
 }
 
@@ -553,14 +558,15 @@ func (m model) View() string {
 		for i := start; i < end; i++ {
 			it := m.view[i]
 			line := it.Title
+			if it.GitBranch != "" {
+				line += " (" + it.GitBranch + ")"
+			}
 			if it.Desc != "" {
-				// dim badge; hard column 34: pad title, clip title if exceeds
 				titleW := lipgloss.Width(line)
-				if titleW < 34 {
-					line += strings.Repeat(" ", 34-titleW)
+				if titleW < 44 {
+					line += strings.Repeat(" ", 44-titleW)
 				} else {
-					// long title: clip and let desc overflow naturally
-					line = truncateRunes(line, 32)
+					line = truncateRunes(line, 42)
 					line += "  "
 				}
 				line += styleDim.Render(it.Desc)
