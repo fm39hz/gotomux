@@ -299,6 +299,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 							_ = m.store.RecordKill(it.Name)
 						}
 						m.status = "killed " + it.Name
+						InvalidateCaches()
 						m.reload()
 					}
 				}
@@ -324,6 +325,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					} else {
 						m.status = "froze " + name
 					}
+					InvalidateCaches()
 					m.reload()
 				} else if it.Kind == KindPreset {
 					m.status = "session not running - attach first"
@@ -373,6 +375,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						m.status = err.Error()
 					} else {
 						m.status = "deleted " + it.Name
+						InvalidateCaches()
 						m.reload()
 					}
 				}
@@ -402,6 +405,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.status = msg.err.Error()
 		} else {
 			m.status = "saved " + msg.name
+			InvalidateCaches()
 			m.reload()
 		}
 		return m, nil

@@ -34,22 +34,44 @@ type sourceMsg struct {
 }
 
 // tmuxSnapshot: share one live list across sources that need it.
-var tmuxSnapshot []tmux.LiveSession
+var (
+	tmuxSnapshot   []tmux.LiveSession
+	tmuxSnapshotOK bool
+	presetCache    []store.PresetMeta
+	presetCacheOK  bool
+)
+
+// InvalidateCaches marks tmux and preset caches as stale so the next
+// defaultSources call re-fetches fresh data.
+func InvalidateCaches() {
+	tmuxSnapshotOK = false
+	presetCacheOK = false
+}
 
 // defaultSources order = dedup priority (first wins name/path).
-// tmuxSnapshot is captured once per Snapshot cycle.
-func defaultSources(ctl *tmux.Ctl, store *store.Store, createName, createCwd string) []Source {
-	// snapshot tmux once for all sources this paint
-	tmuxSnapshot = nil
-	if ctl != nil {
-		if live, err := ctl.ListLive(); err == nil && len(live) > 0 {
-			tmuxSnapshot = live
+func defaultSources(ctl *tmux.Ctl, st *store.Store, createName, createCwd string) []Source {
+	// tmux snapshot: reuse cached unless invalidated
+	if !tmuxSnapshotOK {
+		tmuxSnapshot = nil
+		tmuxSnapshotOK = true
+		if ctl != nil {
+			if live, err := ctl.ListLive(); err == nil && len(live) > 0 {
+				tmuxSnapshot = live
+			}
+		}
+	}
+	// preset cache: reuse unless invalidated
+	if !presetCacheOK && st != nil {
+		presetCache = nil
+		presetCacheOK = true
+		if meta, err := st.ListMeta(); err == nil {
+			presetCache = meta
 		}
 	}
 	return []Source{
 		&createSource{ctl: ctl, name: createName, cwd: createCwd, live: tmuxSnapshot},
 		&tmuxSource{live: tmuxSnapshot},
-		&presetSource{store: store},
+		&presetSource{store: st, cached: presetCache},
 		&zoxideSource{},
 	}
 }
@@ -129,17 +151,21 @@ func (s *tmuxSource) Refresh() tea.Cmd { return nil }
 
 // --- presets ---
 
-type presetSource struct{ store *store.Store }
+type presetSource struct {
+	store  *store.Store
+	cached []store.PresetMeta
+}
 
 func (s *presetSource) ID() string { return SrcPreset }
 
 func (s *presetSource) Snapshot() []Item {
-	if s.store == nil {
-		return nil
-	}
-	meta, err := s.store.ListMeta()
-	if err != nil {
-		return nil
+	meta := s.cached
+	if meta == nil && s.store != nil {
+		var err error
+		meta, err = s.store.ListMeta()
+		if err != nil {
+			return nil
+		}
 	}
 	out := make([]Item, 0, len(meta))
 	for _, m := range meta {
