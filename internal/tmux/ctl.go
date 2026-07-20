@@ -116,65 +116,98 @@ type LiveSession struct {
 	ActiveCmd    string // pane_current_command of the live active pane (snapshot)
 }
 
-// listPanesFmt for glance (session + command + active + alive).
-// One `list-panes -s` call covers all sessions.
-const listPanesFmt = "#{session_name}\t#{pane_current_command}\t#{?pane_active,1,0}\t#{?pane_dead,1,0}"
+// listSessFmt + listPanesFmt, single `tmux` fork via \; chain.
+// S/P prefix tells which command produced each output line.
+const listSessFmt = "S\t#{session_name}\t#{session_windows}\t#{session_path}\t#{session_last_attached}\t#{session_activity}\t#{session_created}\t#{session_attached}"
+const listPanesFmt = "P\t#{session_name}\t#{pane_current_command}\t#{?pane_active,1,0}\t#{?pane_dead,1,0}"
 
 func (c *Ctl) ListLive() ([]LiveSession, error) {
-	ss, err := c.t.ListSessions()
+	out, err := exec.Command("tmux",
+		"list-sessions", "-F", listSessFmt,
+		";",
+		"list-panes", "-s", "-F", listPanesFmt,
+	).Output()
 	if err != nil {
-		return nil, err
+		// tmux unreachable — caller should have checked New() first
+		return nil, fmt.Errorf("list live: %w", err)
 	}
-	out := make([]LiveSession, 0, len(ss))
 
-	// glance: prefer active pane, fallback to any non-shell pane
-	activeCmd := map[string]string{}
-	busyCmd := map[string]string{}
-	if raw, err := c.t.Command("list-panes", "-s", "-F", listPanesFmt); err == nil {
-		for _, line := range strings.Split(strings.TrimRight(raw, "\n"), "\n") {
-			line = strings.TrimSpace(line)
-			if line == "" {
+	type livePane struct {
+		sname  string
+		cmd    string
+		active bool
+		dead   bool
+	}
+
+	byName := map[string]LiveSession{}
+	var order []string
+	orderSeen := map[string]bool{}
+	panes := map[string][]livePane{}
+
+	for _, line := range strings.Split(strings.TrimRight(string(out), "\n"), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || len(line) < 2 || line[1] != '\t' {
+			continue
+		}
+		rest := line[2:]
+		fields := strings.Split(rest, "\t")
+
+		switch line[0] {
+		case 'S':
+			if len(fields) < 7 {
 				continue
 			}
-			fields := strings.Split(line, "\t")
+			name := fields[0]
+			nw, _ := strconv.Atoi(fields[1])
+			na, _ := strconv.Atoi(fields[6])
+			byName[name] = LiveSession{
+				Name: name, Windows: nw, Path: fields[2],
+				LastAttached: parseUnix(fields[3]), Activity: parseUnix(fields[4]),
+				Created: parseUnix(fields[5]), Attached: na,
+			}
+			if !orderSeen[name] {
+				orderSeen[name] = true
+				order = append(order, name)
+			}
+		case 'P':
 			if len(fields) < 4 {
 				continue
 			}
-			sname := strings.TrimSpace(fields[0])
-			cmd := strings.TrimSpace(fields[1])
-			active := fields[2] == "1"
-			dead := fields[3] == "1"
-			if sname == "" || cmd == "" || dead {
+			panes[fields[0]] = append(panes[fields[0]], livePane{
+				cmd: fields[1], active: fields[2] == "1", dead: fields[3] == "1",
+			})
+		}
+	}
+
+	activeCmd := map[string]string{}
+	busyCmd := map[string]string{}
+	for sn, list := range panes {
+		for _, p := range list {
+			if p.cmd == "" || p.dead {
 				continue
 			}
-			if _, seen := activeCmd[sname]; !seen && active {
-				activeCmd[sname] = cmd
+			if _, seen := activeCmd[sn]; !seen && p.active {
+				activeCmd[sn] = p.cmd
 			}
-			if _, seen := busyCmd[sname]; !seen && !toolclass.IsShell(cmd) {
-				busyCmd[sname] = cmd
+			if _, seen := busyCmd[sn]; !seen && !toolclass.IsShell(p.cmd) {
+				busyCmd[sn] = p.cmd
 			}
 		}
 	}
-	for _, s := range ss {
-		cmd := activeCmd[s.Name]
+
+	out2 := make([]LiveSession, 0, len(order))
+	for _, name := range order {
+		s := byName[name]
+		cmd := activeCmd[name]
 		if cmd == "" || toolclass.IsShell(cmd) {
-			if b, ok := busyCmd[s.Name]; ok {
+			if b, ok := busyCmd[name]; ok {
 				cmd = b
 			}
 		}
-		ls := LiveSession{
-			Name:         s.Name,
-			Windows:      s.Windows,
-			Path:         s.Path,
-			LastAttached: parseUnix(s.LastAttached),
-			Activity:     parseUnix(s.Activity),
-			Created:      parseUnix(s.Created),
-			Attached:     s.Attached,
-			ActiveCmd:    cmd,
-		}
-		out = append(out, ls)
+		s.ActiveCmd = cmd
+		out2 = append(out2, s)
 	}
-	return out, nil
+	return out2, nil
 }
 
 // parseUnix: tmux/gotmux often expose epoch seconds as decimal string.
