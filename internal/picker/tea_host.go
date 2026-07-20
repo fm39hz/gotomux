@@ -9,22 +9,27 @@ import (
 )
 
 // TeaOpts: force /dev/tty so display-popup + default-shell=nu still get a real TTY.
-// Always inline (no alt-screen): shell prompt / scrollback stay visible - fzf-style.
+// Inside tmux ($TMUX set): alt-screen (avoids popup border flash from nvim).
+// Outside tmux: inline (fzf-style). scrollback stays visible.
 //
 // WithoutSignalHandler: main owns SIGINT for the picker phase only.
 //   - raw TTY: Ctrl+C arrives as KeyMsg -> ActionQuit (cancel)
 //   - SIGINT (non-raw / spam): main calls Program.Quit() -> cancel, exit 0
-// Quit path must ClearInline(FrameLines()) so the list does not linger.
 func TeaOpts() (opts []tea.ProgramOption, alt bool, err error) {
 	tty, err := os.OpenFile("/dev/tty", os.O_RDWR, 0)
 	if err != nil {
 		return []tea.ProgramOption{tea.WithoutSignalHandler()}, false, nil
 	}
-	return []tea.ProgramOption{
+	alt = os.Getenv("TMUX") != ""
+	opts = []tea.ProgramOption{
 		tea.WithInput(tty),
 		tea.WithOutput(tty),
 		tea.WithoutSignalHandler(),
-	}, false, nil
+	}
+	if alt {
+		opts = append(opts, tea.WithAltScreen())
+	}
+	return
 }
 
 // truncateRunes cuts s to at most n runes, adding "..." when clipped.
