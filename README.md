@@ -22,8 +22,8 @@ make install    # or: make build && ./gotomux
 make pkg        # Arch: dist/*.pkg.tar.zst
 ```
 
-**Requires:** `tmux`  
-**Optional:** `zoxide` (`zoxide query -l`), Nerd Font (TUI icons, or set `GOTOMUX_ASCII=1` to forces plain text)
+**Requires:** `tmux`, `zoxide`
+**Optional:** Nerd Font (TUI icons, or set `GOTOMUX_ASCII=1` to forces plain text)
 
 ## CLI
 
@@ -40,7 +40,7 @@ gotomux -h          # show help
 
 | Key                 | Action                                                |
 | ------------------- | ----------------------------------------------------- |
-| type                | filter (Vietnamese diacritics folded)                 |
+| type                | filter (diacritics folded)                            |
 | `enter`             | connect                                               |
 | `ctrl-n` / `ctrl-p` | next / prev                                           |
 | `ctrl-u` / `ctrl-w` | clear query / delete word                             |
@@ -54,67 +54,6 @@ gotomux -h          # show help
 ### shell (launch picker only)
 
 One action: run `gotomux` (Ctrl+B in the samples; pick another chord if it clashes). Binary on `PATH` (e.g. `$(go env GOPATH)/bin`).
-
-#### bash (readline)
-
-[`bind -x`](https://www.gnu.org/software/bash/manual/html_node/Bash-Builtins.html) runs a shell command for a keyseq. Whole binding is one argument (usually single-quoted):
-
-```bash
-# ~/.bashrc
-bind -x '"\C-b": gotomux'
-```
-
-#### bash + ble.sh
-
-ble takes over the line editor; use [`ble-bind`](https://github.com/akinomyoga/ble.sh) after `source ble.sh`, not plain `bind -x`.
-
-From the [ble.sh README](https://github.com/akinomyoga/ble.sh): **`-c`** runs a shell command; **`-x`** is for bash-`bind -x`-style edit functions (READLINE\_\*); **`-f`** binds a ble widget.
-
-```bash
-# after: source /path/to/ble.sh  (or your distro ble entrypoint)
-ble-bind -c 'C-b' 'gotomux'
-```
-
-#### zsh (zle)
-
-User widgets: shell function + [`zle -N`](https://zsh.sourceforge.io/Doc/Release/Zsh-Line-Editor.html) + [`bindkey`](https://zsh.sourceforge.io/Doc/Release/Zsh-Line-Editor.html):
-
-```zsh
-# ~/.zshrc
-gotomux-widget() { gotomux }
-zle -N gotomux-widget
-bindkey '^b' gotomux-widget
-```
-
-Vi/emacs maps if you use them:
-
-```zsh
-bindkey -M emacs '^b' gotomux-widget
-bindkey -M vicmd '^b' gotomux-widget
-bindkey -M viins '^b' gotomux-widget
-```
-
-#### fish
-
-Prefer `fish_user_key_bindings` or `conf.d`:
-
-```fish
-# ~/.config/fish/functions/fish_user_key_bindings.fish
-function fish_user_key_bindings
-    bind ctrl-b gotomux
-end
-```
-
-Or:
-
-```fish
-# ~/.config/fish/conf.d/gotomux.fish
-bind ctrl-b gotomux
-```
-
-**oh-my-fish:** themes/plugins may reset binds. Keep the bind in `conf.d/gotomux.fish` or at the **end** of `config.fish` after omf init so it wins.
-
-Discover what the terminal sends: `fish_key_reader`.
 
 #### nushell
 
@@ -199,20 +138,20 @@ Shape JSON sketch:
 
 Sources form a space×time matrix:
 
-| | Here | Anywhere |
-|---|---|---|
-| Future | **Create** | **Zoxide** |
-| Present | — | **Active** |
-| Past | — | **Preset** |
+|         | Here       | Anywhere   |
+| ------- | ---------- | ---------- |
+| Future  | **Create** | **Zoxide** |
+| Present | -          | **Active** |
+| Past    | -          | **Preset** |
 
 Tiered tuple sort: `tier > recency > cooccur > kind > detail > busy > pathQ > idx`.
-Same algorithm everywhere — environment (terminal, tmux, remote) only changes inputs:
+Same algorithm everywhere - environment (terminal, tmux, remote) only changes inputs:
 
 - **ctxSession set** (inside tmux): items matching current session name excluded;
   cooccur overlay active for remaining items.
 - **No ctxSession** (terminal, remote standalone): all items visible; cooccur = 0.
 
-"Just left" surfaces via recency — no special case.
+"Just left" surfaces via recency - no special case.
 
 ## Env
 
@@ -244,7 +183,7 @@ make help && make test
 
 - [tmux](https://github.com/tmux/tmux), [zoxide](https://github.com/ajeetdsouza/zoxide)
 - [Bubble Tea](https://github.com/charmbracelet/bubbletea), [fzf](https://github.com/junegunn/fzf), [gotmux](https://github.com/GianlucaP106/gotmux), [modernc sqlite](https://gitlab.com/cznic/sqlite)
-- [go-git](https://github.com/go-git/go-git), [gopsutil](https://github.com/shirou/gopsutil), [projectdetect](https://github.com/richardwooding/projectdetect), [go-devicons](https://github.com/epilande/go-devicons)
+- [gopsutil](https://github.com/shirou/gopsutil), [projectdetect](https://github.com/richardwooding/projectdetect), [go-devicons](https://github.com/epilande/go-devicons)
 
 ## License
 
