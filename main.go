@@ -134,7 +134,7 @@ func connectItem(ctl *tmux.Ctl, st *store.Store, it picker.Item) error {
 	// ranking telemetry - never fail the connect
 	if st != nil {
 		_ = st.RecordOpen(it.Name)
-		if live, e := ctl.ListLive(); e == nil {
+		if live := picker.CachedLiveSessions(); len(live) > 0 {
 			names := make([]string, 0, len(live))
 			for _, s := range live {
 				if s.Name != it.Name {

@@ -48,6 +48,10 @@ func InvalidateCaches() {
 	presetCacheOK = false
 }
 
+// CachedLiveSessions returns the last tmux snapshot, or nil. Used by
+// connectItem for pair recording without a second ListLive call.
+func CachedLiveSessions() []tmux.LiveSession { return tmuxSnapshot }
+
 // defaultSources order = dedup priority (first wins name/path).
 func defaultSources(ctl *tmux.Ctl, st *store.Store, createName, createCwd string) []Source {
 	if !tmuxSnapshotOK {

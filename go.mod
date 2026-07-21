@@ -3,7 +3,6 @@ module github.com/fm39hz/gotomux
 go 1.26.5
 
 require (
-	github.com/GianlucaP106/gotmux v0.5.0
 	github.com/charmbracelet/bubbletea v1.3.10
 	github.com/charmbracelet/lipgloss v1.1.0
 	github.com/epilande/go-devicons v0.0.0-20250505162540-0661cab71a28

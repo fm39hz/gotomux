@@ -8,7 +8,6 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/GianlucaP106/gotmux/gotmux"
 	"github.com/fm39hz/gotomux/internal/project"
 	"github.com/fm39hz/gotomux/internal/store"
 	"github.com/fm39hz/gotomux/internal/toolclass"
@@ -28,7 +27,6 @@ func IsLayoutDump(s string) bool {
 	return strings.Contains(s, ",") && (strings.Contains(s, "{") || strings.Contains(s, "[") || strings.Contains(s, "x"))
 }
 
-// LayoutForStore: instance freeze may keep named or raw dump.
 func LayoutForStore(layout string, nPanes int) string {
 	if nPanes <= 1 || layout == "" {
 		return ""
@@ -39,13 +37,6 @@ func LayoutForStore(layout string, nPanes int) string {
 	return ""
 }
 
-// LayoutForShape: product split essence only - no pixel dumps, no ratios.
-//
-//	named -> keep
-//	dump  -> axis/grid class (even-horizontal | even-vertical | tiled)
-//	else  -> "" (InferSplit defaults even-horizontal)
-//
-// Essence = how panes nest, not sizes/tools/paths.
 func LayoutForShape(layout string, nPanes int) string {
 	if nPanes <= 1 {
 		return ""
@@ -59,8 +50,6 @@ func LayoutForShape(layout string, nPanes int) string {
 	return ""
 }
 
-// classifyDump maps tmux window_layout to a portable named split.
-// { = horizontal cuts, [ = vertical cuts; both -> tiled (nested grid).
 func classifyDump(dump string) string {
 	h := strings.Contains(dump, "{")
 	v := strings.Contains(dump, "[")
@@ -76,8 +65,6 @@ func classifyDump(dump string) string {
 	}
 }
 
-// InferSplit materialises concrete split at bake (shape->instance), not Load.
-// multi-pane + empty -> even-horizontal.
 func InferSplit(layout string, nPanes int) string {
 	if nPanes <= 1 {
 		return ""
@@ -91,35 +78,45 @@ func InferSplit(layout string, nPanes int) string {
 	return "even-horizontal"
 }
 
-
-
-type Ctl struct {
-	t *gotmux.Tmux
-}
+type Ctl struct{}
 
 func New() (*Ctl, error) {
-	t, err := gotmux.DefaultTmux()
-	if err != nil {
-		return nil, err
+	// Verify tmux is reachable
+	if err := exec.Command("tmux", "info").Run(); err != nil {
+		return nil, fmt.Errorf("tmux not reachable: %w", err)
 	}
-	return &Ctl{t: t}, nil
+	return &Ctl{}, nil
 }
+
+func tmuxCmd(args ...string) (string, error) {
+	out, err := exec.Command("tmux", args...).Output()
+	if err != nil {
+		return "", fmt.Errorf("tmux %s: %w", strings.Join(args, " "), err)
+	}
+	return strings.TrimSuffix(strings.TrimRight(string(out), "\n"), "\n"), nil
+}
+
+func tmuxRun(args ...string) error {
+	cmd := exec.Command("tmux", args...)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("tmux %s: %w (%s)", strings.Join(args, " "), err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+const listSessFmt = "S\t#{session_name}\t#{session_windows}\t#{session_path}\t#{session_last_attached}\t#{session_activity}\t#{session_created}\t#{session_attached}"
+const listPanesFmt = "P\t#{session_name}\t#{pane_current_command}\t#{?pane_active,1,0}\t#{?pane_dead,1,0}"
 
 type LiveSession struct {
 	Name         string
 	Windows      int
-	Path         string // session_path - for dedup vs zoxide
-	LastAttached int64  // unix; 0 if unknown
-	Activity     int64  // unix last pane activity
-	Created      int64  // unix session created
-	Attached     int    // client count
-	ActiveCmd    string // pane_current_command of the live active pane (snapshot)
+	Path         string
+	LastAttached int64
+	Activity     int64
+	Created      int64
+	Attached     int
+	ActiveCmd    string
 }
-
-// listSessFmt + listPanesFmt, single `tmux` fork via \; chain.
-// S/P prefix tells which command produced each output line.
-const listSessFmt = "S\t#{session_name}\t#{session_windows}\t#{session_path}\t#{session_last_attached}\t#{session_activity}\t#{session_created}\t#{session_attached}"
-const listPanesFmt = "P\t#{session_name}\t#{pane_current_command}\t#{?pane_active,1,0}\t#{?pane_dead,1,0}"
 
 func (c *Ctl) ListLive() ([]LiveSession, error) {
 	out, err := exec.Command("tmux",
@@ -128,7 +125,6 @@ func (c *Ctl) ListLive() ([]LiveSession, error) {
 		"list-panes", "-s", "-F", listPanesFmt,
 	).Output()
 	if err != nil {
-		// tmux unreachable — caller should have checked New() first
 		return nil, fmt.Errorf("list live: %w", err)
 	}
 
@@ -149,8 +145,7 @@ func (c *Ctl) ListLive() ([]LiveSession, error) {
 		if line == "" || len(line) < 2 || line[1] != '\t' {
 			continue
 		}
-		rest := line[2:]
-		fields := strings.Split(rest, "\t")
+		fields := strings.Split(line[2:], "\t")
 
 		switch line[0] {
 		case 'S':
@@ -210,13 +205,11 @@ func (c *Ctl) ListLive() ([]LiveSession, error) {
 	return out2, nil
 }
 
-// parseUnix: tmux/gotmux often expose epoch seconds as decimal string.
 func parseUnix(s string) int64 {
 	s = strings.TrimSpace(s)
 	if s == "" || s == "0" {
 		return 0
 	}
-	// strip fractional if any
 	if i := strings.IndexByte(s, '.'); i >= 0 {
 		s = s[:i]
 	}
@@ -228,16 +221,14 @@ func parseUnix(s string) int64 {
 }
 
 func (c *Ctl) Has(name string) bool {
-	return c.t.HasSession(name)
+	return exec.Command("tmux", "has-session", "-t", name).Run() == nil
 }
 
-// CurrentSession: attached session name, or empty outside tmux.
-// Uses gotmux Command (same socket path) - no extra raw exec import.
 func (c *Ctl) CurrentSession() string {
 	if os.Getenv("TMUX") == "" {
 		return ""
 	}
-	out, err := c.t.Command("display-message", "-p", "#S")
+	out, err := tmuxCmd("display-message", "-p", "#S")
 	if err != nil {
 		return ""
 	}
@@ -248,32 +239,10 @@ func (c *Ctl) Kill(name string) error {
 	if name == "" {
 		return fmt.Errorf("kill: empty session name")
 	}
-	s, err := c.t.GetSessionByName(name)
-	if err != nil {
-		return fmt.Errorf("kill %q: %w", name, err)
-	}
-	if s == nil {
-		return fmt.Errorf("kill %q: session not found", name)
-	}
-	if err := s.Kill(); err != nil {
-		return fmt.Errorf("kill %q: %w", name, err)
-	}
-	return nil
+	return tmuxRun("kill-session", "-t", name)
 }
 
-func (c *Ctl) run(args ...string) error {
-	if len(args) == 0 {
-		return fmt.Errorf("tmux: empty command")
-	}
-	if _, err := c.t.Command(args...); err != nil {
-		return fmt.Errorf("tmux %s: %w", strings.Join(args, " "), err)
-	}
-	return nil
-}
-
-// runChain: one tmux client process, commands separated by "\;" (literal).
-// Uses exec directly - gotmux Command error strings are opaque and some
-// chained forms confuse its query builder.
+// runChain: one tmux client process, commands separated by "\;".
 func (c *Ctl) runChain(parts ...[]string) error {
 	var args []string
 	first := true
@@ -297,10 +266,8 @@ func (c *Ctl) runChain(parts ...[]string) error {
 	return nil
 }
 
-// freezeFmt: one list-panes -s covers all windows/panes of a session.
 const freezeFmt = "#{window_index}\t#{window_name}\t#{window_layout}\t#{pane_index}\t#{pane_current_path}\t#{pane_current_command}\t#{pane_start_command}\t#{pane_pid}\t#{pane_active}\t#{session_path}"
 
-// Freeze: 1x list-panes + 1x ps snapshot (portable). No nested ListWindows/ListPanes.
 func (c *Ctl) Freeze(name string) (*store.Preset, error) {
 	if !project.ValidSessionName(name) {
 		return nil, fmt.Errorf("invalid session name %q", name)
@@ -309,7 +276,7 @@ func (c *Ctl) Freeze(name string) (*store.Preset, error) {
 		return nil, fmt.Errorf("session %q not found", name)
 	}
 
-	raw, err := c.t.Command("list-panes", "-s", "-t", "="+name, "-F", freezeFmt)
+	raw, err := tmuxCmd("list-panes", "-s", "-t", "="+name, "-F", freezeFmt)
 	if err != nil {
 		return nil, fmt.Errorf("list-panes: %w", err)
 	}
@@ -318,7 +285,6 @@ func (c *Ctl) Freeze(name string) (*store.Preset, error) {
 		return nil, fmt.Errorf("session %q has no panes", name)
 	}
 
-	// Lazy: only snapshot processes when some pane still looks like a shell.
 	var procs *procIndex
 	needPS := false
 	for _, line := range lines {
@@ -413,10 +379,6 @@ func (c *Ctl) Freeze(name string) (*store.Preset, error) {
 	return p, nil
 }
 
-// Load executes a materialised preset only - no topology/placement inference.
-// Inference (even split, R/Ck cwd) happens at bake (shape->instance) before Load.
-// One tmux client process; "\;" separators.
-// Targets: =sess: for new-window, =sess:N for window ops (base-index aware).
 func (c *Ctl) Load(p *store.Preset) error {
 	if !project.ValidSessionName(p.Name) {
 		return fmt.Errorf("invalid session name %q", p.Name)
@@ -452,7 +414,6 @@ func (c *Ctl) Load(p *store.Preset) error {
 			}
 			parts = append(parts, sp)
 		}
-		// Load executes only - split already materialised at bake/freeze.
 		if w.Layout != "" {
 			parts = append(parts, []string{"select-layout", "-t", t, w.Layout})
 		}
@@ -483,15 +444,14 @@ func (c *Ctl) Load(p *store.Preset) error {
 	parts = append(parts, []string{"select-window", "-t", windowTarget(p.Name, base)})
 
 	if err := c.runChain(parts...); err != nil {
-		_ = c.Kill(p.Name) // best-effort cleanup of half-created session
+		_ = c.Kill(p.Name)
 		return fmt.Errorf("load %q: %w", p.Name, err)
 	}
 	return nil
 }
 
-// windowBaseIndex: global base-index (many configs use 1).
 func (c *Ctl) windowBaseIndex() int {
-	out, err := c.t.Command("show-options", "-gv", "base-index")
+	out, err := tmuxCmd("show-options", "-gv", "base-index")
 	if err != nil {
 		return 0
 	}
@@ -502,21 +462,12 @@ func (c *Ctl) windowBaseIndex() int {
 	return n
 }
 
-// sessionTarget: "=name:" forces session context (never a window of same name).
-// Bare -t name is ambiguous when a window is named like the session
-// (freeze stores cwd basename / automatic-rename). new-window then hits
-// that window -> "create window failed: index N in use".
-func sessionTarget(session string) string {
-	return "=" + session + ":"
-}
+func sessionTarget(session string) string { return "=" + session + ":" }
 
-// windowTarget: "=name:N" - exact session + window index (base-index aware).
 func windowTarget(session string, idx int) string {
 	return fmt.Sprintf("=%s:%d", session, idx)
 }
 
-// safeWindowName: empty if name breaks targets or equals session name.
-// Equals session -> drop so we never reintroduce -t ambiguity after rename.
 func safeWindowName(name, session string) string {
 	name = strings.TrimSpace(name)
 	if name == "" {
@@ -533,7 +484,6 @@ func safeWindowName(name, session string) string {
 	}
 	return name
 }
-
 
 func normalizeWindows(wins []store.PresetWindow, sessCwd string) []store.PresetWindow {
 	if len(wins) == 0 {
@@ -575,7 +525,6 @@ func cmdArgs(cmd string) []string {
 	return strings.Fields(cmd)
 }
 
-// Connect attaches or switches to session. Creates empty session if missing.
 func (c *Ctl) Connect(name, cwd string) error {
 	if !project.ValidSessionName(name) {
 		return fmt.Errorf("invalid session name %q", name)
@@ -588,24 +537,21 @@ func (c *Ctl) Connect(name, cwd string) error {
 				return fmt.Errorf("connect %q: cwd: %w", name, err)
 			}
 		}
-		if err := c.run("new-session", "-d", "-s", name, "-c", cwd); err != nil {
+		if err := tmuxRun("new-session", "-d", "-s", name, "-c", cwd); err != nil {
 			return fmt.Errorf("create session %q: %w", name, err)
 		}
 	}
-	s, err := c.t.GetSessionByName(name)
-	if err != nil {
-		return fmt.Errorf("get session %q: %w", name, err)
-	}
-	if s == nil {
-		return fmt.Errorf("session %q not found after create", name)
-	}
 	if os.Getenv("TMUX") != "" {
-		if err := c.t.SwitchClient(&gotmux.SwitchClientOptions{TargetSession: name}); err != nil {
+		if err := tmuxRun("switch-client", "-t", name); err != nil {
 			return fmt.Errorf("switch to %q: %w", name, err)
 		}
 		return nil
 	}
-	if err := s.Attach(); err != nil {
+	cmd := exec.Command("tmux", "attach-session", "-t", name)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("attach %q: %w", name, err)
 	}
 	return nil
