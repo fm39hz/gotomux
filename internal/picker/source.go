@@ -2,6 +2,7 @@ package picker
 
 import (
 	"fmt"
+	"sync"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -11,88 +12,80 @@ import (
 	"github.com/fm39hz/gotomux/internal/toolclass"
 )
 
-// Source IDs - stable keys for bySrc slots and future remote hosts.
-const (
-	SrcCreate = "create"
-	SrcTmux   = "tmux"
-	SrcPreset = "preset"
-	SrcZoxide = "zoxide"
-)
-
-// Source feeds the picker. Snapshot seeds paint; Refresh is optional truth update.
-type Source interface {
-	ID() string
-	Snapshot() []Item
-	Refresh() tea.Cmd
+// FlattenFilter controls how flattenSources processes items from this source.
+type FlattenFilter struct {
+	Cap  int  // max items (0 = unlimited)
+	Hide bool // hide all items when query is non-empty
 }
 
-// sourceMsg replaces one source slot after background truth fetch.
+type Source interface {
+	Snapshot() []Item
+	Refresh() tea.Cmd
+	FlattenFilter(query string) FlattenFilter
+}
+
 type sourceMsg struct {
-	id    string
+	src   Source
 	items []Item
 }
 
-// tmuxSnapshot: share one live list across sources that need it.
-var (
-	tmuxSnapshot   []tmux.LiveSession
-	tmuxSnapshotOK bool
-	presetCache    []store.PresetMeta
-	presetCacheOK  bool
-)
-
-// InvalidateCaches marks tmux and preset caches as stale so the next
-// defaultSources call re-fetches fresh data.
-func InvalidateCaches() {
-	tmuxSnapshotOK = false
-	presetCacheOK = false
+type sourceCache struct {
+	tmuxSnap []tmux.LiveSession
+	tmuxOK   bool
+	presetM  []store.PresetMeta
+	presetOK bool
+	zoxMem   []Item
+	zoxAt    time.Time
+	zoxMu    *sync.Mutex
+	zoxSt    *store.Store
 }
 
-// CachedLiveSessions returns the last tmux snapshot, or nil. Used by
-// connectItem for pair recording without a second ListLive call.
-func CachedLiveSessions() []tmux.LiveSession { return tmuxSnapshot }
+func (c *sourceCache) invalidate() {
+	c.tmuxOK = false
+	c.presetOK = false
+}
 
-// defaultSources order = dedup priority (first wins name/path).
-func defaultSources(ctl *tmux.Ctl, st *store.Store, createName, createCwd string) []Source {
-	if !tmuxSnapshotOK {
-		tmuxSnapshot = nil
-		tmuxSnapshotOK = true
+var sessionSnap []tmux.LiveSession
+
+func CachedLiveSessions() []tmux.LiveSession { return sessionSnap }
+
+func defaultSources(ctl tmux.Connector, st *store.Store, createName, createCwd string, cache *sourceCache) []Source {
+	if !cache.tmuxOK {
+		cache.tmuxSnap = nil
+		cache.tmuxOK = true
 		if ctl != nil {
 			if live, err := ctl.ListLive(); err == nil && len(live) > 0 {
-				tmuxSnapshot = live
+				cache.tmuxSnap = live
 			}
 		}
 	}
+	sessionSnap = cache.tmuxSnap
 	return []Source{
-		&createSource{ctl: ctl, name: createName, cwd: createCwd, live: tmuxSnapshot},
-		&tmuxSource{live: tmuxSnapshot},
-		&presetSource{store: st},
-		&zoxideSource{},
+		&createSource{ctl: ctl, name: createName, cwd: createCwd, live: cache.tmuxSnap},
+		&tmuxSource{live: cache.tmuxSnap},
+		&presetSource{store: st, cache: cache},
+		&zoxideSource{cache: cache},
 	}
 }
 
-// --- create ---
-
 type createSource struct {
-	ctl  *tmux.Ctl
+	ctl  tmux.Connector
 	name string
 	cwd  string
 	live []tmux.LiveSession
 }
 
-func (s *createSource) ID() string { return SrcCreate }
-
 func (s *createSource) Snapshot() []Item {
 	if s.name == "" {
 		return nil
 	}
-	// Session already exists: hide Create
 	for _, ls := range s.live {
 		if ls.Name == s.name {
 			return nil
 		}
 	}
 	return []Item{{
-		Src:     SrcCreate,
+
 		Kind:    KindCreate,
 		Title:   fmt.Sprintf("[Create] %s", s.name),
 		Desc:    s.cwd,
@@ -103,14 +96,13 @@ func (s *createSource) Snapshot() []Item {
 }
 
 func (s *createSource) Refresh() tea.Cmd { return nil }
-
-// --- local tmux (uses shared snapshot) ---
+func (s *createSource) FlattenFilter(query string) FlattenFilter {
+	return FlattenFilter{Hide: query != ""}
+}
 
 type tmuxSource struct {
 	live []tmux.LiveSession
 }
-
-func (s *tmuxSource) ID() string { return SrcTmux }
 
 func (s *tmuxSource) Snapshot() []Item {
 	out := make([]Item, 0, len(s.live))
@@ -124,9 +116,7 @@ func (s *tmuxSource) Snapshot() []Item {
 		}
 		busy := mkBusy(ls.ActiveCmd)
 		out = append(out, Item{
-			Src:     SrcTmux,
 			Kind:    KindActive,
-			Busy:    busy,
 			Title:   fmt.Sprintf("[Active] %s", ls.Name),
 			Desc:    badgeFromBusy(busy),
 			Name:    ls.Name,
@@ -139,32 +129,32 @@ func (s *tmuxSource) Snapshot() []Item {
 }
 
 func (s *tmuxSource) Refresh() tea.Cmd { return nil }
-
-// --- presets ---
+func (s *tmuxSource) FlattenFilter(string) FlattenFilter { return FlattenFilter{} }
 
 type presetSource struct {
 	store *store.Store
+	cache *sourceCache
 }
-
-func (s *presetSource) ID() string { return SrcPreset }
 
 func (s *presetSource) Snapshot() []Item {
 	var meta []store.PresetMeta
-	if presetCacheOK {
-		meta = presetCache
+	if s.cache.presetOK {
+		meta = s.cache.presetM
 	} else if s.store != nil {
 		var err error
 		meta, err = s.store.ListMeta()
 		if err != nil {
 			return nil
 		}
-		presetCache = meta
-		presetCacheOK = true
+		s.cache.presetM = meta
+		s.cache.presetOK = true
+	}
+	if len(meta) == 0 {
+		return nil
 	}
 	out := make([]Item, 0, len(meta))
 	for _, m := range meta {
 		out = append(out, Item{
-			Src:     SrcPreset,
 			Kind:    KindPreset,
 			Title:   fmt.Sprintf("[Preset] %s", m.Name),
 			Desc:    "saved preset",
@@ -177,53 +167,57 @@ func (s *presetSource) Snapshot() []Item {
 }
 
 func (s *presetSource) Refresh() tea.Cmd { return nil }
+func (s *presetSource) FlattenFilter(string) FlattenFilter { return FlattenFilter{} }
 
-// --- zoxide (cache paint + full truth refresh) ---
-
-type zoxideSource struct{}
-
-func (s *zoxideSource) ID() string { return SrcZoxide }
+type zoxideSource struct {
+	cache *sourceCache
+}
 
 func (s *zoxideSource) Snapshot() []Item {
-	items, _, ok := loadZoxItemsSync()
+	items, _, ok := loadZoxItemsSync(s.cache)
 	if !ok {
 		return nil
 	}
 	for i := range items {
-		items[i].Src = SrcZoxide
 		items[i].Kind = KindZoxide
 	}
 	return items
 }
 
+func (s *zoxideSource) FlattenFilter(query string) FlattenFilter {
+	if query != "" {
+		return FlattenFilter{}
+	}
+	return FlattenFilter{Cap: zoxCap}
+}
+
 func (s *zoxideSource) Refresh() tea.Cmd {
+	src := Source(s)
 	return func() tea.Msg {
-		return sourceMsg{id: SrcZoxide, items: rebuildZoxItems()}
+		return sourceMsg{src: src, items: rebuildZoxItems(s.cache)}
 	}
 }
 
-// snapshotAll calls Snapshot on every source in parallel goroutines.
-func snapshotAll(srcs []Source) map[string][]Item {
+func snapshotAll(srcs []Source) map[Source][]Item {
 	type slot struct {
-		id    string
+		src   Source
 		items []Item
 	}
 	ch := make(chan slot, len(srcs))
 	for _, s := range srcs {
 		s := s
 		go func() {
-			ch <- slot{s.ID(), s.Snapshot()}
+			ch <- slot{s, s.Snapshot()}
 		}()
 	}
-	out := make(map[string][]Item, len(srcs))
+	out := make(map[Source][]Item, len(srcs))
 	for range srcs {
 		r := <-ch
-		out[r.id] = r.items
+		out[r.src] = r.items
 	}
 	return out
 }
 
-// refreshCmds: all non-nil Refresh cmds.
 func refreshCmds(srcs []Source) []tea.Cmd {
 	var cmds []tea.Cmd
 	for _, s := range srcs {
@@ -234,24 +228,19 @@ func refreshCmds(srcs []Source) []tea.Cmd {
 	return cmds
 }
 
-// flattenSources: source-order merge with name/path dedup (first wins).
-func flattenSources(order []Source, bySrc map[string][]Item, query string) []Item {
+func flattenSources(order []Source, bySrc map[Source][]Item, query string) []Item {
 	q := query != ""
 	names := map[string]bool{}
 	paths := map[string]bool{}
 	var out []Item
 	for _, s := range order {
-		id := s.ID()
-		items := bySrc[id]
-		if id == SrcZoxide && !q {
-			n := zoxCap
-			if n > len(items) {
-				n = len(items)
-			}
-			items = items[:n]
+		items := bySrc[s]
+		ff := s.FlattenFilter(query)
+		if ff.Cap > 0 && ff.Cap < len(items) {
+			items = items[:ff.Cap]
 		}
 		for _, it := range items {
-			if id == SrcCreate && q {
+			if ff.Hide && q {
 				continue
 			}
 			nr := normPath(it.Path)
@@ -268,35 +257,33 @@ func flattenSources(order []Source, bySrc map[string][]Item, query string) []Ite
 	return out
 }
 
-// applyRankMeta overlays usage + cooccur on all slots.
-func applyRankMeta(bySrc map[string][]Item, st *store.Store, pairs map[string]int64, ctxSession, ctxPath string) {
-	now := time.Now().Unix()
+func applyRankMeta(bySrc map[Source][]Item, st *store.Store, ctx Context) {
 	var us map[string]store.Usage
-	if st != nil {
+	if len(ctx.Usage) > 0 {
+		us = ctx.Usage
+	} else if st != nil {
 		us, _ = st.AllUsage()
 	}
-	for id, items := range bySrc {
+
+	for key, items := range bySrc {
 		if len(us) > 0 {
-			applyUsage(items, us, now)
+			applyUsage(items, us, ctx.Now)
 		}
-		applyCooccur(items, pairs)
-		if ctxSession != "" {
+		applyCooccur(items, ctx.Pairs)
+		if ctx.HasSession() {
 			n := 0
 			for _, it := range items {
-				if it.Name == ctxSession || (ctxPath != "" && it.Path == ctxPath) {
+				if it.Name == ctx.Session || (ctx.Path != "" && it.Path == ctx.Path) {
 					continue
 				}
 				items[n] = it
 				n++
 			}
-			items = items[:n]
+			bySrc[key] = items[:n]
 		}
-		bySrc[id] = items
 	}
 }
 
-// countSources total raw items (pre-dedupe, pre-cap).
-// mkBusy: any non-shell command -> busy marker. Empty otherwise.
 func mkBusy(cmd string) string {
 	if cmd == "" {
 		return ""
@@ -311,7 +298,6 @@ func mkBusy(cmd string) string {
 	return base
 }
 
-// badgeFromBusy: "*" if busy tool, empty string if idle.
 func badgeFromBusy(busy string) string {
 	if busy == "" {
 		return ""
@@ -319,7 +305,7 @@ func badgeFromBusy(busy string) string {
 	return busy + " *"
 }
 
-func countSources(bySrc map[string][]Item) int {
+func countSources(bySrc map[Source][]Item) int {
 	n := 0
 	for _, items := range bySrc {
 		n += len(items)

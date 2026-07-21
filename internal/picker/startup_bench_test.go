@@ -54,7 +54,6 @@ func TestStartupBreakdown(t *testing.T) {
 	}
 
 	t7 := time.Now()
-	BindStore(st)
 	_ = NewModel(ctl, st, name, root)
 	t.Logf("NewModel: %v", time.Since(t7))
 

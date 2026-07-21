@@ -2,38 +2,25 @@ package picker
 
 import (
 	"os/exec"
-	"sync"
 	"time"
 
 	"github.com/fm39hz/gotomux/internal/store"
 )
 
-// Zoxide truth is `zoxide query -l`. Cache (mem + SQLite) only seeds paint.
-// zoxideSource.Refresh always rebuilds full list into the search pool.
-
-var (
-	zoxItemMem   []Item
-	zoxItemMemAt time.Time
-	zoxItemMu    sync.Mutex
-	zoxStore     *store.Store
-)
-
-func BindStore(s *store.Store) { zoxStore = s }
-
-func loadZoxItemsSync() ([]Item, time.Duration, bool) {
-	zoxItemMu.Lock()
-	if len(zoxItemMem) > 0 {
-		age := time.Since(zoxItemMemAt)
-		items := zoxItemMem
-		zoxItemMu.Unlock()
+func loadZoxItemsSync(cache *sourceCache) ([]Item, time.Duration, bool) {
+	cache.zoxMu.Lock()
+	if len(cache.zoxMem) > 0 {
+		age := time.Since(cache.zoxAt)
+		items := cache.zoxMem
+		cache.zoxMu.Unlock()
 		return items, age, true
 	}
-	zoxItemMu.Unlock()
+	cache.zoxMu.Unlock()
 
-	if zoxStore == nil {
+	if cache.zoxSt == nil {
 		return nil, 0, false
 	}
-	rows, updated, ok := zoxStore.LoadZox()
+	rows, updated, ok := cache.zoxSt.LoadZox()
 	if !ok {
 		return nil, 0, false
 	}
@@ -45,24 +32,24 @@ func loadZoxItemsSync() ([]Item, time.Duration, bool) {
 			age = 0
 		}
 	}
-	zoxItemMu.Lock()
-	zoxItemMem = items
-	zoxItemMemAt = time.Now().Add(-age)
-	zoxItemMu.Unlock()
+	cache.zoxMu.Lock()
+	cache.zoxMem = items
+	cache.zoxAt = time.Now().Add(-age)
+	cache.zoxMu.Unlock()
 	return items, age, true
 }
 
-func saveZoxItems(items []Item) {
+func saveZoxItems(items []Item, cache *sourceCache) {
 	if len(items) == 0 {
 		return
 	}
-	if zoxStore != nil {
-		_ = zoxStore.SaveZox(itemsToZoxRows(items))
+	if cache.zoxSt != nil {
+		_ = cache.zoxSt.SaveZox(itemsToZoxRows(items))
 	}
-	zoxItemMu.Lock()
-	zoxItemMem = items
-	zoxItemMemAt = time.Now()
-	zoxItemMu.Unlock()
+	cache.zoxMu.Lock()
+	cache.zoxMem = items
+	cache.zoxAt = time.Now()
+	cache.zoxMu.Unlock()
 }
 
 func zoxideQueryFresh() []string {
@@ -114,21 +101,20 @@ func trimSpace(s string) string {
 	return s
 }
 
-func rebuildZoxItems() []Item {
+func rebuildZoxItems(cache *sourceCache) []Item {
 	paths := zoxideQueryFresh()
 	if len(paths) == 0 {
 		return nil
 	}
-	// full list - low-rank paths stay searchable after merge; paint already done
 	items := zoxideItems(paths, nil, nil)
 	if len(items) > 0 {
-		saveZoxItems(items)
+		saveZoxItems(items, cache)
 	}
 	return items
 }
 
-func zoxideList() []string {
-	if items, _, ok := loadZoxItemsSync(); ok {
+func zoxideList(cache *sourceCache) []string {
+	if items, _, ok := loadZoxItemsSync(cache); ok {
 		out := make([]string, 0, len(items))
 		for _, it := range items {
 			if it.Path != "" {
@@ -148,7 +134,7 @@ func zoxRowsToItems(rows []store.ZoxRow) []Item {
 			title = "[Zoxide] " + r.Name
 		}
 		out = append(out, Item{
-			Src: SrcZoxide, Kind: KindZoxide,
+			Kind: KindZoxide,
 			Title: title, Desc: r.Desc, Name: r.Name, Path: r.Path, Recency: r.Recency,
 		})
 	}

@@ -91,8 +91,6 @@ func runPicker() error {
 		return fmt.Errorf("open store: %w", err)
 	}
 	defer st.Close()
-	picker.BindStore(st)
-
 	cwd, err := os.Getwd()
 	if err != nil {
 		return err
@@ -105,7 +103,7 @@ func runPicker() error {
 	})
 }
 
-func connectItem(ctl *tmux.Ctl, st *store.Store, it picker.Item) error {
+func connectItem(ctl tmux.Connector, st *store.Store, it picker.Item) error {
 	if ctl == nil {
 		return fmt.Errorf("connect: nil tmux")
 	}

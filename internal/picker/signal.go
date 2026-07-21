@@ -51,7 +51,7 @@ var ErrCancel = errors.New("canceled")
 
 // RunPicker runs the interactive picker in a loop. On connect error, it
 // re-shows the picker with the error message in the status line.
-func RunPicker(ctl *tmux.Ctl, st *store.Store, createName, createCwd string, connect func(Item) error) error {
+func RunPicker(ctl tmux.Connector, st *store.Store, createName, createCwd string, connect func(Item) error) error {
 	var lastErr string
 	for {
 		m := NewModel(ctl, st, createName, createCwd)
@@ -85,7 +85,6 @@ func RunPicker(ctl *tmux.Ctl, st *store.Store, createName, createCwd string, con
 		switch res.Action {
 		case ActionConnect:
 			if err := connect(res.Item); err != nil {
-				InvalidateCaches()
 				lastErr = err.Error()
 				continue
 			}

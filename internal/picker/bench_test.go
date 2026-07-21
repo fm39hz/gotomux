@@ -29,10 +29,11 @@ func BenchmarkEnrichAllCold(b *testing.B) {
 			}
 		}
 	}
-	bySrc := map[string][]Item{SrcZoxide: {}}
+	zoxSrc := &zoxideSource{}
+	bySrc := map[Source][]Item{zoxSrc: {}}
 	for i := range 20 {
 		repo := filepath.Join(dir, fmt.Sprintf("repo-%d", i))
-		bySrc[SrcZoxide] = append(bySrc[SrcZoxide], Item{Path: repo})
+		bySrc[zoxSrc] = append(bySrc[zoxSrc], Item{Path: repo})
 	}
 
 	b.ResetTimer()
@@ -45,7 +46,7 @@ func BenchmarkEnrichAllCold(b *testing.B) {
 	b.Run("sequential", func(b *testing.B) {
 		gitBranchCache = sync.Map{}
 		for range b.N {
-			for _, it := range bySrc[SrcZoxide] {
+			for _, it := range bySrc[zoxSrc] {
 				_ = readGitBranch(it.Path)
 			}
 		}
@@ -63,18 +64,19 @@ func BenchmarkEnrichAllWarm(b *testing.B) {
 			b.Fatalf("git init: %s: %s", err, out)
 		}
 	}
-	bySrc := map[string][]Item{SrcZoxide: {}}
+	zoxSrc := &zoxideSource{}
+	bySrc := map[Source][]Item{zoxSrc: {}}
 	for i := range 20 {
 		repo := filepath.Join(dir, fmt.Sprintf("repo-%d", i))
-		bySrc[SrcZoxide] = append(bySrc[SrcZoxide], Item{Path: repo})
+		bySrc[zoxSrc] = append(bySrc[zoxSrc], Item{Path: repo})
 	}
 	enrichAllSync(bySrc)
 
 	b.ResetTimer()
 	b.Run("setGitBranch", func(b *testing.B) {
 		for range b.N {
-			view := make([]Item, len(bySrc[SrcZoxide]))
-			copy(view, bySrc[SrcZoxide])
+			view := make([]Item, len(bySrc[zoxSrc]))
+			copy(view, bySrc[zoxSrc])
 			for i := range view {
 				setGitBranch(&view[i])
 			}

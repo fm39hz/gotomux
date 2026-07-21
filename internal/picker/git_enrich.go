@@ -82,7 +82,7 @@ func readGitBranch(path string) string {
 
 // enrichAllSync fills the git branch cache for all unique paths in bySrc,
 // running go-git opens in parallel goroutines for speed.
-func enrichAllSync(bySrc map[string][]Item) {
+func enrichAllSync(bySrc map[Source][]Item) {
 	seen := map[string]bool{}
 	var paths []string
 	for _, items := range bySrc {

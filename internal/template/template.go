@@ -623,7 +623,7 @@ func FreezeSave(st *store.Store, p *store.Preset, setSticky bool) (shapeID strin
 // FreezeRemember: live session -> instance+shape (setSticky=false always).
 // Caller owns SIGINT (HoldInterrupt) around this if needed.
 // Does NOT change sticky - that is intentional via StickFrom / ^t.
-func FreezeRemember(ctl *tmux.Ctl, st *store.Store, name string) (shapeID string, shapeCreated bool, err error) {
+func FreezeRemember(ctl tmux.Connector, st *store.Store, name string) (shapeID string, shapeCreated bool, err error) {
 	if ctl == nil {
 		return "", false, fmt.Errorf("freeze: nil tmux")
 	}
@@ -657,7 +657,7 @@ func Apply(tmpl *store.Preset, name, root string) *store.Preset {
 	return bakeShape(nil, tmpl, name, root, "")
 }
 
-func ConnectProject(ctl *tmux.Ctl, st *store.Store, name, cwd string) error {
+func ConnectProject(ctl tmux.Connector, st *store.Store, name, cwd string) error {
 	if ctl == nil {
 		return fmt.Errorf("connect project: nil tmux")
 	}

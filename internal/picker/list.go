@@ -20,13 +20,8 @@ const (
 
 // Item is one picker row from any Source.
 type Item struct {
-	// Busy is a session-level busy indicator (tool token from ActiveCmd).
-	// Set for tmux source; empty for preset/create/zoxide.
-	// Used for glance badge and weak rank boost.
-	Busy    string
-
-	Src     string // Source.ID(); remote later: "tmux@host"
-	Host    string // "" = local
+	Busy    string // non-shell tool in active pane (glance badge)
+	Host    string // "" = local; remote: "hostname"
 	Kind    Kind
 	Title   string
 	Desc    string
@@ -90,7 +85,6 @@ func zoxideItems(zpaths []string, names, paths map[string]bool) []Item {
 			desc = root
 		}
 		out = append(out, Item{
-			Src:     SrcZoxide,
 			Kind:    KindZoxide,
 			Title:   fmt.Sprintf("[Zoxide] %s", name),
 			Desc:    desc,

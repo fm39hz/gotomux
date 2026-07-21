@@ -3,6 +3,7 @@ package picker
 import (
 	"os"
 	"os/exec"
+	"sync"
 	"testing"
 
 	"github.com/fm39hz/gotomux/internal/project"
@@ -23,7 +24,10 @@ func BenchmarkReadyNoZoxide(b *testing.B) {
 		cwd, _ := os.Getwd()
 		root := project.FindProjectRoot(cwd)
 		name := project.SessionName(root)
-		_ = snapshotAll(defaultSources(ctl, st, name, root))
+		var cache sourceCache
+		cache.zoxSt = st
+		cache.zoxMu = &sync.Mutex{}
+		_ = snapshotAll(defaultSources(ctl, st, name, root, &cache))
 		st.Close()
 	}
 }
@@ -41,8 +45,11 @@ func BenchmarkReadyWithZoxide(b *testing.B) {
 		cwd, _ := os.Getwd()
 		root := project.FindProjectRoot(cwd)
 		name := project.SessionName(root)
-		_ = snapshotAll(defaultSources(ctl, st, name, root))
-		_ = zoxideItems(zoxideList(), nil, nil)
+		var cache sourceCache
+		cache.zoxSt = st
+		cache.zoxMu = &sync.Mutex{}
+		_ = snapshotAll(defaultSources(ctl, st, name, root, &cache))
+		_ = zoxideItems(zoxideList(&cache), nil, nil)
 		st.Close()
 	}
 }

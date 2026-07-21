@@ -402,15 +402,16 @@ func TestIdleMRUAndFilterCurrent(t *testing.T) {
 	if got[0].Name != "here" {
 		t.Fatalf("pre-filter want here first, got %s", got[0].Name)
 	}
-	by := map[string][]Item{SrcTmux: {old, cur, left}}
-	applyRankMeta(by, nil, nil, "here", "")
+	tmuxSrc := &tmuxSource{}
+	by := map[Source][]Item{tmuxSrc: {old, cur, left}}
+	applyRankMeta(by, nil, Context{Session: "here"})
 	// current session removed
-	for _, it := range by[SrcTmux] {
+	for _, it := range by[tmuxSrc] {
 		if it.Name == "here" {
 			t.Fatal("current session should be filtered out")
 		}
 	}
-	got = rankItems("", by[SrcTmux])
+	got = rankItems("", by[tmuxSrc])
 	if len(got) != 2 || got[0].Name != "left" {
 		t.Fatalf("after filter current, want left first (just-left MRU), got %v", namesOf(got))
 	}

@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 
@@ -32,23 +33,22 @@ type Result struct {
 
 type model struct {
 	sources  []Source
-	bySrc    map[string][]Item // Snapshot/Refresh slots keyed by Source.ID
+	bySrc    map[Source][]Item // keyed by concrete Source pointer
 	view     []Item
 	cursor   int
 	query    string
-	ctl      *tmux.Ctl
+	ctl      tmux.Connector
 	store    *store.Store
 	status   string
 	done     Result
 	width    int
 	height   int
 	maxShow  int
+	cache    sourceCache
 	help     bool      // ? toggles full key help
 	tmpl     string    // sticky template name (default|...)
 	started  time.Time // swallow Alt-release ESC right after open (display-popup)
-	ctx      string    // current tmux session name (co-occurrence context)
-	ctxPath  string    // current tmux session path
-	pairs    map[string]int64
+	env      Context
 	editPath   string // temp file while $EDITOR open
 	editOld    string // preset name before edit (rename detect)
 	createName string
@@ -84,33 +84,25 @@ func styleFor(k Kind) lipgloss.Style {
 	}
 }
 
-func NewModel(ctl *tmux.Ctl, store *store.Store, createName, createCwd string) model {
-	srcs := defaultSources(ctl, store, createName, createCwd)
+func NewModel(ctl tmux.Connector, store *store.Store, createName, createCwd string) model {
+	var cache sourceCache
+	cache.zoxSt = store
+	cache.zoxMu = &sync.Mutex{}
+	srcs := defaultSources(ctl, store, createName, createCwd, &cache)
 	bySrc := snapshotAll(srcs)
-	ctx := ""
-	ctxPath := ""
-	if ctl != nil {
-		ctx = ctl.CurrentSession()
-		ctxPath = ctl.CurrentSessionPath()
-	}
-	now := time.Now().Unix()
-	var pairs map[string]int64
-	if store != nil && ctx != "" {
-		pairs, _ = store.PairScores(ctx, now)
-	}
-	applyRankMeta(bySrc, store, pairs, ctx, ctxPath)
+	env := newContext(ctl, store)
+	applyRankMeta(bySrc, store, env)
 	enrichAllSync(bySrc)
 	m := model{
 		sources:    srcs,
 		bySrc:      bySrc,
+		cache:      cache,
 		ctl:        ctl,
 		store:      store,
 		maxShow:    12,
 		tmpl:       template.StickyLabel(store),
 		started:    time.Now(),
-		ctx:        ctx,
-		ctxPath:    ctxPath,
-		pairs:      pairs,
+		env:        env,
 		createName: createName,
 		createCwd:  createCwd,
 	}
@@ -122,18 +114,13 @@ func (m *model) pool() []Item {
 	return flattenSources(m.sources, m.bySrc, strings.TrimSpace(m.query))
 }
 
-func (m *model) mergeSource(id string, items []Item) {
+func (m *model) mergeSource(src Source, items []Item) {
 	if m.bySrc == nil {
-		m.bySrc = map[string][]Item{}
+		m.bySrc = map[Source][]Item{}
 	}
-	for i := range items {
-		if items[i].Src == "" {
-			items[i].Src = id
-		}
-	}
-	slot := map[string][]Item{id: items}
-	applyRankMeta(slot, m.store, m.pairs, m.ctx, m.ctxPath)
-	m.bySrc[id] = slot[id]
+	slot := map[Source][]Item{src: items}
+	applyRankMeta(slot, m.store, m.env)
+	m.bySrc[src] = slot[src]
 }
 
 func (m *model) refilter() {
@@ -174,7 +161,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if len(msg.items) == 0 {
 			return m, nil
 		}
-		m.mergeSource(msg.id, msg.items)
+		m.mergeSource(msg.src, msg.items)
 		m.refilter()
 		return m, nil
 
@@ -305,7 +292,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 							_ = m.store.RecordKill(it.Name)
 						}
 						m.status = "killed " + it.Name
-						InvalidateCaches()
+						m.cache.invalidate()
 						m.reload()
 					}
 				}
@@ -331,7 +318,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					} else {
 						m.status = "froze " + name
 					}
-					InvalidateCaches()
+					m.cache.invalidate()
 					m.reload()
 				} else if it.Kind == KindPreset {
 					m.status = "session not running - attach first"
@@ -381,7 +368,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						m.status = err.Error()
 					} else {
 						m.status = "deleted " + it.Name
-						InvalidateCaches()
+						m.cache.invalidate()
 						m.reload()
 					}
 				}
@@ -411,7 +398,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.status = msg.err.Error()
 		} else {
 			m.status = "saved " + msg.name
-			InvalidateCaches()
+			m.cache.invalidate()
 			m.reload()
 		}
 		return m, nil
@@ -420,19 +407,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m *model) reload() {
-	m.sources = defaultSources(m.ctl, m.store, m.createName, m.createCwd)
+	m.sources = defaultSources(m.ctl, m.store, m.createName, m.createCwd, &m.cache)
 	m.bySrc = snapshotAll(m.sources)
-	now := time.Now().Unix()
-	if m.ctl != nil {
-		m.ctx = m.ctl.CurrentSession()
-		m.ctxPath = m.ctl.CurrentSessionPath()
-	}
-	if m.store != nil && m.ctx != "" {
-		m.pairs, _ = m.store.PairScores(m.ctx, now)
-	} else {
-		m.pairs = nil
-	}
-	applyRankMeta(m.bySrc, m.store, m.pairs, m.ctx, m.ctxPath)
+	m.env = newContext(m.ctl, m.store)
+	applyRankMeta(m.bySrc, m.store, m.env)
 	enrichAllSync(m.bySrc)
 	m.refilter()
 }
