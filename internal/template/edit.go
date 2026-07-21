@@ -44,6 +44,7 @@ type presetJSON struct {
 }
 
 type windowJSON struct {
+	Fork  string     `json:"fork,omitempty"`
 	Name  string     `json:"name,omitempty"`
 	Cwd   string     `json:"cwd,omitempty"`
 	Split string     `json:"split,omitempty"`
@@ -87,6 +88,7 @@ func Format(p *store.Preset) string {
 	}
 	for _, w := range p.Windows {
 		wj := windowJSON{
+			Fork:  WindowForkLabel(w),
 			Name:  w.Name,
 			Split: tmux.LayoutForShape(w.Layout, len(w.Panes)),
 		}

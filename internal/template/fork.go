@@ -11,14 +11,13 @@ import (
 	"github.com/fm39hz/gotomux/internal/tmux"
 )
 
-// Fork = one window essence unit (reusable unit).
-// Learned silently when user freezes or sticks after working with sticky.
-// Same/different from sticky windows both count as signal: hits rise on match,
-// new keys appear on divergence (fork of habit).
+// Fork = one window essence unit.
+// Learned silently on freeze/stick. Same pattern → same fork key.
+// Readable label for JSON files, hashed key for DB.
+// Hit counters in DB only — fork label is human-readable everywhere.
 
-// WindowForkKey fingerprints one window: pane count + split class + tools.
-// Labels/cwd ignored - "first pane nvim" is one key everywhere.
-func WindowForkKey(w store.PresetWindow) string {
+// WindowForkLabel returns a human-readable fork identifier like "2|even-vertical|nvim,sh".
+func WindowForkLabel(w store.PresetWindow) string {
 	n := len(w.Panes)
 	if n == 0 {
 		n = 1
@@ -37,12 +36,18 @@ func WindowForkKey(w store.PresetWindow) string {
 			b.WriteString(tmux.ToolIntent(w.Panes[j].Cmd))
 		}
 	}
-	sum := sha256.Sum256([]byte(b.String()))
+	return b.String()
+}
+
+// WindowForkKey returns a stable hash key for DB storage.
+func WindowForkKey(w store.PresetWindow) string {
+	label := WindowForkLabel(w)
+	sum := sha256.Sum256([]byte(label))
 	return hex.EncodeToString(sum[:8])
 }
 
-// windowForkBody: product JSON fragment for one window (readable, no cwd).
-func windowForkBody(w store.PresetWindow) string {
+// WindowForkBody — JSON fragment for DB storage (product, readable, no cwd).
+func WindowForkBody(w store.PresetWindow) string {
 	n := len(w.Panes)
 	if n == 0 {
 		n = 1
@@ -51,10 +56,14 @@ func windowForkBody(w store.PresetWindow) string {
 		Cmd string `json:"cmd,omitempty"`
 	}
 	type win struct {
+		Fork  string `json:"fork,omitempty"`
 		Split string `json:"split,omitempty"`
 		Panes []pane `json:"panes"`
 	}
-	ww := win{Split: tmux.LayoutForShape(w.Layout, n)}
+	ww := win{
+		Fork:  WindowForkLabel(w),
+		Split: tmux.LayoutForShape(w.Layout, n),
+	}
 	for j := 0; j < n; j++ {
 		var c string
 		if j < len(w.Panes) {
@@ -69,19 +78,17 @@ func windowForkBody(w store.PresetWindow) string {
 	return string(b)
 }
 
-// ObserveForks records every window of preset as a fork unit (best-effort, silent).
-// Call after freeze/stick when shape essence is taken from p.
+// ObserveForks records every window as a fork unit.
 func ObserveForks(st *store.Store, p *store.Preset) {
 	if st == nil || p == nil {
 		return
 	}
-	// learn from pure shape windows (same essence as sticky body)
 	sh := ToShape(p, "fork")
 	for _, w := range sh.Windows {
 		key := WindowForkKey(w)
 		if key == "" {
 			continue
 		}
-		_ = st.RecordFork(key, windowForkBody(w))
+		_ = st.RecordFork(key, WindowForkBody(w))
 	}
 }
