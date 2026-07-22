@@ -4,6 +4,7 @@ go 1.26.5
 
 require (
 	charm.land/bubbletea/v2 v2.0.8
+	github.com/caarlos0/env/v11 v11.4.1
 	github.com/charmbracelet/lipgloss v1.1.0
 	github.com/epilande/go-devicons v0.0.0-20250505162540-0661cab71a28
 	github.com/junegunn/fzf v0.74.1
@@ -14,9 +15,7 @@ require (
 )
 
 require (
-	github.com/alecthomas/kong v1.16.0 // indirect
 	github.com/aymanbagabas/go-osc52/v2 v2.0.1 // indirect
-	github.com/caarlos0/env/v11 v11.4.1 // indirect
 	github.com/charmbracelet/colorprofile v0.4.3 // indirect
 	github.com/charmbracelet/ultraviolet v0.0.0-20260703014108-f5a850f9c2b7 // indirect
 	github.com/charmbracelet/x/ansi v0.11.7 // indirect

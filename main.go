@@ -8,10 +8,10 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
-	"github.com/alecthomas/kong"
 	tea "charm.land/bubbletea/v2"
 	"github.com/junegunn/fzf/src/algo"
 
@@ -30,50 +30,41 @@ var errCancel = picker.ErrCancel
 
 func init() { algo.Init("default") }
 
-type freezeCmd struct {
-	Name string `arg:"" optional:"" help:"Session name to freeze (default: current tmux session)"`
-}
-
-type editCmd struct {
-	Name string `arg:"" optional:"" help:"Session or preset name to edit"`
-}
-
 type cli struct {
-	Freeze freezeCmd `cmd:"" help:"Freeze a tmux session to preset"`
-	Edit   editCmd   `cmd:"" help:"Edit a preset"`
-	Version bool    `short:"v" help:"Show version"`
+	Version bool `short:"v" help:"Show version"`
 }
 
 func main() {
 	initEventBus()
 	cfg := config.Load()
 
-	// No args → picker (default). Args → Kong subcommands.
-	if len(os.Args) < 2 {
-		if err := runPicker(cfg); err != nil && !errors.Is(err, errCancel) {
-			fmt.Fprintln(os.Stderr, err)
-			os.Exit(1)
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "-f", "--freeze":
+			name := ""
+			if len(os.Args) > 2 && !strings.HasPrefix(os.Args[2], "-") {
+				name = os.Args[2]
+			}
+			if err := freezeCLI(cfg, name); err != nil && !errors.Is(err, errCancel) {
+				fmt.Fprintln(os.Stderr, err)
+				os.Exit(1)
+			}
+			return
+		case "-e", "--edit":
+			name := ""
+			if len(os.Args) > 2 && !strings.HasPrefix(os.Args[2], "-") {
+				name = os.Args[2]
+			}
+			if err := editCLI(cfg, name); err != nil && !errors.Is(err, errCancel) {
+				fmt.Fprintln(os.Stderr, err)
+				os.Exit(1)
+			}
+			return
 		}
-		return
 	}
-
-	var c cli
-	ctx := kong.Parse(&c,
-		kong.Name("gotomux"),
-		kong.Description("tmux session picker with presets and shapes"),
-		kong.Vars{"version": version},
-	)
-	switch ctx.Command() {
-	case "freeze", "freeze <name>":
-		if err := freezeCLI(cfg, c.Freeze.Name); err != nil && !errors.Is(err, errCancel) {
-			fmt.Fprintln(os.Stderr, err)
-			os.Exit(1)
-		}
-	case "edit", "edit <name>":
-		if err := editCLI(cfg, c.Edit.Name); err != nil && !errors.Is(err, errCancel) {
-			fmt.Fprintln(os.Stderr, err)
-			os.Exit(1)
-		}
+	if err := runPicker(cfg); err != nil && !errors.Is(err, errCancel) {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
 	}
 }
 
