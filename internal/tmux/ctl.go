@@ -116,15 +116,15 @@ type LiveSession struct {
 }
 
 func (c *Ctl) ListLive() ([]LiveSession, error) {
-	out, err := exec.Command("tmux",
+	out, _ := exec.Command("tmux",
 		"list-sessions", "-F", listSessFmt,
 		";",
 		"list-panes", "-s", "-F", listPanesFmt,
 	).Output()
-	if err != nil {
-		return nil, fmt.Errorf("list live: %w", err)
-	}
+	return ParseLiveOutput(string(out)), nil
+}
 
+func ParseLiveOutput(out string) []LiveSession {
 	type livePane struct {
 		sname  string
 		cmd    string
@@ -199,8 +199,9 @@ func (c *Ctl) ListLive() ([]LiveSession, error) {
 		s.ActiveCmd = cmd
 		out2 = append(out2, s)
 	}
-	return out2, nil
+	return out2
 }
+
 
 func parseUnix(s string) int64 {
 	s = strings.TrimSpace(s)

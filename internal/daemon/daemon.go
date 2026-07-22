@@ -3,16 +3,14 @@ package daemon
 import (
 	"log"
 	"os/exec"
-	"sync"
 	"time"
 
 	"github.com/fm39hz/gotomux/internal/store"
 	"github.com/fm39hz/gotomux/internal/tmux"
 )
 
-// Daemon: warm infra + background telemetry. No IPC.
 type Daemon struct {
-	mu       sync.Mutex
+	cc       *tmux.ControlConn
 	ctl      *tmux.Ctl
 	st       *store.Store
 	lastSeen map[string]int64
@@ -22,30 +20,21 @@ func New() (*Daemon, error) {
 	exec.Command("tmux", "start-server").Run()
 	exec.Command("tmux", "set-option", "-g", "exit-empty", "off").Run()
 
-	var (
-		ctl    *tmux.Ctl
-		st     *store.Store
-		ctlErr error
-		stErr  error
-	)
-	var wg sync.WaitGroup
-	wg.Add(2)
-	go func() {
-		defer wg.Done()
-		ctl, ctlErr = tmux.New()
-	}()
-	go func() {
-		defer wg.Done()
-		st, stErr = store.Open()
-	}()
-	wg.Wait()
-	if ctlErr != nil {
-		return nil, ctlErr
+	cc, err := tmux.StartControl()
+	if err != nil {
+		return nil, err
 	}
-	if stErr != nil {
-		return nil, stErr
+	ctl, err := tmux.New()
+	if err != nil {
+		cc.Close()
+		return nil, err
 	}
-	d := &Daemon{ctl: ctl, st: st, lastSeen: map[string]int64{}}
+	st, err := store.Open()
+	if err != nil {
+		cc.Close()
+		return nil, err
+	}
+	d := &Daemon{cc: cc, ctl: ctl, st: st, lastSeen: map[string]int64{}}
 	d.syncNow()
 	go d.pollLoop()
 	return d, nil
@@ -55,42 +44,42 @@ func (d *Daemon) Close() {
 	if d.st != nil {
 		d.st.Close()
 	}
+	if d.cc != nil {
+		d.cc.Close()
+	}
 }
 
-// syncNow polls tmux + SQLite, records telemetry for session switches.
-func (d *Daemon) syncNow() {
-	sessions, err := d.ctl.ListLive()
+func (d *Daemon) listLiveViaControl() []tmux.LiveSession {
+	raw, err := d.cc.Send("list-sessions", "-F", "S\t#{session_name}\t#{session_windows}\t#{session_path}\t#{session_last_attached}\t#{session_activity}\t#{session_created}\t#{session_attached}", ";", "list-panes", "-s", "-F", "P\t#{session_name}\t#{pane_current_command}\t#{?pane_active,1,0}\t#{?pane_dead,1,0}")
 	if err != nil {
+		return nil
+	}
+	return tmux.ParseLiveOutput(raw)
+}
+
+func (d *Daemon) syncNow() {
+	sessions := d.listLiveViaControl()
+	if sessions == nil {
 		return
 	}
-	d.mu.Lock()
-	seen := d.lastSeen
-	d.mu.Unlock()
-
 	for _, s := range sessions {
-		prev, ok := seen[s.Name]
-		if !ok || s.LastAttached > prev {
+		if prev, ok := d.lastSeen[s.Name]; !ok || s.LastAttached > prev {
 			d.recordTelemetry(s.Name, sessions)
 		}
-	}
-
-	d.mu.Lock()
-	for _, s := range sessions {
 		d.lastSeen[s.Name] = s.LastAttached
 	}
 	for name := range d.lastSeen {
-		found := false
+		keep := false
 		for _, s := range sessions {
 			if s.Name == name {
-				found = true
+				keep = true
 				break
 			}
 		}
-		if !found {
+		if !keep {
 			delete(d.lastSeen, name)
 		}
 	}
-	d.mu.Unlock()
 }
 
 func (d *Daemon) recordTelemetry(name string, all []tmux.LiveSession) {
@@ -105,7 +94,9 @@ func (d *Daemon) recordTelemetry(name string, all []tmux.LiveSession) {
 			others = append(others, s.Name)
 		}
 	}
-	d.st.RecordPairsWithLive(name, others)
+	if len(others) > 0 {
+		d.st.RecordPairsWithLive(name, others)
+	}
 }
 
 func (d *Daemon) pollLoop() {

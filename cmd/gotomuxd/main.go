@@ -2,8 +2,8 @@ package main
 
 import (
 	"fmt"
+	"log"
 	"os"
-	"os/signal"
 
 	"github.com/fm39hz/gotomux/internal/daemon"
 )
@@ -16,7 +16,8 @@ func main() {
 	}
 	defer d.Close()
 
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, os.Interrupt, os.Kill)
-	<-sigCh
+	log.Println("listening")
+	if err := daemon.ServeIPC(d); err != nil {
+		log.Fatal(err)
+	}
 }

@@ -1,13 +1,19 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"os"
+	"path/filepath"
 	"sync"
+	"time"
 
+	tea "charm.land/bubbletea/v2"
 	"github.com/junegunn/fzf/src/algo"
 
+	"github.com/fm39hz/gotomux/internal/daemon"
 	"github.com/fm39hz/gotomux/internal/picker"
 	"github.com/fm39hz/gotomux/internal/project"
 	"github.com/fm39hz/gotomux/internal/store"
@@ -57,7 +63,87 @@ Usage:
 `, version)
 }
 
+func daemonSocket() string {
+	dir := os.Getenv("XDG_DATA_HOME")
+	if dir == "" {
+		home, _ := os.UserHomeDir()
+		dir = filepath.Join(home, ".local", "share")
+	}
+	return filepath.Join(dir, "gotomux", "gotomux.sock")
+}
+
 func runPicker() error {
+	sock := daemonSocket()
+	if conn, err := net.DialTimeout("unix", sock, 50*time.Millisecond); err == nil {
+		return runPickerIPC(conn)
+	}
+	return runPickerStandalone()
+}
+
+func runPickerIPC(conn net.Conn) error {
+	defer conn.Close()
+	enc, dec := json.NewEncoder(conn), json.NewDecoder(conn)
+	enc.Encode(daemon.Request{Cmd: "list"})
+	var resp daemon.Response
+	if err := dec.Decode(&resp); err != nil || !resp.OK {
+		return runPickerStandalone()
+	}
+
+	cwd, _ := os.Getwd()
+	root := project.FindProjectRoot(cwd)
+	name := project.SessionName(root)
+
+	// Local ctl+store cho actions trong session.
+	ctl, _ := tmux.New()
+	st, stErr := store.Open()
+	if stErr != nil {
+		return fmt.Errorf("store: %w", stErr)
+	}
+	defer st.Close()
+
+	env := picker.Context{
+		Session: resp.CtxSess, Path: resp.CtxPath,
+		Pairs: resp.Pairs, Usage: resp.Usage, Now: time.Now().Unix(),
+	}
+
+	m := picker.NewModelFromDaemon(ctl, st, name, root, resp.Sessions, resp.Presets, env)
+	opts, _, err := picker.TeaOpts()
+	if err != nil {
+		return err
+	}
+	p := tea.NewProgram(m, opts...)
+	final, runErr := picker.RunCancellable(p)
+	if runErr != nil {
+		return runErr
+	}
+	fm, ok := final.(interface {
+		Done() picker.Result
+		FrameLines() int
+	})
+	if !ok {
+		return errCancel
+	}
+	picker.ClearInline(fm.FrameLines())
+	res := fm.Done()
+	if res.Action != picker.ActionConnect {
+		return errCancel
+	}
+	it := res.Item
+	switch it.Kind {
+	case picker.KindActive:
+		return ctl.Connect(it.Name, "")
+	case picker.KindPreset:
+		p, e := st.Get(it.Name)
+		if e != nil {
+			return e
+		}
+		return ctl.ConnectPreset(p)
+	default:
+		return template.ConnectProject(ctl, st, it.Name, it.Path)
+	}
+}
+
+func runPickerStandalone() error {
 	var (
 		ctl    tmux.Connector
 		st     *store.Store
@@ -97,12 +183,11 @@ func runPicker() error {
 }
 
 func connectItem(ctl tmux.Connector, st *store.Store, it picker.Item) error {
-	var err error
 	switch it.Kind {
 	case picker.KindCreate, picker.KindZoxide:
-		err = template.ConnectProject(ctl, st, it.Name, it.Path)
+		return template.ConnectProject(ctl, st, it.Name, it.Path)
 	case picker.KindActive:
-		err = ctl.Connect(it.Name, "")
+		return ctl.Connect(it.Name, "")
 	case picker.KindPreset:
 		if st == nil {
 			return fmt.Errorf("connect preset: nil store")
@@ -111,12 +196,10 @@ func connectItem(ctl tmux.Connector, st *store.Store, it picker.Item) error {
 		if e != nil {
 			return e
 		}
-		_ = st.Touch(it.Name)
-		err = ctl.ConnectPreset(p)
+		return ctl.ConnectPreset(p)
 	default:
 		return fmt.Errorf("unknown kind %v", it.Kind)
 	}
-	return err
 }
 
 func freezeCLI(args []string) error {
@@ -148,6 +231,8 @@ func freezeCLI(args []string) error {
 		for _, s := range live {
 			items = append(items, s.Name)
 		}
+		_ = st
+		_ = live
 		name, err = picker.Pick(items)
 		if err != nil || name == "" {
 			return errCancel

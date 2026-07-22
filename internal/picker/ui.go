@@ -97,6 +97,35 @@ func styleFor(k Kind) lipgloss.Style {
 	}
 }
 
+func NewModelFromDaemon(ctl tmux.Connector, st *store.Store, createName, createCwd string, sessions []tmux.LiveSession, presets []store.PresetMeta, env Context) model {
+	var cache sourceCache
+	cache.zoxSt = st
+	cache.zoxMu = &sync.Mutex{}
+	cache.tmuxSnap = sessions
+	cache.tmuxOK = true
+	cache.presetM = presets
+	cache.presetOK = true
+	srcs := defaultSources(ctl, st, createName, createCwd, &cache)
+	bySrc := snapshotAll(srcs)
+	applyRankMeta(bySrc, st, env)
+	enrichAllSync(bySrc)
+	m := model{
+		sources:    srcs,
+		bySrc:      bySrc,
+		cache:      cache,
+		ctl:        ctl,
+		store:      st,
+		maxShow:    12,
+		tmpl:       template.StickyLabel(st),
+		started:    time.Now(),
+		env:        env,
+		createName: createName,
+		createCwd:  createCwd,
+	}
+	m.refilter()
+	return m
+}
+
 func NewModel(ctl tmux.Connector, store *store.Store, createName, createCwd string) model {
 	var cache sourceCache
 	cache.zoxSt = store
