@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/alecthomas/kong"
 	tea "charm.land/bubbletea/v2"
 	"github.com/junegunn/fzf/src/algo"
 
@@ -29,46 +30,55 @@ var errCancel = picker.ErrCancel
 
 func init() { algo.Init("default") }
 
-func initEventBus() {
-	template.SetEventBus(event.New())
+type freezeCmd struct {
+	Name string `arg:"" optional:"" help:"Session name to freeze (default: current tmux session)"`
+}
+
+type editCmd struct {
+	Name string `arg:"" optional:"" help:"Session or preset name to edit"`
+}
+
+type cli struct {
+	Freeze freezeCmd `cmd:"" help:"Freeze a tmux session to preset"`
+	Edit   editCmd   `cmd:"" help:"Edit a preset"`
+	Version bool    `short:"v" help:"Show version"`
 }
 
 func main() {
 	initEventBus()
-	err := dispatch()
-	if err == nil || errors.Is(err, errCancel) {
-		os.Exit(0)
-	}
-	fmt.Fprintln(os.Stderr, err)
-	os.Exit(1)
-}
+	cfg := config.Load()
 
-func dispatch() error {
+	// No args → picker (default). Args → Kong subcommands.
 	if len(os.Args) < 2 {
-		return runPicker()
+		if err := runPicker(cfg); err != nil && !errors.Is(err, errCancel) {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		return
 	}
-	switch os.Args[1] {
-	case "-f", "--freeze":
-		return freezeCLI(os.Args)
-	case "-e", "--edit":
-		return editCLI(os.Args)
-	case "-h", "--help":
-		showHelp()
-		return nil
-	default:
-		return fmt.Errorf("unknown flag %q (try -h)", os.Args[1])
+
+	var c cli
+	ctx := kong.Parse(&c,
+		kong.Name("gotomux"),
+		kong.Description("tmux session picker with presets and shapes"),
+		kong.Vars{"version": version},
+	)
+	switch ctx.Command() {
+	case "freeze", "freeze <name>":
+		if err := freezeCLI(cfg, c.Freeze.Name); err != nil && !errors.Is(err, errCancel) {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+	case "edit", "edit <name>":
+		if err := editCLI(cfg, c.Edit.Name); err != nil && !errors.Is(err, errCancel) {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
 	}
 }
 
-func showHelp() {
-	fmt.Printf(`gotomux - session picker (%s)
-
-Usage:
-  gotomux              interactive picker
-  gotomux -f [name]    freeze session
-  gotomux -e [name]    edit preset
-  gotomux -h          show help
-`, version)
+func initEventBus() {
+	template.SetEventBus(event.New())
 }
 
 func daemonStateFile() string {
@@ -80,20 +90,6 @@ func daemonStateFile() string {
 	return filepath.Join(dir, "gotomux", "state.ver")
 }
 
-func readStateVersion() int64 {
-	raw, err := os.ReadFile(daemonStateFile())
-	if err != nil {
-		return 0
-	}
-	var v int64
-	fmt.Sscanf(string(raw), "%d", &v)
-	return v
-}
-
-func writeStateVersion(v int64) {
-	os.WriteFile(daemonStateFile(), []byte(fmt.Sprintf("%d", v)), 0o644)
-}
-
 func daemonSocket() string {
 	dir := os.Getenv("XDG_DATA_HOME")
 	if dir == "" {
@@ -103,34 +99,27 @@ func daemonSocket() string {
 	return filepath.Join(dir, "gotomux", "gotomux.sock")
 }
 
-func cfgDefault() *config.Config { return config.Default() }
-
-func runPicker() error {
+func runPicker(cfg *config.Config) error {
 	sock := daemonSocket()
 	if conn, err := net.DialTimeout("unix", sock, 50*time.Millisecond); err == nil {
-		return runPickerIPC(conn)
+		return runPickerIPC(cfg, conn)
 	}
-	return runPickerStandalone()
+	return runPickerStandalone(cfg)
 }
 
-func runPickerIPC(conn net.Conn) error {
+func runPickerIPC(cfg *config.Config, conn net.Conn) error {
 	defer conn.Close()
 	enc, dec := json.NewEncoder(conn), json.NewDecoder(conn)
 	enc.Encode(daemon.Request{Cmd: "list"})
 	var resp daemon.Response
 	if err := dec.Decode(&resp); err != nil || !resp.OK {
-		return runPickerStandalone()
-	}
-	if resp.Version > 0 {
-		writeStateVersion(resp.Version)
+		return runPickerStandalone(cfg)
 	}
 
 	cwd, _ := os.Getwd()
 	root := project.FindProjectRoot(cwd)
 	name := project.SessionName(root)
 
-	// Local ctl+store cho actions trong session.
-	cfg := cfgDefault()
 	ctl, _ := tmux.New()
 	st, stErr := store.OpenWithConfig(cfg)
 	if stErr != nil {
@@ -154,6 +143,7 @@ func runPickerIPC(conn net.Conn) error {
 	if runErr != nil {
 		return runErr
 	}
+
 	fm, ok := final.(interface {
 		Done() picker.Result
 		FrameLines() int
@@ -161,6 +151,7 @@ func runPickerIPC(conn net.Conn) error {
 	if !ok {
 		return errCancel
 	}
+
 	picker.ClearInline(fm.FrameLines())
 	res := fm.Done()
 	if res.Action != picker.ActionConnect {
@@ -181,7 +172,7 @@ func runPickerIPC(conn net.Conn) error {
 	}
 }
 
-func runPickerStandalone() error {
+func runPickerStandalone(cfg *config.Config) error {
 	var (
 		ctl    tmux.Connector
 		st     *store.Store
@@ -189,7 +180,6 @@ func runPickerStandalone() error {
 		stErr  error
 		root   string
 	)
-	cfg := cfgDefault()
 	var wg sync.WaitGroup
 	wg.Add(3)
 	go func() {
@@ -242,16 +232,11 @@ func connectItem(ctl tmux.Connector, st store.Storer, it picker.Item) error {
 	}
 }
 
-func freezeCLI(args []string) error {
-	name := ""
-	if len(args) > 2 {
-		name = args[2]
-	}
+func freezeCLI(cfg *config.Config, name string) error {
 	ctl, err := tmux.New()
 	if err != nil {
 		return fmt.Errorf("tmux: %w", err)
 	}
-	cfg := cfgDefault()
 	st, err := store.OpenWithConfig(cfg)
 	if err != nil {
 		return fmt.Errorf("store: %w", err)
@@ -287,12 +272,7 @@ func freezeCLI(args []string) error {
 	return nil
 }
 
-func editCLI(args []string) error {
-	name := ""
-	if len(args) > 2 {
-		name = args[2]
-	}
-	cfg := cfgDefault()
+func editCLI(cfg *config.Config, name string) error {
 	st, err := store.OpenWithConfig(cfg)
 	if err != nil {
 		return fmt.Errorf("store: %w", err)

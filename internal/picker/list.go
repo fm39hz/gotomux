@@ -3,7 +3,7 @@ package picker
 import (
 	"fmt"
 	"path/filepath"
-	"sort"
+	"slices"
 
 	"github.com/fm39hz/gotomux/internal/project"
 	"github.com/fm39hz/gotomux/internal/store"
@@ -116,8 +116,15 @@ func rankItems(q string, pool []Item) []Item {
 		}
 		hits = append(hits, scored{it, k})
 	}
-	sort.SliceStable(hits, func(a, b int) bool {
-		return hits[a].k.less(hits[b].k)
+	slices.SortStableFunc(hits, func(a, b scored) int {
+		switch {
+		case a.k.less(b.k):
+			return -1
+		case b.k.less(a.k):
+			return 1
+		default:
+			return 0
+		}
 	})
 	out := make([]Item, len(hits))
 	for i, h := range hits {

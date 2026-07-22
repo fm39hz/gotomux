@@ -10,7 +10,7 @@ import (
 )
 
 func main() {
-	d, err := daemon.New(config.Default())
+	d, err := daemon.New(config.Load())
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "gotomuxd: %v\n", err)
 		os.Exit(1)
