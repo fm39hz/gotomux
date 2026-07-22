@@ -2,8 +2,10 @@ package picker
 
 import (
 	"fmt"
+	"math"
 	"os"
 	"os/exec"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -16,6 +18,8 @@ import (
 	"github.com/fm39hz/gotomux/internal/template"
 	"github.com/fm39hz/gotomux/internal/tmux"
 )
+
+type animTickMsg struct{}
 
 type Action int
 
@@ -31,12 +35,18 @@ type Result struct {
 	Err    error
 }
 
+type animEntry struct {
+	cur float64 // current rendering Y
+	dst float64 // target Y (rank index)
+}
+
 type model struct {
-	sources  []Source
-	bySrc    map[Source][]Item // keyed by concrete Source pointer
-	view     []Item
-	cursor   int
-	query    string
+	sources   []Source
+	bySrc     map[Source][]Item
+	view      []Item
+	cursorIdx int      // index in view (logical), for keyboard navigation
+	cursorKey string   // anim key of selected item, stable across animation
+	query     string
 	ctl      tmux.Connector
 	store    *store.Store
 	status   string
@@ -45,15 +55,18 @@ type model struct {
 	height   int
 	maxShow  int
 	cache    sourceCache
-	help     bool      // ? toggles full key help
-	tmpl     string    // sticky template name (default|...)
-	started  time.Time // swallow Alt-release ESC right after open (display-popup)
+	help     bool
+	tmpl     string
+	started  time.Time
 	env      Context
-	editPath   string // temp file while $EDITOR open
-	editOld    string // preset name before edit (rename detect)
+	editPath   string
+	editOld    string
 	createName string
 	createCwd  string
+	anim     map[string]animEntry // item key → Y position
 }
+
+func animKey(it Item) string { return it.Name + "\x00" + it.Path }
 
 var (
 	styleCursor = lipgloss.NewStyle().Foreground(lipgloss.Color("10")).Bold(true)
@@ -128,21 +141,87 @@ func (m *model) mergeSource(src Source, items []Item) {
 func (m *model) refilter() {
 	q := strings.ToLower(strings.TrimSpace(m.query))
 	m.view = rankItems(q, m.pool())
-	if m.cursor >= len(m.view) {
-		m.cursor = len(m.view) - 1
+
+	// Sync cursorKey: find previously selected item in new view.
+	if m.cursorKey != "" && len(m.view) > 0 {
+		found := false
+		for i, it := range m.view {
+			if animKey(it) == m.cursorKey {
+				m.cursorIdx = i
+				found = true
+				break
+			}
+		}
+		if !found {
+			m.cursorIdx = 0
+		}
+	} else if len(m.view) > 0 {
+		m.cursorIdx = 0
 	}
-	if m.cursor < 0 {
-		m.cursor = 0
+	if m.cursorIdx >= len(m.view) {
+		m.cursorIdx = len(m.view) - 1
 	}
+	if m.cursorIdx < 0 && len(m.view) > 0 {
+		m.cursorIdx = 0
+	}
+	if len(m.view) > 0 {
+		m.cursorKey = animKey(m.view[m.cursorIdx])
+	} else {
+		m.cursorKey = ""
+	}
+
 	for i := range m.view {
 		setGitBranch(&m.view[i])
+	}
+	// Update animation targets — keep old currents for new items.
+	old := m.anim
+	m.anim = map[string]animEntry{}
+	for i, it := range m.view {
+		key := animKey(it)
+		if e, ok := old[key]; ok {
+			e.dst = float64(i)
+			m.anim[key] = e
+		} else {
+			m.anim[key] = animEntry{cur: float64(i), dst: float64(i)}
+		}
 	}
 }
 
 // refilterFromQuery: user edited filter -> jump to best match.
 func (m *model) refilterFromQuery() {
 	m.refilter()
-	m.cursor = 0
+	m.cursorIdx = 0
+}
+
+const animSpeed = 0.3
+
+// animTick moves all items toward their target by animSpeed fraction.
+// Returns false when all items have settled.
+func (m *model) animTick() bool {
+	busy := false
+	for k := range m.anim {
+		e := m.anim[k]
+		if e.cur == e.dst {
+			continue
+		}
+		e.cur += (e.dst - e.cur) * animSpeed
+		if math.Abs(e.cur-e.dst) < 0.01 {
+			e.cur = e.dst
+		} else {
+			busy = true
+		}
+		m.anim[k] = e
+	}
+	return busy
+}
+
+func animSettled(anim map[string]animEntry) bool {
+	for _, e := range anim {
+		if e.cur != e.dst {
+			return false
+		}
+	}
+	return true
 }
 
 func (m *model) totalCount() int {
@@ -150,7 +229,11 @@ func (m *model) totalCount() int {
 }
 
 func (m model) Init() tea.Cmd {
-	cmds := refreshCmds(m.sources)
+	var cmds []tea.Cmd
+	cmds = append(cmds, refreshCmds(m.sources)...)
+	if !animSettled(m.anim) {
+		cmds = append(cmds, tea.Tick(time.Second/60, func(t time.Time) tea.Msg { return animTickMsg{} }))
+	}
 	if len(cmds) == 0 {
 		return nil
 	}
@@ -159,12 +242,22 @@ func (m model) Init() tea.Cmd {
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
+	case animTickMsg:
+		if m.animTick() {
+			return m, tea.Tick(time.Second/60, func(t time.Time) tea.Msg { return animTickMsg{} })
+		}
+		return m, nil
+
 	case sourceMsg:
 		if len(msg.items) == 0 {
 			return m, nil
 		}
 		m.mergeSource(msg.src, msg.items)
 		m.refilter()
+		// Start animation if needed
+		if !animSettled(m.anim) {
+			return m, tea.Tick(time.Second/60, func(t time.Time) tea.Msg { return animTickMsg{} })
+		}
 		return m, nil
 
 	case tea.WindowSizeMsg:
@@ -196,7 +289,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		case "ctrl+t": // sticky <- shape from selection; Create/Zox use it
 			if len(m.view) > 0 {
-				it := m.view[m.cursor]
+				it := m.view[m.cursorIdx]
 				var p *store.Preset
 				var err error
 				switch it.Kind {
@@ -242,8 +335,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 
 		case "enter":
-			if len(m.view) > 0 && m.cursor < len(m.view) {
-				m.done = Result{Action: ActionConnect, Item: m.view[m.cursor]}
+			if len(m.view) > 0 && m.cursorIdx < len(m.view) {
+				m.done = Result{Action: ActionConnect, Item: m.view[m.cursorIdx]}
 				m.query = ""
 				m.view = m.view[:0]
 				return m, tea.Quit
@@ -251,16 +344,18 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		case "ctrl+n", "down":
 			if len(m.view) > 0 {
-				m.cursor = (m.cursor + 1) % len(m.view)
+				m.cursorIdx = (m.cursorIdx + 1) % len(m.view)
+				m.cursorKey = animKey(m.view[m.cursorIdx])
 			}
 			return m, nil
 
 		case "ctrl+p", "up":
 			if len(m.view) > 0 {
-				m.cursor--
-				if m.cursor < 0 {
-					m.cursor = len(m.view) - 1
+				m.cursorIdx--
+				if m.cursorIdx < 0 {
+					m.cursorIdx = len(m.view) - 1
 				}
+				m.cursorKey = animKey(m.view[m.cursorIdx])
 			}
 			return m, nil
 
@@ -285,7 +380,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		case "ctrl+x": // kill active
 			if len(m.view) > 0 {
-				it := m.view[m.cursor]
+				it := m.view[m.cursorIdx]
 				if it.Kind == KindActive {
 					if err := m.ctl.Kill(it.Name); err != nil {
 						m.status = err.Error()
@@ -303,7 +398,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		case "ctrl+f": // freeze instance+shape; sticky stays intentional (^t)
 			if len(m.view) > 0 {
-				it := m.view[m.cursor]
+				it := m.view[m.cursorIdx]
 				name := it.Name
 				if it.Kind == KindActive || (it.Kind == KindPreset && m.ctl.Has(name)) {
 					stop := HoldInterrupt()
@@ -332,7 +427,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if len(m.view) == 0 {
 				return m, nil
 			}
-			it := m.view[m.cursor]
+			it := m.view[m.cursorIdx]
 			switch it.Kind {
 			case KindActive:
 				stop := HoldInterrupt()
@@ -364,7 +459,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		case "ctrl+d": // delete preset
 			if len(m.view) > 0 {
-				it := m.view[m.cursor]
+				it := m.view[m.cursorIdx]
 				if it.Kind == KindPreset {
 					if err := m.store.Delete(it.Name); err != nil {
 						m.status = err.Error()
@@ -404,6 +499,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.reload()
 		}
 		return m, nil
+	}
+	if !animSettled(m.anim) {
+		return m, tea.Tick(time.Second/60, func(t time.Time) tea.Msg { return animTickMsg{} })
 	}
 	return m, nil
 }
@@ -539,7 +637,7 @@ func (m model) View() tea.View {
 		shown = 1
 	} else {
 		half := maxShow / 2
-		start := m.cursor - half
+		start := m.cursorIdx - half
 		if start < 0 {
 			start = 0
 		}
@@ -553,8 +651,22 @@ func (m model) View() tea.View {
 		if end > len(m.view) {
 			end = len(m.view)
 		}
+
+		// Sort visible items by animated Y so moving items slide smoothly.
+		type visItem struct{ it Item }
+		vis := make([]visItem, 0, end-start)
 		for i := start; i < end; i++ {
-			it := m.view[i]
+			vis = append(vis, visItem{m.view[i]})
+		}
+		if !animSettled(m.anim) {
+			sort.SliceStable(vis, func(a, b int) bool {
+				ya := m.anim[animKey(vis[a].it)].cur
+				yb := m.anim[animKey(vis[b].it)].cur
+				return ya < yb
+			})
+		}
+		for _, v := range vis {
+			it := v.it
 			line := it.Title
 			if it.GitBranch != "" {
 				line += " (" + it.GitBranch + ")"
@@ -572,7 +684,7 @@ func (m model) View() tea.View {
 			if m.width > 4 {
 				line = truncateRunes(line, m.width-2)
 			}
-			if i == m.cursor {
+			if animKey(it) == m.cursorKey {
 				b.WriteString(styleCursor.Render(iconCursor() + line))
 			} else {
 				b.WriteString(styleFor(it.Kind).Render("  " + line))
