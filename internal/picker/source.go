@@ -48,9 +48,11 @@ func (c *sourceCache) invalidate() {
 }
 
 func defaultSources(ctl tmux.Connector, st store.Storer, createName, createCwd string, cache *sourceCache) []Source {
-	if !cache.tmuxOK.Load() {
-		cache.tmuxSnap = nil
-		cache.tmuxOK.Store(true)
+	if !cache.tmuxOK.Load() || len(cache.tmuxSnap) == 0 {
+		if !cache.tmuxOK.Load() {
+			cache.tmuxSnap = nil
+			cache.tmuxOK.Store(true)
+		}
 		if ctl != nil {
 			if live, err := ctl.ListLive(context.Background()); err == nil && len(live) > 0 {
 				cache.tmuxSnap = live
