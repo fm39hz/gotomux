@@ -12,7 +12,7 @@ license=('MIT')
 depends=('tmux')
 optdepends=('zoxide: frequent project paths in the picker')
 makedepends=('go')
-install=gotomux.install
+install=dist/gotomux.install
 options=('!lto' '!debug')
 
 source=("${pkgname}-${pkgver}.tar.gz::${url}/archive/v${pkgver}.tar.gz")

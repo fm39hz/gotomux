@@ -34,11 +34,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Stamp version into PKGBUILD
+      - name: Prepare AUR files
         run: |
           tagver="${GITHUB_REF_NAME#v}"
           sed -i "s/^pkgver=.*/pkgver=${tagver}  # set by CI/" dist/PKGBUILD-aur
-
+          cp dist/PKGBUILD-aur PKGBUILD
+          cp dist/gotomux.install gotomux.install
+          rm -f dist/src/gotomux/PKGBUILD
       - name: Push to AUR
         uses: KSXGitHub/github-actions-deploy-aur@v3
         with:
