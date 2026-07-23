@@ -29,6 +29,8 @@ type Daemon struct {
 
 	cachedPairs map[string]int64
 	cachedUsage map[string]store.Usage
+	ctxSess     string
+	ctxPath     string
 	cacheMu     sync.RWMutex
 
 	stopCh  chan struct{}
@@ -184,11 +186,12 @@ func (d *Daemon) syncNow() {
 	}
 	d.lastSeenMu.Unlock()
 
-	ctxSess := d.ctl.CurrentSession(context.Background())
+	sess, path := d.ctl.CurrentContext(context.Background())
 	d.cacheMu.Lock()
+	d.ctxSess, d.ctxPath = sess, path
 	d.stMu.Lock()
-	if ctxSess != "" && d.st != nil {
-		d.cachedPairs, _ = d.st.PairScores(ctxSess, time.Now().Unix())
+	if sess != "" && d.st != nil {
+		d.cachedPairs, _ = d.st.PairScores(sess, time.Now().Unix())
 	} else {
 		d.cachedPairs = nil
 	}

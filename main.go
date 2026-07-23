@@ -135,11 +135,15 @@ func runPickerIPC(cfg *config.Config, conn net.Conn) error {
 		return runErr
 	}
 
-	fm, ok := final.(interface{ Done() picker.Result })
+	fm, ok := final.(interface {
+		Done() picker.Result
+		FrameLines() int
+	})
 	if !ok {
 		return errCancel
 	}
 
+	picker.ClearInline(fm.FrameLines())
 	res := fm.Done()
 	if res.Action != picker.ActionConnect {
 		return errCancel

@@ -230,11 +230,8 @@ func (d *Daemon) buildListResponse() Response {
 		presets, _ = d.st.ListMeta()
 	}
 
-	// Use cached values from syncNow — avoids SQLite queries per request.
-	ctxSess := d.ctl.CurrentSession(context.Background())
-	ctxPath := d.ctl.CurrentSessionPath(context.Background())
-
 	d.cacheMu.RLock()
+	ctxSess, ctxPath := d.ctxSess, d.ctxPath
 	pairs := d.cachedPairs
 	usage := d.cachedUsage
 	d.cacheMu.RUnlock()

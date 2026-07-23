@@ -269,6 +269,25 @@ func (c *Ctl) CurrentSessionPath(ctx context.Context) string {
 	return strings.TrimSpace(out)
 }
 
+// CurrentContext returns session name + path in one tmux call (1 fork instead of 2).
+func (c *Ctl) CurrentContext(ctx context.Context) (session, path string) {
+	if os.Getenv("TMUX") == "" {
+		return "", ""
+	}
+	out, err := tmuxCmd(ctx, "display-message", "-p", "#S\t#{session_path}")
+	if err != nil {
+		return "", ""
+	}
+	parts := strings.SplitN(out, "\t", 2)
+	if len(parts) >= 1 {
+		session = strings.TrimSpace(parts[0])
+	}
+	if len(parts) >= 2 {
+		path = strings.TrimSpace(parts[1])
+	}
+	return session, path
+}
+
 func (c *Ctl) Kill(ctx context.Context, name string) error {
 	if name == "" {
 		return fmt.Errorf("kill: empty session name")
