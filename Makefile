@@ -1,8 +1,10 @@
 BIN     := gotomux
 DAEMON  := gotomuxd
 LDFLAGS := -s -w
+REMOTE  := origin
+BRANCH  := master
 
-.PHONY: help build build-all run test test-v bench install install-all clean fmt vet pkg pkg-install
+.PHONY: help build build-all run test test-v bench install install-all clean fmt vet pkg pkg-install publish
 
 help: ## list targets
 	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN{FS=":.*?## "}; {printf "  %-12s %s\n", $$1, $$2}'
@@ -43,6 +45,13 @@ fmt: ## gofmt
 
 vet: ## go vet
 	go vet ./...
+
+publish: ## tag & push: make publish [major|minor|patch]
+	@scripts/bump-version.sh --do $(filter-out publish,$(MAKECMDGOALS))
+
+# Make consumes these as targets so declare them phony to avoid confusion.
+.PHONY: major minor patch
+major minor patch: ;
 
 pkg: ## build Arch package (artifacts to dist/)
 	mkdir -p dist
