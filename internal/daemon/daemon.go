@@ -4,6 +4,9 @@ import (
 	"context"
 	"log"
 	"os/exec"
+	"path/filepath"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -19,6 +22,10 @@ type Daemon struct {
 	cfg          *config.Config
 	lastSeen     map[string]int64
 	stateVersion atomic.Int64
+
+	cachedPairs map[string]int64
+	cachedUsage map[string]store.Usage
+	cacheMu     sync.RWMutex
 }
 
 func New(cfg *config.Config) (*Daemon, error) {
@@ -34,12 +41,13 @@ func New(cfg *config.Config) (*Daemon, error) {
 		cc.Close()
 		return nil, err
 	}
-	st, err := store.Open()
+	st, err := store.OpenWithConfig(cfg)
 	if err != nil {
 		cc.Close()
 		return nil, err
 	}
 	d := &Daemon{cc: cc, ctl: ctl, st: st, cfg: cfg, lastSeen: map[string]int64{}}
+	d.syncZoxide()
 	d.syncNow()
 	go d.pollLoop()
 	return d, nil
@@ -56,7 +64,18 @@ func (d *Daemon) Close() {
 
 func (d *Daemon) listLiveViaControl() []tmux.LiveSession {
 	raw, err := d.cc.Send(context.Background(), "list-sessions", "-F", "S\t#{session_name}\t#{session_windows}\t#{session_path}\t#{session_last_attached}\t#{session_activity}\t#{session_created}\t#{session_attached}", ";", "list-panes", "-s", "-F", "P\t#{session_name}\t#{pane_current_command}\t#{?pane_active,1,0}\t#{?pane_dead,1,0}")
+	if err == nil {
+		return tmux.ParseLiveOutput(raw)
+	}
+	log.Printf("listLiveViaControl: %v — attempting reconnect", err)
+	if rerr := d.cc.Reconnect(); rerr != nil {
+		log.Printf("reconnect failed: %v", rerr)
+		return nil
+	}
+	log.Printf("reconnected to tmux -C")
+	raw, err = d.cc.Send(context.Background(), "list-sessions", "-F", "S\t#{session_name}\t#{session_windows}\t#{session_path}\t#{session_last_attached}\t#{session_activity}\t#{session_created}\t#{session_attached}", ";", "list-panes", "-s", "-F", "P\t#{session_name}\t#{pane_current_command}\t#{?pane_active,1,0}\t#{?pane_dead,1,0}")
 	if err != nil {
+		log.Printf("listLiveViaControl after reconnect: %v", err)
 		return nil
 	}
 	return tmux.ParseLiveOutput(raw)
@@ -88,6 +107,22 @@ func (d *Daemon) syncNow() {
 			changed = true
 		}
 	}
+
+	// Precompute pairs + usage for fast IPC response
+	ctxSess := d.ctl.CurrentSession(context.Background())
+	d.cacheMu.Lock()
+	if ctxSess != "" && d.st != nil {
+		d.cachedPairs, _ = d.st.PairScores(ctxSess, time.Now().Unix())
+	} else {
+		d.cachedPairs = nil
+	}
+	if d.st != nil {
+		d.cachedUsage, _ = d.st.AllUsage()
+	} else {
+		d.cachedUsage = nil
+	}
+	d.cacheMu.Unlock()
+
 	if changed {
 		d.stateVersion.Add(1)
 	}
@@ -110,11 +145,43 @@ func (d *Daemon) recordTelemetry(name string, all []tmux.LiveSession) {
 	}
 }
 
+// syncZoxide runs zoxide query -l and caches results in the zox table.
+// Best-effort; no error returned (cache stays stale if zoxide is missing).
+func (d *Daemon) syncZoxide() {
+	if d.st == nil {
+		return
+	}
+	out, err := exec.Command("zoxide", "query", "-l").Output()
+	if err != nil {
+		return
+	}
+	now := time.Now().Unix()
+	var rows []store.ZoxRow
+	for _, line := range strings.Split(string(out), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		name := filepath.Base(line)
+		if name == "" || name == "." || name == "/" {
+			continue
+		}
+		rows = append(rows, store.ZoxRow{
+			Name: name, Path: line,
+			Title: "[Zoxide] " + name, Recency: now,
+		})
+	}
+	if len(rows) > 0 {
+		d.st.SaveZox(rows)
+	}
+}
+
 func (d *Daemon) pollLoop() {
 	interval := 10 * time.Second
 	if d.cfg != nil {
 		interval = d.cfg.PollInterval
 	}
+	d.syncZoxide()
 	for {
 		time.Sleep(interval)
 		d.syncNow()

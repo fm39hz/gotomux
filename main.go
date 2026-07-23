@@ -149,6 +149,13 @@ func runPickerIPC(cfg *config.Config, conn net.Conn) error {
 		return errCancel
 	}
 	it := res.Item
+
+	// Notify daemon BEFORE connecting so telemetry is recorded immediately,
+	// not 10s later on the next poll cycle.
+	enc.Encode(daemon.Request{Cmd: "connect", Name: it.Name})
+	var ack daemon.Response
+	dec.Decode(&ack)
+
 	switch it.Kind {
 	case picker.KindActive:
 		return ctl.Connect(ctx, it.Name, "")
@@ -224,6 +231,41 @@ func connectItem(ctl tmux.Connector, st store.Storer, it picker.Item) error {
 }
 
 func freezeCLI(cfg *config.Config, name string) error {
+	// Try IPC first — daemon freeze uses its own tmux + store, 0 fork.
+	if conn, err := net.DialTimeout("unix", daemonSocket(), 50*time.Millisecond); err == nil {
+		defer conn.Close()
+		enc, dec := json.NewEncoder(conn), json.NewDecoder(conn)
+		enc.Encode(daemon.Request{Cmd: "list"})
+		var listResp daemon.Response
+		if err := dec.Decode(&listResp); err == nil && listResp.OK {
+			if name == "" {
+				if listResp.CtxSess != "" {
+					name = listResp.CtxSess
+				} else if len(listResp.Sessions) > 0 {
+					items := make([]string, 0, len(listResp.Sessions))
+					for _, s := range listResp.Sessions {
+						items = append(items, s.Name)
+					}
+					name, err = picker.Pick(items)
+					if err != nil || name == "" {
+						return errCancel
+					}
+				}
+			}
+			if name != "" {
+				enc.Encode(daemon.Request{Cmd: "freeze", Name: name})
+				var fr daemon.Response
+				dec.Decode(&fr)
+				if fr.OK {
+					fmt.Printf("froze %s\n", name)
+					return nil
+				}
+				return fmt.Errorf("freeze via daemon: %s", fr.Error)
+			}
+		}
+	}
+
+	// Fallback: standalone freeze
 	ctl, err := tmux.New()
 	if err != nil {
 		return fmt.Errorf("tmux: %w", err)
