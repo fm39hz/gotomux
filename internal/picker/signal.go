@@ -47,15 +47,10 @@ func RunPicker(cfg *config.Config, ctl tmux.Connector, st store.Storer, createNa
 			return runErr
 		}
 
-		fm, ok := final.(interface {
-			Done() Result
-			FrameLines() int
-		})
+		fm, ok := final.(interface{ Done() Result })
 		if !ok {
 			return ErrCancel
 		}
-
-		ClearInline(fm.FrameLines())
 
 		res := fm.Done()
 		switch res.Action {

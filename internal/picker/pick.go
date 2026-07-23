@@ -33,7 +33,6 @@ func Pick(names []string) (string, error) {
 	if !ok {
 		return "", fmt.Errorf("pick: unexpected model type %T", final)
 	}
-	ClearInline(2 + len(pm.view))
 	return pm.name, nil
 }
 

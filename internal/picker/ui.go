@@ -617,6 +617,13 @@ func editorCmd(path string) *exec.Cmd {
 }
 
 func (m model) View() tea.View {
+	if m.ui.done.Action != ActionNone {
+		var b strings.Builder
+		b.WriteString(m.ui.done.Item.Title)
+		b.WriteByte('\n')
+		return tea.NewView(b.String())
+	}
+
 	var b strings.Builder
 
 	b.WriteString(styleDim.Render(iconPrompt()))
