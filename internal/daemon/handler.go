@@ -166,11 +166,10 @@ func (d *Daemon) buildStatusResponse() Response {
 		stOK = d.st.Ping() == nil
 	}
 	d.stMu.Unlock()
-	ccOK := d.cc != nil
 
 	return Response{
 		OK: true,
-		StatusCC: ccOK, StatusStore: stOK,
+		StatusCC: d.cc != nil, StatusStore: stOK,
 		CCErrs: d.ccErrs.Load(), StoreErrs: d.storeErrs.Load(),
 		Uptime: int64(time.Since(d.startedAt).Seconds()),
 	}

@@ -39,10 +39,8 @@ type Daemon struct {
 	sockPath string
 	wg       sync.WaitGroup
 
-	// error governance
 	storeErrs  atomic.Int64
 	ccErrs     atomic.Int64
-	ccTimeouts atomic.Int64
 	startedAt  time.Time
 }
 
@@ -60,13 +58,11 @@ func New(cfg *config.Config) (*Daemon, error) {
 	}
 	stDir := cfg.ResolveDataDir()
 	if err := os.MkdirAll(stDir, 0o755); err != nil {
-		cc.Close()
 		return nil, err
 	}
 	stPath := filepath.Join(stDir, "state.db")
 	st, err := store.OpenWithConfig(cfg)
 	if err != nil {
-		cc.Close()
 		return nil, err
 	}
 

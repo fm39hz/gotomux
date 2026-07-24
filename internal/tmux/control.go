@@ -4,52 +4,48 @@ import (
 	"bufio"
 	"context"
 	"fmt"
-	"net"
+	"io"
 	"os/exec"
 	"strings"
 	"sync"
 	"time"
 )
 
-// ControlConn is a direct tmux control socket connection.
-// Replaces the old tmux -C subprocess approach — no extra process, no pipe hacks.
-// SetReadDeadline on the underlying net.Conn gives clean timeouts without
-// goroutine leaks.
+// ControlConn is a tmux -C control mode subprocess.
+// Single persistent process — one exec at init, then pipe commands via stdin,
+// read responses (with %begin/%end markers) from stdout.
+// No per-command fork overhead.
 type ControlConn struct {
 	mu   sync.Mutex
-	conn net.Conn
-	br   *bufio.Reader
-	path string
+	cmd  *exec.Cmd
+	in   io.WriteCloser
+	out  *bufio.Reader
+	readTimeout time.Duration
 }
 
-func tmuxSocketPath() (string, error) {
-	out, err := exec.Command("tmux", "display-message", "-p", "#{socket_path}").Output()
-	if err != nil {
-		return "", fmt.Errorf("resolve tmux socket: %w", err)
-	}
-	return strings.TrimSpace(string(out)), nil
-}
-
-func dialTMUX(timeout time.Duration) (net.Conn, string, error) {
-	path, err := tmuxSocketPath()
-	if err != nil {
-		return nil, "", err
-	}
-	conn, err := net.DialTimeout("unix", path, timeout)
-	if err != nil {
-		return nil, "", fmt.Errorf("dial tmux %s: %w", path, err)
-	}
-	return conn, path, nil
-}
-
-// StartControl dials the tmux control socket directly.
-// Requires the tmux server to be running (call ensureServer / start-server first).
+// StartControl spawns "tmux -C" and returns a ControlConn.
+// Requires the tmux server to be running first (call start-server / ensureServer).
 func StartControl() (*ControlConn, error) {
-	conn, path, err := dialTMUX(2 * time.Second)
+	cmd := exec.Command("tmux", "-C")
+	in, err := cmd.StdinPipe()
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("tmux -C stdin: %w", err)
 	}
-	return &ControlConn{conn: conn, br: bufio.NewReader(conn), path: path}, nil
+	out, err := cmd.StdoutPipe()
+	if err != nil {
+		return nil, fmt.Errorf("tmux -C stdout: %w", err)
+	}
+	// stderr: discard to avoid blocking; tmux errors come via %error on stdout
+	cmd.Stderr = nil
+
+	if err := cmd.Start(); err != nil {
+		return nil, fmt.Errorf("tmux -C start: %w", err)
+	}
+
+	return &ControlConn{
+		cmd: cmd, in: in, out: bufio.NewReader(out),
+		readTimeout: 5 * time.Second,
+	}, nil
 }
 
 func buildCommand(args []string) string {
@@ -70,83 +66,117 @@ func buildCommand(args []string) string {
 	return b.String()
 }
 
-// Send writes a command to the tmux control socket and reads the response.
-// A 5-second deadline prevents hanging. On any I/O error the connection is
-// closed; caller must Reconnect before the next call.
+// Send writes a command to the tmux -C subprocess and reads the response.
+// Read deadline via goroutine + timeout channel (no SetReadDeadline on pipe).
 func (cc *ControlConn) Send(ctx context.Context, args ...string) (string, error) {
 	cc.mu.Lock()
 	defer cc.mu.Unlock()
 
-	if cc.conn == nil {
+	if cc.cmd == nil {
 		return "", fmt.Errorf("tmux: not connected")
 	}
 
 	cmdLine := buildCommand(args)
-	dl := time.Now().Add(5 * time.Second)
-	if d, ok := ctx.Deadline(); ok && d.Before(dl) {
-		dl = d
-	}
-
-	cc.conn.SetWriteDeadline(dl)
-	if _, err := fmt.Fprint(cc.conn, cmdLine); err != nil {
-		cc.conn.Close()
-		cc.conn = nil
+	if _, err := fmt.Fprint(cc.in, cmdLine); err != nil {
+		cc.closeLocked()
 		return "", fmt.Errorf("tmux send: %w", err)
 	}
 
-	cc.conn.SetReadDeadline(dl)
+	return cc.readResponse(ctx)
+}
 
-	var out strings.Builder
-	for {
-		line, err := cc.br.ReadString('\n')
-		if err != nil {
-			cc.conn.Close()
-			cc.conn = nil
-			return "", fmt.Errorf("tmux recv: %w", err)
-		}
-		line = strings.TrimSuffix(line, "\n")
-
-		switch {
-		case strings.HasPrefix(line, "%begin "):
-		case strings.HasPrefix(line, "%end "):
-			return strings.TrimRight(out.String(), "\n"), nil
-		case strings.HasPrefix(line, "%error "):
-			return "", fmt.Errorf("tmux: %s", strings.TrimSpace(line[7:]))
-		default:
-			if strings.HasPrefix(line, "%") {
-				continue
+func (cc *ControlConn) readResponse(ctx context.Context) (string, error) {
+	type res struct {
+		out string
+		err error
+	}
+	ch := make(chan res, 1)
+	go func() {
+		var out strings.Builder
+		for {
+			line, err := cc.out.ReadString('\n')
+			if err != nil {
+				cc.closeLocked()
+				ch <- res{"", fmt.Errorf("tmux recv: %w", err)}
+				return
 			}
-			out.WriteString(line)
-			out.WriteByte('\n')
+			line = strings.TrimSuffix(line, "\n")
+			switch {
+			case strings.HasPrefix(line, "%begin "):
+			case strings.HasPrefix(line, "%end "):
+				ch <- res{strings.TrimRight(out.String(), "\n"), nil}
+				return
+			case strings.HasPrefix(line, "%error "):
+				ch <- res{"", fmt.Errorf("tmux: %s", strings.TrimSpace(line[7:]))}
+				return
+			default:
+				if strings.HasPrefix(line, "%") {
+					continue
+				}
+				out.WriteString(line)
+				out.WriteByte('\n')
+			}
 		}
+	}()
+
+	t := cc.readTimeout
+	if d, ok := ctx.Deadline(); ok {
+		remaining := time.Until(d)
+		if remaining < t {
+			t = remaining
+		}
+	}
+	select {
+	case r := <-ch:
+		return r.out, r.err
+	case <-time.After(t):
+		cc.closeLocked()
+		return "", fmt.Errorf("tmux: response timeout (%v)", t)
+	case <-ctx.Done():
+		cc.closeLocked()
+		return "", ctx.Err()
 	}
 }
 
 func (cc *ControlConn) Close() {
 	cc.mu.Lock()
 	defer cc.mu.Unlock()
-	if cc.conn != nil {
-		cc.conn.Close()
-		cc.conn = nil
-	}
+	cc.closeLocked()
 }
 
-// Reconnect closes the old socket and opens a new connection.
+func (cc *ControlConn) closeLocked() {
+	if cc.cmd != nil && cc.cmd.Process != nil {
+		cc.cmd.Process.Kill()
+	}
+	cc.in.Close()
+	cc.cmd = nil
+	cc.in = nil
+	cc.out = nil
+}
+
+// Reconnect kills the old subprocess and spawns a new one.
 func (cc *ControlConn) Reconnect() error {
 	cc.mu.Lock()
 	defer cc.mu.Unlock()
 
-	if cc.conn != nil {
-		cc.conn.Close()
-		cc.conn = nil
+	cc.closeLocked()
+
+	cmd := exec.Command("tmux", "-C")
+	in, err := cmd.StdinPipe()
+	if err != nil {
+		return fmt.Errorf("tmux -C stdin: %w", err)
+	}
+	out, err := cmd.StdoutPipe()
+	if err != nil {
+		return fmt.Errorf("tmux -C stdout: %w", err)
+	}
+	cmd.Stderr = nil
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("tmux -C start: %w", err)
 	}
 
-	conn, path, err := dialTMUX(2 * time.Second)
-	if err != nil {
-		return err
-	}
-	cc.conn = conn
-	cc.path = path
-	cc.br = bufio.NewReader(conn)
+	cc.cmd = cmd
+	cc.in = in
+	cc.out = bufio.NewReader(out)
 	return nil
 }
