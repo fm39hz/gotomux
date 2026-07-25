@@ -48,10 +48,6 @@ func ProfileRun(cfg *config.Config, ctl tmux.Connector, st store.Storer, createN
 		applyRankMeta(bySrc, st, env)
 	})
 
-	log("enrichAllSyncWith", func() {
-		enrichAllSyncWith(bySrc, gitConc(cfg))
-	})
-
 	log("StickyLabel", func() {
 		template.StickyLabel(st)
 	})

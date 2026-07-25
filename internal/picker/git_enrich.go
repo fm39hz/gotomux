@@ -5,8 +5,6 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
-
-	tea "charm.land/bubbletea/v2"
 )
 
 var gitBranchCache sync.Map // path → string ("" = not a git repo, "master | worktree" for linked worktree)
@@ -82,8 +80,15 @@ func readGitBranch(path string) string {
 	return label
 }
 
-// gitEnrichDone is sent when async git enrichment completes.
-type gitEnrichDone struct{}
+// PreloadCache bulk-populates gitBranchCache from a pre-computed map.
+// Used by daemon IPC to avoid filesystem I/O in the picker.
+func PreloadCache(m map[string]string) {
+	for path, branch := range m {
+		if branch != "" {
+			gitBranchCache.Store(path, branch)
+		}
+	}
+}
 
 // collectPaths extracts unique non-empty paths from bySrc.
 func collectPaths(bySrc map[Source][]Item) []string {
@@ -122,19 +127,6 @@ func enrichPaths(paths []string, concurrency int) {
 		}(p)
 	}
 	wg.Wait()
-}
-
-// enrichCmd returns a tea.Cmd that runs git enrichment in background.
-// The UI renders immediately; branches appear when the cmd completes.
-func enrichCmd(bySrc map[Source][]Item, concurrency int) tea.Cmd {
-	paths := collectPaths(bySrc)
-	if len(paths) == 0 {
-		return nil
-	}
-	return func() tea.Msg {
-		enrichPaths(paths, concurrency)
-		return gitEnrichDone{}
-	}
 }
 
 // enrichAllSync fills the git branch cache for all unique paths in bySrc.

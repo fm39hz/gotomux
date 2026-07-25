@@ -127,6 +127,11 @@ func runPickerIPC(cfg *config.Config, conn net.Conn) error {
 	}
 	defer st.Close()
 
+	// Preload git branch cache from daemon to avoid filesystem I/O in the picker.
+	if len(resp.GitBranches) > 0 {
+		picker.PreloadCache(resp.GitBranches)
+	}
+
 	ctx := context.Background()
 	env := picker.Context{
 		Session: ctl.CurrentSession(ctx), Path: ctl.CurrentSessionPath(ctx),

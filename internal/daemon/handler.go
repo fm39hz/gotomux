@@ -32,6 +32,7 @@ type Response struct {
 	CtxPath string              `json:"ctx_path,omitempty"`
 	Pairs   map[string]int64    `json:"pairs,omitempty"`
 	Usage   map[string]store.Usage `json:"usage,omitempty"`
+	GitBranches map[string]string `json:"git_branches,omitempty"`
 
 	// status response fields
 	StatusCC     bool  `json:"status_cc,omitempty"`
@@ -225,8 +226,10 @@ func (d *Daemon) buildListResponse() Response {
 	ctxSess, ctxPath := d.ctxSess, d.ctxPath
 	pairs := d.cachedPairs
 	usage := d.cachedUsage
+	gitBranches := d.cachedGitBranches
 	d.cacheMu.RUnlock()
 
 	return Response{OK: true, Sessions: sessions, Presets: presets,
-		CtxSess: ctxSess, CtxPath: ctxPath, Pairs: pairs, Usage: usage}
+		CtxSess: ctxSess, CtxPath: ctxPath, Pairs: pairs, Usage: usage,
+		GitBranches: gitBranches}
 }

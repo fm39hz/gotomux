@@ -16,6 +16,36 @@ import (
 	"github.com/fm39hz/gotomux/internal/tmux"
 )
 
+// readGitBranch returns the git branch name for a path, or "".
+// Simplified version of picker's detectLabel — handles regular repos only.
+func readGitBranch(path string) string {
+	data, err := os.ReadFile(filepath.Join(path, ".git", "HEAD"))
+	if err != nil {
+		return ""
+	}
+	head := strings.TrimSpace(string(data))
+	if !strings.HasPrefix(head, "ref: refs/heads/") {
+		return ""
+	}
+	return strings.TrimPrefix(head, "ref: refs/heads/")
+}
+
+// gitBranches returns path→branch for all unique non-empty paths.
+func gitBranches(paths []string) map[string]string {
+	m := make(map[string]string, len(paths))
+	seen := map[string]bool{}
+	for _, p := range paths {
+		if p == "" || seen[p] {
+			continue
+		}
+		seen[p] = true
+		if b := readGitBranch(p); b != "" {
+			m[p] = b
+		}
+	}
+	return m
+}
+
 type Daemon struct {
 	cc           *tmux.ControlConn
 	ctl          *tmux.Ctl
@@ -27,13 +57,14 @@ type Daemon struct {
 	lastSeenMu   sync.Mutex
 	stateVersion atomic.Int64
 
-	cachedSessions []tmux.LiveSession
-	cachedPresets  []store.PresetMeta
-	cachedPairs    map[string]int64
-	cachedUsage    map[string]store.Usage
-	ctxSess        string
-	ctxPath        string
-	cacheMu        sync.RWMutex
+	cachedSessions    []tmux.LiveSession
+	cachedPresets     []store.PresetMeta
+	cachedPairs       map[string]int64
+	cachedUsage       map[string]store.Usage
+	cachedGitBranches map[string]string
+	ctxSess           string
+	ctxPath           string
+	cacheMu           sync.RWMutex
 
 	stopCh  chan struct{}
 	sockPath string
@@ -191,9 +222,16 @@ func (d *Daemon) syncNow() {
 	d.lastSeenMu.Unlock()
 
 	sess, path := d.ctl.CurrentContext(context.Background())
+
+	sessPaths := make([]string, len(sessions))
+	for i, s := range sessions {
+		sessPaths[i] = s.Path
+	}
+
 	d.cacheMu.Lock()
 	d.ctxSess, d.ctxPath = sess, path
 	d.cachedSessions = sessions
+	d.cachedGitBranches = gitBranches(sessPaths)
 	d.stMu.Lock()
 	if sess != "" && d.st != nil {
 		d.cachedPairs, _ = d.st.PairScores(sess, time.Now().Unix())
