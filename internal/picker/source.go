@@ -172,9 +172,17 @@ type zoxideSource struct {
 	cache *sourceCache
 }
 
+const zoxCacheMaxAge = 30 * time.Second
+
 func (s *zoxideSource) Snapshot() []Item {
-	items, _, ok := loadZoxItemsSync(s.cache)
+	items, age, ok := loadZoxItemsSync(s.cache)
 	if !ok {
+		return nil
+	}
+	if age > zoxCacheMaxAge {
+		s.cache.zoxMu.Lock()
+		s.cache.zoxMem = nil
+		s.cache.zoxMu.Unlock()
 		return nil
 	}
 	for i := range items {
@@ -193,6 +201,12 @@ func (s *zoxideSource) FlattenFilter(query string) FlattenFilter {
 func (s *zoxideSource) Refresh() tea.Cmd {
 	src := Source(s)
 	return func() tea.Msg {
+		s.cache.zoxMu.Lock()
+		recent := len(s.cache.zoxMem) > 0 && time.Since(s.cache.zoxAt) < 30*time.Second
+		s.cache.zoxMu.Unlock()
+		if recent {
+			return nil
+		}
 		return sourceMsg{src: src, items: rebuildZoxItems(s.cache)}
 	}
 }

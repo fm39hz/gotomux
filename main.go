@@ -138,7 +138,12 @@ func runPickerIPC(cfg *config.Config, conn net.Conn) error {
 		Pairs: resp.Pairs, Usage: resp.Usage, Now: time.Now().Unix(),
 	}
 
-	m := picker.NewModelFromDaemon(cfg, ctl, st, name, root, resp.Sessions, resp.Presets, env)
+	var zoxideItems []picker.Item
+	if len(resp.Zoxide) > 0 {
+		zoxideItems = picker.ZoxRowsToItems(resp.Zoxide)
+	}
+
+	m := picker.NewModelFromDaemon(cfg, ctl, st, name, root, resp.Sessions, resp.Presets, env, zoxideItems)
 	opts, _, err := picker.TeaOpts()
 	if err != nil {
 		return err

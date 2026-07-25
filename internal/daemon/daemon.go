@@ -59,6 +59,7 @@ type Daemon struct {
 
 	cachedSessions    []tmux.LiveSession
 	cachedPresets     []store.PresetMeta
+	cachedZoxide      []store.ZoxRow
 	cachedPairs       map[string]int64
 	cachedUsage       map[string]store.Usage
 	cachedGitBranches map[string]string
@@ -223,15 +224,9 @@ func (d *Daemon) syncNow() {
 
 	sess, path := d.ctl.CurrentContext(context.Background())
 
-	sessPaths := make([]string, len(sessions))
-	for i, s := range sessions {
-		sessPaths[i] = s.Path
-	}
-
 	d.cacheMu.Lock()
 	d.ctxSess, d.ctxPath = sess, path
 	d.cachedSessions = sessions
-	d.cachedGitBranches = gitBranches(sessPaths)
 	d.stMu.Lock()
 	if sess != "" && d.st != nil {
 		d.cachedPairs, _ = d.st.PairScores(sess, time.Now().Unix())
@@ -305,6 +300,29 @@ func (d *Daemon) syncZoxide() {
 	if len(rows) > 0 {
 		st.SaveZox(rows)
 	}
+	d.cacheMu.Lock()
+	d.cachedZoxide = rows
+	d.cacheMu.Unlock()
+}
+
+// ensureGitBranches computes git branches for cached session paths lazily.
+// Called on first IPC "list" request so New() doesn't block on cold disk I/O.
+func (d *Daemon) ensureGitBranches() {
+	d.cacheMu.Lock()
+	if d.cachedGitBranches != nil {
+		d.cacheMu.Unlock()
+		return
+	}
+	paths := make([]string, len(d.cachedSessions))
+	for i, s := range d.cachedSessions {
+		paths[i] = s.Path
+	}
+	// Release lock during I/O so concurrent readers don't block.
+	d.cacheMu.Unlock()
+	branches := gitBranches(paths)
+	d.cacheMu.Lock()
+	d.cachedGitBranches = branches
+	d.cacheMu.Unlock()
 }
 
 func (d *Daemon) pollLoop() {

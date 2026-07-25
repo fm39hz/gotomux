@@ -24,7 +24,7 @@ func loadZoxItemsSync(cache *sourceCache) ([]Item, time.Duration, bool) {
 	if !ok {
 		return nil, 0, false
 	}
-	items := zoxRowsToItems(rows)
+	items := ZoxRowsToItems(rows)
 	age := time.Duration(0)
 	if updated > 0 {
 		age = time.Since(time.Unix(updated, 0))
@@ -126,7 +126,7 @@ func zoxideList(cache *sourceCache) []string {
 	return zoxideQueryFresh()
 }
 
-func zoxRowsToItems(rows []store.ZoxRow) []Item {
+func ZoxRowsToItems(rows []store.ZoxRow) []Item {
 	out := make([]Item, 0, len(rows))
 	for _, r := range rows {
 		title := r.Title

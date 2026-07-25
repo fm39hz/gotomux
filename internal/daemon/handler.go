@@ -33,6 +33,7 @@ type Response struct {
 	Pairs   map[string]int64    `json:"pairs,omitempty"`
 	Usage   map[string]store.Usage `json:"usage,omitempty"`
 	GitBranches map[string]string `json:"git_branches,omitempty"`
+	Zoxide  []store.ZoxRow      `json:"zoxide,omitempty"`
 
 	// status response fields
 	StatusCC     bool  `json:"status_cc,omitempty"`
@@ -220,9 +221,12 @@ func (d *Daemon) handleFreeze(name string) error {
 }
 
 func (d *Daemon) buildListResponse() Response {
+	d.ensureGitBranches()
+
 	d.cacheMu.RLock()
 	sessions := d.cachedSessions
 	presets := d.cachedPresets
+	zoxide := d.cachedZoxide
 	ctxSess, ctxPath := d.ctxSess, d.ctxPath
 	pairs := d.cachedPairs
 	usage := d.cachedUsage
@@ -231,5 +235,5 @@ func (d *Daemon) buildListResponse() Response {
 
 	return Response{OK: true, Sessions: sessions, Presets: presets,
 		CtxSess: ctxSess, CtxPath: ctxPath, Pairs: pairs, Usage: usage,
-		GitBranches: gitBranches}
+		GitBranches: gitBranches, Zoxide: zoxide}
 }

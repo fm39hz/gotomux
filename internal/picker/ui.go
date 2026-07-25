@@ -160,12 +160,15 @@ func initInput() textinput.Model {
 	return ti
 }
 
-func NewModelFromDaemon(cfg *config.Config, ctl tmux.Connector, st store.Storer, createName, createCwd string, sessions []tmux.LiveSession, presets []store.PresetMeta, env Context) model {
+func NewModelFromDaemon(cfg *config.Config, ctl tmux.Connector, st store.Storer, createName, createCwd string, sessions []tmux.LiveSession, presets []store.PresetMeta, env Context, zoxideItems []Item) model {
+	zoxAt := time.Now()
 	cache := &sourceCache{
 		zoxSt:    st,
 		zoxMu:    &sync.Mutex{},
 		tmuxSnap: sessions,
 		presetM:  presets,
+		zoxMem:   zoxideItems,
+		zoxAt:    zoxAt,
 	}
 	cache.tmuxOK.Store(true)
 	cache.presetOK.Store(true)
