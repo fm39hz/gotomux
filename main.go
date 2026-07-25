@@ -63,6 +63,12 @@ func main() {
 				os.Exit(1)
 			}
 			return
+		case "-p", "--profile":
+			if err := profileRun(cfg); err != nil {
+				fmt.Fprintln(os.Stderr, err)
+				os.Exit(1)
+			}
+			return
 		}
 	}
 	if err := runPicker(cfg); err != nil && !errors.Is(err, errCancel) {
@@ -224,6 +230,62 @@ func runPickerStandalone(cfg *config.Config) error {
 	return picker.RunPicker(cfg, ctl, st, name, root, func(it picker.Item) error {
 		return connectItem(ctl, st, it)
 	})
+}
+
+func profileRun(cfg *config.Config) error {
+	fmt.Fprintln(os.Stderr, "profile:")
+	totalStart := time.Now()
+
+	log := func(name string, fn func()) {
+		start := time.Now()
+		fn()
+		fmt.Fprintf(os.Stderr, "  %-28s %v\n", name, time.Since(start))
+	}
+
+	var (
+		ctl    tmux.Connector
+		st     *store.Store
+		ctlErr error
+		stErr  error
+		root   string
+	)
+	log("parallel init", func() {
+		var wg sync.WaitGroup
+		wg.Add(3)
+		go func() {
+			defer wg.Done()
+			c, e := tmux.New()
+			ctl, ctlErr = c, e
+		}()
+		go func() {
+			defer wg.Done()
+			s, e := store.OpenWithConfig(cfg)
+			st, stErr = s, e
+		}()
+		go func() {
+			defer wg.Done()
+			cwd, _ := os.Getwd()
+			root = project.FindProjectRoot(cwd)
+		}()
+		wg.Wait()
+	})
+	if ctlErr != nil {
+		return fmt.Errorf("tmux: %w", ctlErr)
+	}
+	if stErr != nil {
+		return fmt.Errorf("store: %w", stErr)
+	}
+	defer st.Close()
+
+	var name string
+	log("SessionName", func() {
+		name = project.SessionName(root)
+	})
+
+	picker.ProfileRun(cfg, ctl, st, name, root)
+
+	fmt.Fprintf(os.Stderr, "  %-28s %v\n", "total", time.Since(totalStart))
+	return nil
 }
 
 func connectItem(ctl tmux.Connector, st store.Storer, it picker.Item) error {
