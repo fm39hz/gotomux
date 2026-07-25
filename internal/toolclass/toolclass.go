@@ -26,6 +26,7 @@ var shells = map[string]bool{
 	"nu": true, "nushell": true, "dash": true, "ash": true,
 	"elvish": true, "xonsh": true, "pwsh": true, "powershell": true,
 	"tmux": true, "login": true,
+	"gotomux": true, // self — never persist the picker as pane cmd
 }
 
 // preferred: binaries we keep when walking process trees
