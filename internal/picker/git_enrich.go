@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+
+	tea "charm.land/bubbletea/v2"
 )
 
 var gitBranchCache sync.Map // path → string ("" = not a git repo, "master | worktree" for linked worktree)
@@ -80,11 +82,11 @@ func readGitBranch(path string) string {
 	return label
 }
 
-// enrichAllSync fills the git branch cache for all unique paths in bySrc,
-// running go-git opens in parallel goroutines for speed.
-func enrichAllSync(bySrc map[Source][]Item) { enrichAllSyncWith(bySrc, 4) }
+// gitEnrichDone is sent when async git enrichment completes.
+type gitEnrichDone struct{}
 
-func enrichAllSyncWith(bySrc map[Source][]Item, concurrency int) {
+// collectPaths extracts unique non-empty paths from bySrc.
+func collectPaths(bySrc map[Source][]Item) []string {
 	seen := map[string]bool{}
 	var paths []string
 	for _, items := range bySrc {
@@ -97,6 +99,11 @@ func enrichAllSyncWith(bySrc map[Source][]Item, concurrency int) {
 			paths = append(paths, p)
 		}
 	}
+	return paths
+}
+
+// enrichPaths reads git branch for all given paths with limited concurrency.
+func enrichPaths(paths []string, concurrency int) {
 	if len(paths) == 0 {
 		return
 	}
@@ -115,6 +122,26 @@ func enrichAllSyncWith(bySrc map[Source][]Item, concurrency int) {
 		}(p)
 	}
 	wg.Wait()
+}
+
+// enrichCmd returns a tea.Cmd that runs git enrichment in background.
+// The UI renders immediately; branches appear when the cmd completes.
+func enrichCmd(bySrc map[Source][]Item, concurrency int) tea.Cmd {
+	paths := collectPaths(bySrc)
+	if len(paths) == 0 {
+		return nil
+	}
+	return func() tea.Msg {
+		enrichPaths(paths, concurrency)
+		return gitEnrichDone{}
+	}
+}
+
+// enrichAllSync fills the git branch cache for all unique paths in bySrc.
+func enrichAllSync(bySrc map[Source][]Item) { enrichAllSyncWith(bySrc, 4) }
+
+func enrichAllSyncWith(bySrc map[Source][]Item, concurrency int) {
+	enrichPaths(collectPaths(bySrc), concurrency)
 }
 
 // setGitBranch looks up the cached branch for the item's Path and sets

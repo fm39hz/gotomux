@@ -85,17 +85,18 @@ func (v *viewModel) visible() []Item {
 // viewModel
 
 type model struct {
-	sources    []Source
-	bySrc      map[Source][]Item
-	ctl        tmux.Connector
-	store      store.Storer
-	cache      *sourceCache
-	cfg        *config.Config
-	env        Context
-	tmpl       string
-	createName string
-	createCwd  string
-	ui         viewModel
+	sources       []Source
+	bySrc         map[Source][]Item
+	ctl           tmux.Connector
+	store         store.Storer
+	cache         *sourceCache
+	cfg           *config.Config
+	env           Context
+	tmpl          string
+	createName    string
+	createCwd     string
+	ui            viewModel
+	pendingEnrich tea.Cmd
 }
 
 // ID now method on Item { return it.Name + "\x00" + it.Path }
@@ -173,24 +174,24 @@ func NewModelFromDaemon(cfg *config.Config, ctl tmux.Connector, st store.Storer,
 	srcs := defaultSources(ctl, st, createName, createCwd, cache)
 	bySrc := snapshotAll(srcs)
 	applyRankMeta(bySrc, st, env)
-	enrichAllSyncWith(bySrc, gitConc(cfg))
 	m := model{
-		sources:    srcs,
-		bySrc:      bySrc,
-		cache:      cache,
-		ctl:        ctl,
-		store:      st,
-		cfg:        cfg,
-		tmpl:       template.StickyLabel(st),
-		env:        env,
-		createName: createName,
-		createCwd:  createCwd,
+		sources:       srcs,
+		bySrc:         bySrc,
+		cache:         cache,
+		ctl:           ctl,
+		store:         st,
+		cfg:           cfg,
+		tmpl:          template.StickyLabel(st),
+		env:           env,
+		createName:    createName,
+		createCwd:     createCwd,
 		ui: viewModel{
 			queryInput: initInput(),
 			helpModel:  help.New(),
 			maxShow:    maxShow(cfg),
 			started:    time.Now(),
 		},
+		pendingEnrich: enrichCmd(bySrc, gitConc(cfg)),
 	}
 	m.refilter()
 	return m
@@ -206,24 +207,24 @@ func NewModel(cfg *config.Config, ctl tmux.Connector, store store.Storer, create
 	bySrc := snapshotAll(srcs)
 	env := newContext(ctl, store)
 	applyRankMeta(bySrc, store, env)
-	enrichAllSyncWith(bySrc, gitConc(cfg))
 	m := model{
-		sources:    srcs,
-		bySrc:      bySrc,
-		cache:      cache,
-		ctl:        ctl,
-		store:      store,
-		cfg:        cfg,
-		tmpl:       template.StickyLabel(store),
-		env:        env,
-		createName: createName,
-		createCwd:  createCwd,
+		sources:       srcs,
+		bySrc:         bySrc,
+		cache:         cache,
+		ctl:           ctl,
+		store:         store,
+		cfg:           cfg,
+		tmpl:          template.StickyLabel(store),
+		env:           env,
+		createName:    createName,
+		createCwd:     createCwd,
 		ui: viewModel{
 			queryInput: initInput(),
 			helpModel:  help.New(),
 			maxShow:    maxShow(cfg),
 			started:    time.Now(),
 		},
+		pendingEnrich: enrichCmd(bySrc, gitConc(cfg)),
 	}
 	m.refilter()
 	return m
@@ -283,6 +284,9 @@ func (m *model) totalCount() int {
 func (m model) Init() tea.Cmd {
 	var cmds []tea.Cmd
 	cmds = append(cmds, textinput.Blink)
+	if m.pendingEnrich != nil {
+		cmds = append(cmds, m.pendingEnrich)
+	}
 	cmds = append(cmds, refreshCmds(m.sources)...)
 	return tea.Batch(cmds...)
 }
@@ -294,6 +298,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.mergeSource(msg.src, msg.items)
+		m.refilter()
+		return m, nil
+
+	case gitEnrichDone:
 		m.refilter()
 		return m, nil
 
