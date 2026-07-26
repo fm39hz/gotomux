@@ -8,11 +8,11 @@ import (
 
 // Usage is per-session connect/kill stats for frecency ranking.
 type Usage struct {
-	Name     string
-	Opens    int64
-	Kills    int64
-	LastOpen int64
-	LastKill int64
+	Name     string `json:"name"`
+	Opens    int64  `json:"opens,omitempty"`
+	Kills    int64  `json:"kills,omitempty"`
+	LastOpen int64  `json:"last_open,omitempty"`
+	LastKill int64  `json:"last_kill,omitempty"`
 }
 
 // RecordOpen increments open count (connect / create / attach).
@@ -131,4 +131,3 @@ SELECT a, b, n, last FROM pair WHERE a = ? OR b = ?
 	}
 	return out, rows.Err()
 }
-

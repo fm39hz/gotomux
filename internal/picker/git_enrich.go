@@ -1,73 +1,17 @@
 package picker
 
 import (
-	"os"
-	"path/filepath"
-	"strings"
 	"sync"
+
+	"github.com/fm39hz/gotomux/internal/gitinfo"
 )
 
-var gitBranchCache sync.Map // path → string ("" = not a git repo, "master | worktree" for linked worktree)
+// gitBranchCache is per-process: the picker is short-lived, so entries never need
+// invalidating within a run. It caches misses as well as hits so a directory that
+// is not a repository is not re-stat'ed on every refilter.
+var gitBranchCache sync.Map // path -> string ("" = not a repo)
 
-// detectLabel returns the branch display label for a path, or "" if not a git
-// repo. Appends " | worktree" when the repo is a git linked worktree.
-func detectLabel(path string) string {
-	head, worktree := readHEAD(filepath.Clean(path))
-	if head == "" {
-		return ""
-	}
-	label := parseBranch(string(head))
-	if label != "" && worktree {
-		label += " | worktree"
-	}
-	return label
-}
-
-// readHEAD reads .git/HEAD. Works for both regular repos (.git dir)
-// and linked worktrees (.git file pointing to the actual git dir via "gitdir: <path>").
-// Returns (HEAD content, isWorktree).
-func readHEAD(path string) (string, bool) {
-	// Regular repo: .git/HEAD
-	data, err := os.ReadFile(filepath.Join(path, ".git", "HEAD"))
-	if err == nil {
-		return strings.TrimSpace(string(data)), false
-	}
-	// Linked worktree: .git is a file, content "gitdir: <path-to-gitdir>\n"
-	fi, err := os.Stat(filepath.Join(path, ".git"))
-	if err != nil || fi.IsDir() {
-		return "", false
-	}
-	data, err = os.ReadFile(filepath.Join(path, ".git"))
-	if err != nil {
-		return "", false
-	}
-	raw := strings.TrimSpace(string(data))
-	const gitdirPrefix = "gitdir: "
-	if !strings.HasPrefix(raw, gitdirPrefix) {
-		return "", false
-	}
-	// gitdir: path may be relative to the .git file's parent dir.
-	gitDir := raw[len(gitdirPrefix):]
-	if !filepath.IsAbs(gitDir) {
-		gitDir = filepath.Join(filepath.Dir(filepath.Join(path, ".git")), gitDir)
-	}
-	data, err = os.ReadFile(filepath.Join(gitDir, "HEAD"))
-	if err != nil {
-		return "", false
-	}
-	return strings.TrimSpace(string(data)), true
-}
-
-// parseBranch extracts the branch name from the HEAD ref line.
-// Returns "" for detached HEAD.
-func parseBranch(head string) string {
-	if !strings.HasPrefix(head, "ref: refs/heads/") {
-		return ""
-	}
-	return strings.TrimPrefix(head, "ref: refs/heads/")
-}
-
-// readGitBranch checks cache first, then opens the repo to detect branch.
+// readGitBranch returns the cached label for a path, reading it if absent.
 func readGitBranch(path string) string {
 	if path == "" {
 		return ""
@@ -75,17 +19,31 @@ func readGitBranch(path string) string {
 	if v, ok := gitBranchCache.Load(path); ok {
 		return v.(string)
 	}
-	label := detectLabel(path)
+	label := gitinfo.Label(path)
 	gitBranchCache.Store(path, label)
 	return label
 }
 
-// PreloadCache bulk-populates gitBranchCache from a pre-computed map.
-// Used by daemon IPC to avoid filesystem I/O in the picker.
-func PreloadCache(m map[string]string) {
-	for path, branch := range m {
-		if branch != "" {
-			gitBranchCache.Store(path, branch)
+// PreloadCache bulk-populates the cache from a pre-computed map, so the picker
+// performs no filesystem walk at all on the daemon path.
+//
+// Absent paths are cached as misses. The daemon reports only real branches, so
+// without this every non-repository row would be re-read locally — reintroducing
+// exactly the I/O the payload exists to avoid.
+func PreloadCache(branches map[string]string) {
+	for path, branch := range branches {
+		gitBranchCache.Store(path, branch)
+	}
+}
+
+// PreloadMisses marks paths with no branch, given the set that does have one.
+func PreloadMisses(paths []string, branches map[string]string) {
+	for _, p := range paths {
+		if p == "" {
+			continue
+		}
+		if _, ok := branches[p]; !ok {
+			gitBranchCache.Store(p, "")
 		}
 	}
 }
@@ -107,26 +65,24 @@ func collectPaths(bySrc map[Source][]Item) []string {
 	return paths
 }
 
-// enrichPaths reads git branch for all given paths with limited concurrency.
+// enrichPaths fills the cache for the given paths with bounded concurrency.
 func enrichPaths(paths []string, concurrency int) {
-	if len(paths) == 0 {
+	pending := make([]string, 0, len(paths))
+	for _, p := range paths {
+		if p == "" {
+			continue
+		}
+		if _, ok := gitBranchCache.Load(p); !ok {
+			pending = append(pending, p)
+		}
+	}
+	if len(pending) == 0 {
 		return
 	}
-	var wg sync.WaitGroup
-	if concurrency < 1 {
-		concurrency = 4
+	found := gitinfo.Labels(pending, concurrency)
+	for _, p := range pending {
+		gitBranchCache.Store(p, found[p]) // "" for misses
 	}
-	sem := make(chan struct{}, concurrency)
-	for _, p := range paths {
-		wg.Add(1)
-		sem <- struct{}{}
-		go func(path string) {
-			defer wg.Done()
-			defer func() { <-sem }()
-			readGitBranch(path)
-		}(p)
-	}
-	wg.Wait()
 }
 
 // enrichAllSync fills the git branch cache for all unique paths in bySrc.
@@ -136,8 +92,7 @@ func enrichAllSyncWith(bySrc map[Source][]Item, concurrency int) {
 	enrichPaths(collectPaths(bySrc), concurrency)
 }
 
-// setGitBranch looks up the cached branch for the item's Path and sets
-// GitBranch. No-op if not cached or not a git repo.
+// setGitBranch copies the cached label onto the item. No-op on a miss.
 func setGitBranch(it *Item) {
 	if it.Path == "" {
 		return

@@ -80,4 +80,3 @@ func DetectTypes(dir string) []pd.Match {
 func IsDetectedProject(dir string) bool {
 	return len(DetectTypes(dir)) > 0
 }
-

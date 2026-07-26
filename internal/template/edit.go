@@ -45,10 +45,10 @@ type presetJSON struct {
 }
 
 type windowJSON struct {
-	Fork  string     `json:"fork,omitempty"`
-	Name  string     `json:"name,omitempty"`
-	Cwd   string     `json:"cwd,omitempty"`
-	Split string     `json:"split,omitempty"`
+	Fork  string `json:"fork,omitempty"`
+	Name  string `json:"name,omitempty"`
+	Cwd   string `json:"cwd,omitempty"`
+	Split string `json:"split,omitempty"`
 	// legacyLayout accepts old hand-edits / mirrors that still say "layout".
 	LegacyLayout string     `json:"layout,omitempty"`
 	Panes        []paneJSON `json:"panes"`
@@ -189,7 +189,6 @@ func Parse(text string) (*model.Session, error) {
 	}
 	return p, nil
 }
-
 
 func isShapeID(s string) bool {
 	return s == "default" || strings.HasPrefix(s, "shape-")

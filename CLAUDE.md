@@ -30,8 +30,10 @@ go test ./... -count=1 -short      # what CI runs
 
 Test gating (matters when a test "doesn't run"):
 
-- `-short` skips live-tmux tests in `internal/tmux/load_test.go`. CI has no tmux server, so it always passes `-short`. Run without `-short` locally to exercise real `new-session`/`split-window`.
+- `-short` skips live-tmux tests in `internal/tmux/load_test.go`, `internal/tmux/control_test.go` and `internal/daemon/daemon_test.go`. CI has no tmux server, so it always passes `-short`. Run without `-short` locally to exercise real `new-session`/`split-window` and the control-mode transport.
 - Env-gated, off by default: `MIGRATE_USER=1` (`template/migrate_user_test.go`), `RECONCILE_USER=1` (`template/reconcile_test.go`) — these touch the *real* `~/.config/gotomux/shapes`. `STARTUP_BENCH=1` (`picker/startup_bench_test.go`).
+
+**Any test that touches tmux must go through `tmuxtest.Isolate` (`internal/tmuxtest`). Never set `TMUX_TMPDIR` by hand and never call `kill-server` in a test.** Setting `TMUX_TMPDIR` is not sufficient isolation: if the directory does not exist, tmux **silently ignores it**, `start-server` still returns 0, and the test operates on the developer's default socket — so the cleanup `kill-server` destroys their live sessions with no error anywhere. This is not hypothetical; it happened while building the control-mode transport. `Isolate` creates the directory, then *proves* isolation by checking `#{socket_path}` is inside it, and registers teardown only after that check passes. Verified discriminator: with the dir present the socket is `$TMUX_TMPDIR/tmux-<uid>/default`; with it absent the socket is `/tmp/tmux-<uid>/default`.
 
 CI (`.github/workflows/ci.yml`) runs `go vet` + `go test -short`. No linter beyond vet. Tags `v*` trigger release + AUR push.
 
@@ -74,6 +76,21 @@ Note: README documents the socket as `gotomuxd.sock`; the code uses `gotomux.soc
 - Single-instance is enforced twice: `flock` on `$XDG_RUNTIME_DIR/gotomux-<hash>.lock` plus stale-socket detection in `listenWithGuard`.
 
 Perf is the point of this package. Recent commits are all deferral work (defer zoxide query, move git enrich into the daemon). When touching it, keep expensive work off `New()` and off the IPC response path.
+
+#### tmux control mode — measured constraints (do not re-derive)
+
+Verified on tmux 3.7b in throwaway servers (`tmux -L …`). These are not inferable from the code and each one killed a plausible design:
+
+- **The daemon must never start the tmux server.** tmux registers a systemd *transient scope per pane*, parented under whatever unit started the server. A server started from `gotomuxd.service` therefore makes every pane of every session a child of that unit, and `systemctl --user stop gotomuxd` tears them all down — the journal logs `Stopping tmux child pane <pid>` for each and leaves the server alive with **zero sessions**. This destroyed real sessions during development. `KillMode=process` (now in `dist/gotomuxd.service`) saves the server *process* but not the pane scopes, so it is necessary and **not sufficient**. `daemon.New` therefore never runs `start-server`: it attaches only when `tmux.ServerRunning()` is already true, stays `Ready=false` otherwise (clients fall back to standalone), and `ensureControl` retries each poll. Correct topology, verified: `tmux-spawn-*.scope` units are *siblings* of `gotomuxd.service`, and the service cgroup holds only `gotomuxd` plus its own `tmux -C` client.
+- **`exit-empty off` is no longer set.** It mutated the user's server globally and is redundant while the daemon owns a hidden session — the server never reaches zero sessions.
+- **A control client must own a session, and attaching to a user session corrupts the data we serve.** `-C attach-session -t X` sets `session_attached=1` and bumps `session_last_attached` + `session_activity` on X. `-r` (read-only) does **not** help — it blocks input, not the attach. Since `LiveSession.Recency` is `max(LastAttached, Activity, Created)`, a daemon that attaches is falsifying its own ranking input.
+- **The only non-perturbing invocation is a dedicated hidden session**: `tmux -C new-session -A -s __gotomuxd -- cat`. User sessions stay byte-identical (`attached=0`, `last_attached` still empty on never-attached sessions). `-- cat` avoids spawning a shell — with a real shell the stream floods with `%output` of the prompt. `-A` makes daemon restart reuse the session. The hidden session **is** visible to `list-sessions`, so every consumer must filter it.
+- **`refresh-client -f no-output` suppresses `%output` entirely** (client gains the `no-output` flag; measured `%output` count drops to 0). Send it as the first command after connecting.
+- **`buildCommand`-style quoting has two independent fatal bugs.** Quote set `" '\";"` omits TAB, so `ListSessFmt` (tab-separated) is split into argv by tmux and only `S` survives as the format. And `";"` *does* match the set, so the separator gets quoted to `';'` → `parse error: command list-sessions: too many arguments` → `%error` → **`%exit`**, killing the client. Correct approach: one command per line, single-quote every argument that is not a bare command/flag token, never quote the separator, and read one `%begin`/`%end` block per command. An unquoted `;` on one line does work but still yields **two** blocks.
+- **Membership events**: creating a session emits `%sessions-changed` (plus `%unlinked-window-add`) — there is no `%session-created`. Killing emits `%sessions-changed` + `%unlinked-window-close`. Renaming emits `%session-renamed`. So `%sessions-changed` is the event to key membership resync on.
+- **Events do not cover timestamps.** `session_activity` advances on any pane output with no event emitted, and it feeds `Recency`. Event-driven resync therefore does **not** replace the periodic poll — events handle membership, the poll handles timestamps. Keep both.
+- **`%exit` means the client is gone** (e.g. after `%error` on a malformed command) — the transport must treat it as a reconnect trigger, not just a log line.
+- `session_last_attached` is **empty** for never-attached sessions, so `ParseLiveOutput`'s numeric fields must tolerate `""` (`parseUnix` / discarded `Atoi` error already do).
 
 ### Shapes — the non-obvious core
 

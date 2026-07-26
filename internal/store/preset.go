@@ -23,10 +23,13 @@ func (s *Store) ListNames() ([]string, error) {
 }
 
 // PresetMeta is name+cwd+recency for list/dedup/rank (no full tree load).
+// PresetMeta is served over IPC as well as read from SQLite, so it carries json
+// tags: without them the payload mixed snake_case keys from daemon.Response with
+// Go field names from the embedded types.
 type PresetMeta struct {
-	Name     string
-	Cwd      string
-	LastUsed int64
+	Name     string `json:"name"`
+	Cwd      string `json:"cwd,omitempty"`
+	LastUsed int64  `json:"last_used,omitempty"`
 }
 
 func (s *Store) ListMeta() ([]PresetMeta, error) {
@@ -239,8 +242,8 @@ ON CONFLICT(name) DO UPDATE SET
 		return err
 	}
 	type pr struct {
-		a, b       string
-		n, last    int64
+		a, b    string
+		n, last int64
 	}
 	var found []pr
 	for rows.Next() {
@@ -284,4 +287,3 @@ ON CONFLICT(a, b) DO UPDATE SET
 	}
 	return tx.Commit()
 }
-

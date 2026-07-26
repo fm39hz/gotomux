@@ -27,9 +27,10 @@ func HoldInterrupt() (stop func()) {
 // Callers treat it as a clean exit, not a failure.
 var ErrCancel = errors.New("canceled")
 
-// RunPicker runs the interactive picker in a loop. On connect error, it
-// re-shows the picker with the error message in the status line.
-func RunPicker(cfg *config.Config, ctl tmux.Connector, st store.Storer, createName, createCwd string, connect func(Item) error) error {
+// RunPicker runs the interactive picker in a loop. The connect callback receives
+// the whole Result, not just the Item, because it also needs the live-session set
+// captured at confirm time to record co-occurrence.
+func RunPicker(cfg *config.Config, ctl tmux.Connector, st store.Storer, createName, createCwd string, connect func(Result) error) error {
 	var lastErr string
 	for {
 		m := NewModel(cfg, ctl, st, createName, createCwd)
@@ -55,7 +56,7 @@ func RunPicker(cfg *config.Config, ctl tmux.Connector, st store.Storer, createNa
 		res := fm.Done()
 		switch res.Action {
 		case ActionConnect:
-			if err := connect(res.Item); err != nil {
+			if err := connect(res); err != nil {
 				lastErr = err.Error()
 				continue
 			}

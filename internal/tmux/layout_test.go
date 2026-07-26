@@ -32,8 +32,6 @@ func TestLayoutNamedOnly(t *testing.T) {
 	}
 }
 
-
-
 func TestSessionTargets(t *testing.T) {
 	if sessionTarget("bat-dong-san-web") != "=bat-dong-san-web:" {
 		t.Fatal(sessionTarget("bat-dong-san-web"))
@@ -51,7 +49,6 @@ func TestSessionTargets(t *testing.T) {
 		t.Fatal("path name should be empty")
 	}
 }
-
 
 func TestLayoutForShapeClassifiesDump(t *testing.T) {
 	h := "ad85,158x35,0,0{40x35,0,0,37,39x35,41,0,38}"

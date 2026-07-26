@@ -34,6 +34,10 @@ type Result struct {
 	Action Action
 	Item   Item
 	Err    error
+	// Live is the set of session names that were live when the user confirmed.
+	// Carried on the result so the caller can record co-occurrence without
+	// re-listing tmux, and so it reflects exactly what was on screen.
+	Live []string
 }
 
 // viewModel — UI state, tách biệt khỏi business logic.
@@ -73,22 +77,15 @@ func (v *viewModel) scrollOff() int {
 	return s
 }
 
-func (v *viewModel) visible() []Item {
-	start := v.scrollOff()
-	end := start + v.maxShow
-	if end > len(v.items) {
-		end = len(v.items)
-	}
-	return v.items[start:end]
-}
-
 // viewModel
 
 type model struct {
-	sources    []Source
-	bySrc      map[Source][]Item
-	ctl        tmux.Connector
-	store      store.Storer
+	sources []Source
+	bySrc   map[Source][]Item
+	ctl     tmux.Connector
+	store   store.Storer
+	// openStore lazily provides a store when store is nil (daemon mode).
+	openStore  func() store.Storer
 	cache      *sourceCache
 	cfg        *config.Config
 	env        Context
@@ -96,6 +93,26 @@ type model struct {
 	createName string
 	createCwd  string
 	ui         viewModel
+}
+
+// ensureStore returns a store, opening one on first use.
+//
+// In daemon mode the paint path has no store at all: every input is seeded, so
+// opening SQLite (which also runs the migration probes) would put work on cold
+// start for data already in hand. The action keys genuinely need one, and they
+// are user-initiated and rare, so that is where the cost belongs.
+func (m *model) ensureStore() store.Storer {
+	if m.store != nil {
+		return m.store
+	}
+	if m.openStore == nil {
+		return nil
+	}
+	m.store = m.openStore()
+	if m.cache != nil {
+		m.cache.zoxSt = m.store
+	}
+	return m.store
 }
 
 // ID now method on Item { return it.Name + "\x00" + it.Path }
@@ -136,20 +153,21 @@ func maxShow(cfg *config.Config) int {
 	return 12
 }
 
-func applyUICfg(cfg *config.Config) {
-	if cfg == nil {
-		return
+func zoxCapFrom(cfg *config.Config) int {
+	if cfg != nil && cfg.ZoxideCap > 0 {
+		return cfg.ZoxideCap
 	}
-	if cfg.ZoxideCap > 0 {
-		zoxCap = cfg.ZoxideCap
-	}
+	return defaultZoxCap
 }
 
+// gitConc bounds concurrency for git-branch reads. It used to return
+// cfg.MaxShow — a display setting driving an I/O thread budget — while
+// cfg.GitConcurrency existed and was read nowhere.
 func gitConc(cfg *config.Config) int {
-	if cfg != nil && cfg.MaxShow > 0 {
-		return cfg.MaxShow
+	if cfg != nil && cfg.GitConcurrency > 0 {
+		return cfg.GitConcurrency
 	}
-	return 12
+	return 4
 }
 
 func initInput() textinput.Model {
@@ -160,30 +178,90 @@ func initInput() textinput.Model {
 	return ti
 }
 
-func NewModelFromDaemon(cfg *config.Config, ctl tmux.Connector, st store.Storer, createName, createCwd string, sessions []tmux.LiveSession, presets []store.PresetMeta, env Context, zoxideItems []Item) model {
-	zoxAt := time.Now()
+// Deps are the collaborators the picker acts through.
+type Deps struct {
+	Ctl   tmux.Connector
+	Store store.Storer
+	// OpenStore supplies a store on demand when Store is nil. The paint path
+	// needs no store when everything is seeded, but the action keys
+	// (kill/freeze/delete/edit) do — so the SQLite open moves off cold start and
+	// onto the first action instead of being skipped or forced.
+	OpenStore func() store.Storer
+}
+
+// Seed carries pre-computed picker inputs, normally straight from the daemon.
+// Fields left zero are gathered locally, which is what makes the two run modes
+// one code path with different inputs rather than two implementations.
+type Seed struct {
+	Sessions    []tmux.LiveSession
+	Presets     []store.PresetMeta
+	ZoxideItems []Item
+	StickyLabel string
+	// Env, when non-nil, replaces the locally derived ranking context.
+	Env *Context
+	// Seeded marks the payload authoritative: empty slices then mean "empty",
+	// not "unknown", and no source may fall back to tmux or SQLite.
+	Seeded bool
+}
+
+// newModelCore is the single construction path. Both NewModel and
+// NewModelFromDaemon (and ProfileRun) route through it, because "the two paths
+// must stay behaviorally identical" is only true if there is one path; three
+// copies of this literal is what let them drift.
+func newModelCore(cfg *config.Config, d Deps, createName, createCwd string, seed Seed) model {
 	cache := &sourceCache{
-		zoxSt:    st,
-		zoxMu:    &sync.Mutex{},
-		tmuxSnap: sessions,
-		presetM:  presets,
-		zoxMem:   zoxideItems,
-		zoxAt:    zoxAt,
+		zoxMu:  &sync.Mutex{},
+		zoxSt:  d.Store,
+		zoxCap: zoxCapFrom(cfg),
+		seeded: seed.Seeded,
 	}
-	cache.tmuxOK.Store(true)
-	cache.presetOK.Store(true)
-	applyUICfg(cfg)
-	srcs := defaultSources(ctl, st, createName, createCwd, cache)
+	if seed.Seeded {
+		cache.tmuxSnap = seed.Sessions
+		cache.presetM = seed.Presets
+		cache.tmuxDone.Store(true)
+		cache.presetDone.Store(true)
+		if len(seed.ZoxideItems) > 0 {
+			cache.zoxMem = seed.ZoxideItems
+			// Only stamp freshness when there is something to be fresh about; the
+			// old code stamped time.Now() even for an empty payload.
+			cache.zoxAt = time.Now()
+		}
+	}
+
+	srcs := defaultSources(d.Ctl, d.Store, createName, createCwd, cache)
 	bySrc := snapshotAll(srcs)
-	applyRankMeta(bySrc, st, env)
+
+	env := Context{}
+	if seed.Env != nil {
+		env = *seed.Env
+	} else {
+		env = newContext(d.Ctl, d.Store)
+	}
+	// Co-occurrence is meaningless without a current session. The guard lived
+	// only in newContext, so the daemon path — which built Context by hand in
+	// main — could apply pair scores with no session context at all.
+	if env.Session == "" {
+		env.Pairs = nil
+	}
+	if env.Now == 0 {
+		env.Now = time.Now().Unix()
+	}
+	applyRankMeta(bySrc, d.Store, env)
+
+	tmpl := seed.StickyLabel
+	if tmpl == "" && d.Store != nil {
+		tmpl = template.StickyLabel(d.Store)
+	}
+
 	m := model{
 		sources:    srcs,
 		bySrc:      bySrc,
 		cache:      cache,
-		ctl:        ctl,
-		store:      st,
+		ctl:        d.Ctl,
+		store:      d.Store,
+		openStore:  d.OpenStore,
 		cfg:        cfg,
-		tmpl:       template.StickyLabel(st),
+		tmpl:       tmpl,
 		env:        env,
 		createName: createName,
 		createCwd:  createCwd,
@@ -195,42 +273,82 @@ func NewModelFromDaemon(cfg *config.Config, ctl tmux.Connector, st store.Storer,
 		},
 	}
 	m.refilter()
+	if !seed.Seeded {
+		// Fill git labels for the rows about to be shown, so the first paint is
+		// visually complete. This is safe to do after ranking because GitBranch is
+		// display-only — rankOf never reads it — so no amount of late enrichment can
+		// reorder the list. The remaining paths are done in the background by
+		// enrichRestCmd.
+		//
+		// Standalone runs previously showed no branch on any row until the user
+		// pressed a key that triggered reload(), the only place enrichment ran.
+		m.enrichVisible()
+	}
 	return m
 }
 
-func NewModel(cfg *config.Config, ctl tmux.Connector, store store.Storer, createName, createCwd string) model {
-	cache := &sourceCache{
-		zoxSt: store,
-		zoxMu: &sync.Mutex{},
+// enrichVisible reads git labels for the rows currently on screen.
+func (m *model) enrichVisible() {
+	n := m.ui.maxShow
+	if n <= 0 || n > len(m.ui.items) {
+		n = len(m.ui.items)
 	}
-	applyUICfg(cfg)
-	srcs := defaultSources(ctl, store, createName, createCwd, cache)
-	bySrc := snapshotAll(srcs)
-	env := newContext(ctl, store)
-	applyRankMeta(bySrc, store, env)
-	m := model{
-		sources:    srcs,
-		bySrc:      bySrc,
-		cache:      cache,
-		ctl:        ctl,
-		store:      store,
-		cfg:        cfg,
-		tmpl:       template.StickyLabel(store),
-		env:        env,
-		createName: createName,
-		createCwd:  createCwd,
-		ui: viewModel{
-			queryInput: initInput(),
-			helpModel:  help.New(),
-			maxShow:    maxShow(cfg),
-			started:    time.Now(),
-		},
+	if n == 0 {
+		return
 	}
-	m.refilter()
-	return m
+	paths := make([]string, 0, n)
+	for i := range m.ui.items[:n] {
+		paths = append(paths, m.ui.items[i].Path)
+	}
+	enrichPaths(paths, gitConc(m.cfg))
+	for i := range m.ui.items[:n] {
+		setGitBranch(&m.ui.items[i])
+	}
 }
 
+// gitDoneMsg reports that background git enrichment finished.
+type gitDoneMsg struct{}
 
+// enrichRestCmd reads the git labels that enrichVisible did not cover.
+// Returns nil when the daemon already supplied them.
+func (m model) enrichRestCmd() tea.Cmd {
+	if m.cache == nil || m.cache.seeded {
+		return nil
+	}
+	paths := collectPaths(m.bySrc)
+	if len(paths) == 0 {
+		return nil
+	}
+	conc := gitConc(m.cfg)
+	return func() tea.Msg {
+		enrichPaths(paths, conc)
+		return gitDoneMsg{}
+	}
+}
+
+// NewModelFromDaemon builds the picker from a daemon payload.
+func NewModelFromDaemon(cfg *config.Config, d Deps, createName, createCwd string, seed Seed) model {
+	seed.Seeded = true
+	return newModelCore(cfg, d, createName, createCwd, seed)
+}
+
+// NewModel builds the picker by reading everything locally.
+func NewModel(cfg *config.Config, ctl tmux.Connector, st store.Storer, createName, createCwd string) model {
+	return newModelCore(cfg, Deps{Ctl: ctl, Store: st}, createName, createCwd, Seed{})
+}
+
+// liveNames returns the live session names already held in the source cache. No
+// tmux call: this is the snapshot the list was painted from.
+func (m *model) liveNames() []string {
+	if m.cache == nil || len(m.cache.tmuxSnap) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(m.cache.tmuxSnap))
+	for _, s := range m.cache.tmuxSnap {
+		out = append(out, s.Name)
+	}
+	return out
+}
 
 func (m *model) pool() []Item {
 	return flattenSources(m.sources, m.bySrc, strings.TrimSpace(m.ui.queryInput.Value()))
@@ -285,6 +403,9 @@ func (m model) Init() tea.Cmd {
 	var cmds []tea.Cmd
 	cmds = append(cmds, textinput.Blink)
 	cmds = append(cmds, refreshCmds(m.sources)...)
+	if c := m.enrichRestCmd(); c != nil {
+		cmds = append(cmds, c)
+	}
 	return tea.Batch(cmds...)
 }
 
@@ -296,6 +417,15 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.mergeSource(msg.src, msg.items)
 		m.refilter()
+		return m, nil
+
+	case gitDoneMsg:
+		// Re-apply labels only. Deliberately not a refilter: GitBranch does not
+		// participate in ranking, so re-ranking here could only risk a visible jump
+		// for no benefit.
+		for i := range m.ui.items {
+			setGitBranch(&m.ui.items[i])
+		}
 		return m, nil
 
 	case tea.WindowSizeMsg:
@@ -320,7 +450,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		case key.Matches(msg, defaultKeyMap.Confirm):
 			if len(m.ui.items) > 0 && m.ui.cursor < len(m.ui.items) {
-				m.ui.done = Result{Action: ActionConnect, Item: m.ui.items[m.ui.cursor]}
+				m.ui.done = Result{
+					Action: ActionConnect,
+					Item:   m.ui.items[m.ui.cursor],
+					Live:   m.liveNames(),
+				}
 				m.ui.queryInput.SetValue("")
 				m.ui.items = m.ui.items[:0]
 				return m, tea.Quit
@@ -345,13 +479,18 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 
 		case key.Matches(msg, defaultKeyMap.Sticky):
+			st := m.ensureStore()
+			if st == nil {
+				m.ui.status = "sticky: store unavailable"
+				return m, nil
+			}
 			if len(m.ui.items) > 0 {
 				it := m.ui.items[m.ui.cursor]
 				var p *mod.Session
 				var err error
 				switch it.Kind {
 				case KindPreset:
-					p, err = m.store.Get(it.Name)
+					p, err = st.Get(it.Name)
 				case KindActive:
 					var s *mod.Session
 					s, err = m.ctl.Freeze(context.Background(), it.Name)
@@ -359,7 +498,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						p = s
 					}
 				default:
-					if err := template.ResetActive(m.store); err != nil {
+					if err := template.ResetActive(st); err != nil {
 						m.ui.status = err.Error()
 					} else {
 						m.tmpl = "default"
@@ -371,12 +510,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.ui.status = err.Error()
 					return m, nil
 				}
-				id, created, err := template.StickFrom(m.store, p)
+				id, created, err := template.StickFrom(st, p)
 				if err != nil {
 					m.ui.status = err.Error()
 					return m, nil
 				}
-				m.tmpl = template.StickyLabel(m.store)
+				m.tmpl = template.StickyLabel(st)
 				if m.tmpl == "" || m.tmpl == id {
 					m.tmpl = template.ShapeLabel(template.ToShape(p, id))
 				}
@@ -387,7 +526,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				return m, nil
 			}
-			if err := template.ResetActive(m.store); err != nil {
+			if err := template.ResetActive(st); err != nil {
 				m.ui.status = err.Error()
 			} else {
 				m.tmpl = "default"
@@ -402,8 +541,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					if err := m.ctl.Kill(context.Background(), it.Name); err != nil {
 						m.ui.status = err.Error()
 					} else {
-						if m.store != nil {
-							_ = m.store.RecordKill(it.Name)
+						if st := m.ensureStore(); st != nil {
+							_ = st.RecordKill(it.Name)
 						}
 						m.ui.status = "killed " + it.Name
 						m.cache.invalidate()
@@ -419,7 +558,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				name := it.Name
 				if it.Kind == KindActive || (it.Kind == KindPreset && m.ctl.Has(context.Background(), name)) {
 					stop := HoldInterrupt()
-					sid, created, err := template.FreezeRemember(m.ctl, m.store, name)
+					sid, created, err := template.FreezeRemember(m.ctl, m.ensureStore(), name)
 					stop()
 					if err != nil {
 						m.ui.status = err.Error()
@@ -448,7 +587,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			switch it.Kind {
 			case KindActive:
 				stop := HoldInterrupt()
-				_, _, err := template.FreezeRemember(m.ctl, m.store, it.Name)
+				_, _, err := template.FreezeRemember(m.ctl, m.ensureStore(), it.Name)
 				stop()
 				if err != nil {
 					m.ui.status = err.Error()
@@ -478,7 +617,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if len(m.ui.items) > 0 {
 				it := m.ui.items[m.ui.cursor]
 				if it.Kind == KindPreset {
-					if err := m.store.Delete(it.Name); err != nil {
+					if err := m.ensureStore().Delete(it.Name); err != nil {
 						m.ui.status = err.Error()
 					} else {
 						m.ui.status = "deleted " + it.Name
@@ -517,12 +656,19 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, cmd
 }
 
+// reload re-reads every source after a mutating action.
+//
+// It invalidates the cache first, including the seeded flag: a kill, delete or
+// freeze makes the daemon's payload wrong, so this must read from tmux and SQLite
+// rather than re-serving what was handed over at startup.
 func (m *model) reload() {
 	savedScroll := m.ui.scrollOff()
-	m.sources = defaultSources(m.ctl, m.store, m.createName, m.createCwd, m.cache)
+	st := m.ensureStore()
+	m.cache.invalidate()
+	m.sources = defaultSources(m.ctl, st, m.createName, m.createCwd, m.cache)
 	m.bySrc = snapshotAll(m.sources)
-	m.env = newContext(m.ctl, m.store)
-	applyRankMeta(m.bySrc, m.store, m.env)
+	m.env = newContext(m.ctl, st)
+	applyRankMeta(m.bySrc, st, m.env)
 	enrichAllSyncWith(m.bySrc, gitConc(m.cfg))
 	m.refilter()
 	// Actions (kill/freeze/delete/edit) change list length → preserve scroll.
@@ -555,7 +701,7 @@ type editDoneMsg struct {
 }
 
 func (m *model) beginEdit(name string) (tea.Cmd, error) {
-	p, err := m.store.Get(name)
+	p, err := m.ensureStore().Get(name)
 	if err != nil {
 		return nil, err
 	}
@@ -577,7 +723,7 @@ func (m *model) beginEdit(name string) (tea.Cmd, error) {
 	if c.Stdin == nil {
 		c.Stdin, c.Stdout, c.Stderr = os.Stdin, os.Stdout, os.Stderr
 	}
-	st := m.store
+	st := m.ensureStore()
 	old := name
 	return tea.ExecProcess(c, func(err error) tea.Msg {
 		defer os.Remove(path)
@@ -711,5 +857,3 @@ func (m model) View() tea.View {
 	b.WriteByte('\n')
 	return tea.NewView(b.String())
 }
-
-

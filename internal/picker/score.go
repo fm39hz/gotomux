@@ -67,7 +67,6 @@ type rankKey struct {
 	cooccur int64
 	kind    int8
 	detail  int32
-	busy    int8   // 1 if session has non-shell tool active
 	pathQ   int8
 	idx     int
 }
@@ -87,9 +86,6 @@ func (a rankKey) less(b rankKey) bool {
 	}
 	if a.detail != b.detail {
 		return a.detail > b.detail
-	}
-	if a.busy != b.busy {
-		return a.busy > b.busy
 	}
 	if a.pathQ != b.pathQ {
 		return a.pathQ > b.pathQ
@@ -477,20 +473,6 @@ func rankOf(q string, it Item, idx int) (rankKey, bool) {
 	}, true
 }
 
-// scoreItem: debug int (higher = better). Production sort uses rankKey.less.
-func scoreItem(q string, it Item) int {
-	k, ok := rankOf(q, it, 0)
-	if !ok {
-		return -1
-	}
-	// coarse encoding for tests comparing order loosely
-	return int(127-k.tier)*100_000_000 +
-		int(k.kind)*1_000_000 +
-		int(k.detail%1_000_000) +
-		int(k.recency%10_000)*10 +
-		int(k.pathQ+127)
-}
-
 func fuzzyMatch(query, text string) bool {
 	if query == "" {
 		return true
@@ -506,15 +488,4 @@ func fuzzyMatch(query, text string) bool {
 		return false
 	}
 	return true
-}
-
-func scoreMatch(query, text string) int {
-	if query == "" {
-		return 0
-	}
-	h, ok := matchOnLabel(query, text)
-	if !ok {
-		return -1
-	}
-	return int(127-h.tier)*100_000 + int(h.detail)
 }

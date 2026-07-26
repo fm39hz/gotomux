@@ -120,18 +120,59 @@ func tmuxRun(ctx context.Context, args ...string) error {
 	return nil
 }
 
-const ListSessFmt = "S\t#{session_name}\t#{session_windows}\t#{session_path}\t#{session_last_attached}\t#{session_activity}\t#{session_created}\t#{session_attached}"
+const ListSessFmt = "S\t#{session_id}\t#{session_name}\t#{session_windows}\t#{session_path}\t#{session_last_attached}\t#{session_activity}\t#{session_created}\t#{session_attached}"
 const ListPanesFmt = "P\t#{session_name}\t#{pane_current_command}\t#{?pane_active,1,0}\t#{?pane_dead,1,0}"
 
 type LiveSession struct {
-	Name         string
-	Windows      int
-	Path         string
-	LastAttached int64
-	Activity     int64
-	Created      int64
-	Attached     int
-	ActiveCmd    string
+	// ID is tmux's own session id ("$0"). It is carried so a client can identify
+	// which session it is running inside from $TMUX alone, without forking tmux:
+	// $TMUX is "<socket>,<serverpid>,<session index>" and the index matches
+	// #{session_id} minus the '$'.
+	ID           string `json:"id,omitempty"`
+	Name         string `json:"name"`
+	Windows      int    `json:"windows,omitempty"`
+	Path         string `json:"path,omitempty"`
+	LastAttached int64  `json:"last_attached,omitempty"`
+	Activity     int64  `json:"activity,omitempty"`
+	Created      int64  `json:"created,omitempty"`
+	Attached     int    `json:"attached,omitempty"`
+	ActiveCmd    string `json:"active_cmd,omitempty"`
+}
+
+// SessionIDFromEnv extracts the current session id from a $TMUX value, or "" when
+// not inside tmux. Returns the id in tmux's own "$N" form.
+func SessionIDFromEnv(tmuxEnv string) string {
+	if tmuxEnv == "" {
+		return ""
+	}
+	parts := strings.Split(tmuxEnv, ",")
+	if len(parts) < 3 {
+		return ""
+	}
+	idx := strings.TrimSpace(parts[len(parts)-1])
+	if idx == "" {
+		return ""
+	}
+	if _, err := strconv.Atoi(idx); err != nil {
+		return ""
+	}
+	return "$" + idx
+}
+
+// CurrentSessionID returns this process's tmux session id without forking.
+func CurrentSessionID() string { return SessionIDFromEnv(os.Getenv("TMUX")) }
+
+// FindByID returns the session with the given tmux id.
+func FindByID(sessions []LiveSession, id string) (LiveSession, bool) {
+	if id == "" {
+		return LiveSession{}, false
+	}
+	for _, s := range sessions {
+		if s.ID == id {
+			return s, true
+		}
+	}
+	return LiveSession{}, false
 }
 
 func (c *Ctl) ListLive(ctx context.Context) ([]LiveSession, error) {
@@ -171,16 +212,16 @@ func ParseLiveOutput(out string) []LiveSession {
 
 		switch line[0] {
 		case 'S':
-			if len(fields) < 7 {
+			if len(fields) < 8 {
 				continue
 			}
-			name := fields[0]
-			nw, _ := strconv.Atoi(fields[1])
-			na, _ := strconv.Atoi(fields[6])
+			name := fields[1]
+			nw, _ := strconv.Atoi(fields[2])
+			na, _ := strconv.Atoi(fields[7])
 			byName[name] = LiveSession{
-				Name: name, Windows: nw, Path: fields[2],
-				LastAttached: parseUnix(fields[3]), Activity: parseUnix(fields[4]),
-				Created: parseUnix(fields[5]), Attached: na,
+				ID: fields[0], Name: name, Windows: nw, Path: fields[3],
+				LastAttached: parseUnix(fields[4]), Activity: parseUnix(fields[5]),
+				Created: parseUnix(fields[6]), Attached: na,
 			}
 			if !orderSeen[name] {
 				orderSeen[name] = true
@@ -226,7 +267,6 @@ func ParseLiveOutput(out string) []LiveSession {
 	}
 	return out2
 }
-
 
 func parseUnix(s string) int64 {
 	s = strings.TrimSpace(s)
@@ -600,8 +640,13 @@ func (c *Ctl) Connect(ctx context.Context, name, cwd string) error {
 		}
 		return nil
 	}
-	// Swap PID so gotomux doesn't linger as zombie.
-	// Telemetry handled by daemon background poll.
+	// Swap PID so gotomux doesn't linger as a zombie.
+	//
+	// NOTE: this replaces the process. Nothing after this point runs — no
+	// deferred close, no post-connect bookkeeping. Callers must record any
+	// telemetry BEFORE calling Connect. (A previous comment here claimed the
+	// daemon's background poll handled telemetry; it did not, and the usage table
+	// stayed empty as a result.)
 	tmuxBin, err := exec.LookPath("tmux")
 	if err != nil {
 		return fmt.Errorf("tmux not found: %w", err)

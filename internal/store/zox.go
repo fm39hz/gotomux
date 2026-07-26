@@ -5,12 +5,13 @@ import (
 )
 
 // ZoxRow is a cached zoxide picker row (no UI types).
+// ZoxRow is served over IPC as well as persisted; see PresetMeta on the tags.
 type ZoxRow struct {
-	Name    string
-	Path    string
-	Title   string
-	Desc    string
-	Recency int64
+	Name    string `json:"name"`
+	Path    string `json:"path,omitempty"`
+	Title   string `json:"title,omitempty"`
+	Desc    string `json:"desc,omitempty"`
+	Recency int64  `json:"recency,omitempty"`
 }
 
 // LoadZox returns cached zoxide rows and cache age (unix updated).
@@ -74,4 +75,3 @@ ON CONFLICT(id) DO UPDATE SET updated = excluded.updated
 	}
 	return tx.Commit()
 }
-

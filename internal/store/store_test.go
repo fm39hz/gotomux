@@ -108,7 +108,6 @@ func TestSaveFreezeAtomic(t *testing.T) {
 	_ = st.Delete("zz-acid")
 }
 
-
 func TestRebindNameMergesUsageAndPairs(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("XDG_DATA_HOME", dir)

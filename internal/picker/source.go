@@ -3,6 +3,7 @@ package picker
 import (
 	"context"
 	"fmt"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -32,29 +33,48 @@ type sourceMsg struct {
 }
 
 type sourceCache struct {
-	tmuxSnap []tmux.LiveSession
-	tmuxOK   atomic.Bool
-	presetM  []store.PresetMeta
-	presetOK atomic.Bool
-	zoxMem   []Item
-	zoxAt    time.Time
-	zoxMu    *sync.Mutex
-	zoxSt    store.Storer
+	// seeded marks the caches as supplied by the daemon. When set, empty means
+	// empty: sources must not "self-heal" by re-running tmux or SQLite.
+	//
+	// The old guards keyed off length (len(tmuxSnap) == 0), so a daemon that
+	// legitimately reported zero sessions or zero presets silently reintroduced a
+	// tmux fork and a SQLite query onto the path documented as performing
+	// neither — and did so invisibly, because the result looked correct.
+	seeded bool
+
+	tmuxSnap   []tmux.LiveSession
+	tmuxDone   atomic.Bool
+	presetM    []store.PresetMeta
+	presetDone atomic.Bool
+	zoxMem     []Item
+	zoxAt      time.Time
+	zoxMu      *sync.Mutex
+	zoxSt      store.Storer
+	zoxCap     int
 }
 
+// invalidate drops everything derived from an earlier read. Called after a
+// mutating action (kill/delete/freeze), which also invalidates the daemon's
+// payload — so seeded is cleared too and the next read goes to the source.
 func (c *sourceCache) invalidate() {
-	c.tmuxOK.Store(false)
-	c.presetOK.Store(false)
+	c.seeded = false
+	c.tmuxDone.Store(false)
+	c.presetDone.Store(false)
+}
+
+func (c *sourceCache) cap() int {
+	if c.zoxCap > 0 {
+		return c.zoxCap
+	}
+	return defaultZoxCap
 }
 
 func defaultSources(ctl tmux.Connector, st store.Storer, createName, createCwd string, cache *sourceCache) []Source {
-	if !cache.tmuxOK.Load() || len(cache.tmuxSnap) == 0 {
-		if !cache.tmuxOK.Load() {
-			cache.tmuxSnap = nil
-			cache.tmuxOK.Store(true)
-		}
+	if !cache.seeded && !cache.tmuxDone.Load() {
+		cache.tmuxDone.Store(true)
+		cache.tmuxSnap = nil
 		if ctl != nil {
-			if live, err := ctl.ListLive(context.Background()); err == nil && len(live) > 0 {
+			if live, err := ctl.ListLive(context.Background()); err == nil {
 				cache.tmuxSnap = live
 			}
 		}
@@ -127,7 +147,7 @@ func (s *tmuxSource) Snapshot() []Item {
 	return out
 }
 
-func (s *tmuxSource) Refresh() tea.Cmd { return nil }
+func (s *tmuxSource) Refresh() tea.Cmd                   { return nil }
 func (s *tmuxSource) FlattenFilter(string) FlattenFilter { return FlattenFilter{} }
 
 type presetSource struct {
@@ -137,16 +157,17 @@ type presetSource struct {
 
 func (s *presetSource) Snapshot() []Item {
 	var meta []store.PresetMeta
-	if s.cache.presetOK.Load() && len(s.cache.presetM) > 0 {
+	switch {
+	case s.cache.seeded || s.cache.presetDone.Load():
 		meta = s.cache.presetM
-	} else if s.store != nil {
+	case s.store != nil:
 		var err error
 		meta, err = s.store.ListMeta()
 		if err != nil {
 			return nil
 		}
 		s.cache.presetM = meta
-		s.cache.presetOK.Store(true)
+		s.cache.presetDone.Store(true)
 	}
 	if len(meta) == 0 {
 		return nil
@@ -165,7 +186,7 @@ func (s *presetSource) Snapshot() []Item {
 	return out
 }
 
-func (s *presetSource) Refresh() tea.Cmd { return nil }
+func (s *presetSource) Refresh() tea.Cmd                   { return nil }
 func (s *presetSource) FlattenFilter(string) FlattenFilter { return FlattenFilter{} }
 
 type zoxideSource struct {
@@ -176,26 +197,47 @@ const zoxCacheMaxAge = 30 * time.Second
 
 func (s *zoxideSource) Snapshot() []Item {
 	items, age, ok := loadZoxItemsSync(s.cache)
-	if !ok {
-		return nil
-	}
-	if age > zoxCacheMaxAge {
+	if ok && age > zoxCacheMaxAge {
 		s.cache.zoxMu.Lock()
 		s.cache.zoxMem = nil
 		s.cache.zoxMu.Unlock()
-		return nil
+		ok = false
 	}
-	for i := range items {
-		items[i].Kind = KindZoxide
+	if !ok {
+		if s.cache.seeded {
+			// The daemon owns zoxide in this mode; never exec from the hot path.
+			return nil
+		}
+		// Cold or stale cache: query zoxide synchronously so the FIRST paint is
+		// already complete. snapshotAll runs sources concurrently, so this
+		// overlaps the tmux and preset reads rather than adding to them.
+		//
+		// The query used to happen only in Refresh, which meant the very first run
+		// on a machine painted with zero zoxide rows and then reordered the list
+		// under the user a moment later.
+		items = rebuildZoxItems(s.cache)
+		if len(items) == 0 {
+			return nil
+		}
 	}
-	return items
+	// Return a copy. loadZoxItemsSync hands back the cache's own backing array,
+	// and downstream code writes through it: applyRankMeta compacts in place
+	// (items[n] = it; bySrc[key] = items[:n]) when filtering out the current
+	// session. That shifted cache.zoxMem's elements, so the next Snapshot — after
+	// any kill/delete/reload — saw duplicated rows and lost distinct ones. The
+	// Kind write below was also unsynchronized against the refresh goroutine.
+	out := slices.Clone(items)
+	for i := range out {
+		out[i].Kind = KindZoxide
+	}
+	return out
 }
 
 func (s *zoxideSource) FlattenFilter(query string) FlattenFilter {
 	if query != "" {
 		return FlattenFilter{}
 	}
-	return FlattenFilter{Cap: zoxCap}
+	return FlattenFilter{Cap: s.cache.cap()}
 }
 
 func (s *zoxideSource) Refresh() tea.Cmd {
@@ -249,12 +291,16 @@ func flattenSources(order []Source, bySrc map[Source][]Item, query string) []Ite
 	for _, s := range order {
 		items := bySrc[s]
 		ff := s.FlattenFilter(query)
-		if ff.Cap > 0 && ff.Cap < len(items) {
-			items = items[:ff.Cap]
-		}
+		// Cap counts items that actually make the list. Applying it to the raw
+		// slice first meant duplicates consumed budget and were then discarded,
+		// so ZoxideCap=40 yielded fewer than 40 zoxide rows for no stated reason.
+		kept := 0
 		for _, it := range items {
 			if ff.Hide && q {
 				continue
+			}
+			if ff.Cap > 0 && kept >= ff.Cap {
+				break
 			}
 			nr := normPath(it.Path)
 			if names[it.Name] || (nr != "" && paths[nr]) {
@@ -265,6 +311,7 @@ func flattenSources(order []Source, bySrc map[Source][]Item, query string) []Ite
 				paths[nr] = true
 			}
 			out = append(out, it)
+			kept++
 		}
 	}
 	return out

@@ -96,7 +96,7 @@ func (m *mockStorer) Touch(name string) error {
 	return nil
 }
 
-func (m *mockStorer) RecordFork(key, body string) error { return nil }
+func (m *mockStorer) RecordFork(key, body string) error             { return nil }
 func (m *mockStorer) RecordPlacement(shapeID, pattern string) error { return nil }
 func (m *mockStorer) ListShapes() ([]string, error) {
 	var ids []string
@@ -112,7 +112,7 @@ type mockConnector struct {
 	loadCall atomic.Int32
 }
 
-func (m *mockConnector) Has(ctx context.Context, name string) bool { return m.has }
+func (m *mockConnector) Has(ctx context.Context, name string) bool           { return m.has }
 func (m *mockConnector) Connect(ctx context.Context, name, cwd string) error { return nil }
 func (m *mockConnector) Freeze(ctx context.Context, name string) (*model.Session, error) {
 	return &model.Session{Name: name, Cwd: "/tmp"}, nil

@@ -90,7 +90,10 @@ func OpenWithConfig(cfg *config.Config) (*Store, error) {
 		_ = db.Close()
 		return nil, err
 	}
-	s.Prune()
+	// Prune is deliberately NOT called here. It issues two DELETEs — a write
+	// transaction plus WAL churn — on the cold path of every single CLI
+	// invocation, to collect rows that at most trickle in. The daemon runs it
+	// periodically instead (see pollLoop).
 	return s, nil
 }
 
@@ -212,7 +215,29 @@ func (s *Store) Ping() error {
 	return s.db.Ping()
 }
 
+// schemaVersion is bumped whenever migrate() gains a statement. It gates the
+// whole migration behind one PRAGMA read: the CREATE TABLE IF NOT EXISTS
+// statements and pragma_table_info probes are individually cheap but there are
+// fourteen of them, on the cold path of every invocation, to do nothing.
+//
+// The migration itself stays additive-only and idempotent — the fast path is an
+// optimisation, not a replacement, so a DB from a future version or one that
+// somehow lost user_version still gets the full run.
+const schemaVersion = 1
+
 func (s *Store) migrate() error {
+	var have int
+	if err := s.db.QueryRow(`PRAGMA user_version`).Scan(&have); err == nil && have == schemaVersion {
+		return nil
+	}
+	if err := s.migrateAll(); err != nil {
+		return err
+	}
+	_, _ = s.db.Exec(fmt.Sprintf(`PRAGMA user_version = %d`, schemaVersion))
+	return nil
+}
+
+func (s *Store) migrateAll() error {
 	_, err := s.db.Exec(`
 PRAGMA foreign_keys = ON;
 CREATE TABLE IF NOT EXISTS session (
@@ -297,12 +322,30 @@ CREATE TABLE IF NOT EXISTS sticky (
 );`); err != nil {
 		return err
 	}
-	// old DBs: shape without updated_at (CREATE IF NOT EXISTS does not alter)
+	// Old DBs have shape without updated_at (CREATE IF NOT EXISTS does not alter).
+	//
+	// The ALTER and its backfill go in one transaction: a crash between them left
+	// every shape at updated_at = 0, which makes the config mirror's
+	// `mtime > dbUpd` comparison always pick the file — so any hand-edited shape
+	// file would win over the DB forever, with nothing to indicate why.
 	var shapeHasUpdated int
 	_ = s.db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('shape') WHERE name='updated_at'`).Scan(&shapeHasUpdated)
 	if shapeHasUpdated == 0 {
-		_, _ = s.db.Exec(`ALTER TABLE shape ADD COLUMN updated_at INTEGER NOT NULL DEFAULT 0`)
-		_, _ = s.db.Exec(`UPDATE shape SET updated_at = created_at WHERE updated_at = 0`)
+		tx, txErr := s.db.Begin()
+		if txErr != nil {
+			return txErr
+		}
+		if _, err := tx.Exec(`ALTER TABLE shape ADD COLUMN updated_at INTEGER NOT NULL DEFAULT 0`); err != nil {
+			_ = tx.Rollback()
+			return err
+		}
+		if _, err := tx.Exec(`UPDATE shape SET updated_at = created_at WHERE updated_at = 0`); err != nil {
+			_ = tx.Rollback()
+			return err
+		}
+		if err := tx.Commit(); err != nil {
+			return err
+		}
 	}
 	if _, err = s.db.Exec(`
 CREATE TABLE IF NOT EXISTS placement (
@@ -328,4 +371,3 @@ CREATE TABLE IF NOT EXISTS fork (
 	_, err = s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_session_last_used ON session(last_used DESC)`)
 	return err
 }
-

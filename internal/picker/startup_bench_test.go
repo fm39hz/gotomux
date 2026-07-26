@@ -35,7 +35,7 @@ func TestStartupBreakdown(t *testing.T) {
 
 	t3 := time.Now()
 	lab := template.StickyLabel(st)
-	t.Logf("StickyLabel#1 (sync+reconcile): %v label=%s", time.Since(t3), lab)
+	t.Logf("StickyLabel#1: %v label=%s", time.Since(t3), lab)
 
 	t4 := time.Now()
 	_ = template.StickyLabel(st)

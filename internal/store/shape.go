@@ -323,4 +323,3 @@ ON CONFLICT(id) DO UPDATE SET shape_id = excluded.shape_id
 func (s *Store) String() string {
 	return fmt.Sprintf("Store{%v}", s.db)
 }
-

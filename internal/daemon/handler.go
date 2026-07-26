@@ -2,8 +2,10 @@ package daemon
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"hash/fnv"
+	"io"
 	"log"
 	"net"
 	"os"
@@ -17,31 +19,48 @@ import (
 )
 
 type Request struct {
-	Cmd     string `json:"cmd"`
-	Name    string `json:"name,omitempty"`
-	Version int64  `json:"version,omitempty"`
+	Cmd  string `json:"cmd"`
+	Name string `json:"name,omitempty"`
+	// SessID is the caller's own tmux session id ("$0"), read from its $TMUX with
+	// no fork. The daemon cannot infer it: the daemon process has no $TMUX, so the
+	// CtxSess/CtxPath fields it used to send always described nothing.
+	SessID string `json:"sess_id,omitempty"`
 }
 
 type Response struct {
-	OK      bool                `json:"ok"`
-	Version int64               `json:"version,omitempty"`
-	Error   string              `json:"error,omitempty"`
+	OK bool `json:"ok"`
+	// Ready reports that the last sync saw BOTH tmux and the DB, i.e. the
+	// payload is complete rather than merely well-formed. Clients must treat
+	// !Ready as "fall back to standalone" — OK alone says nothing about
+	// completeness, which is exactly how an empty payload used to pass as a
+	// successful response.
+	Ready bool `json:"ready,omitempty"`
+	// SyncedAt is the unix time of the last Ready sync. Clients reject payloads
+	// older than a few poll intervals so a wedged daemon cannot serve stale data.
+	SyncedAt int64 `json:"synced_at,omitempty"`
+	// Version is a monotonic state generation, for debugging only. There is no
+	// conditional-request protocol: the CLI is a short-lived process with no
+	// cross-run cache, so a client-side version is meaningless.
+	Version  int64              `json:"version,omitempty"`
+	Error    string             `json:"error,omitempty"`
 	Sessions []tmux.LiveSession `json:"sessions,omitempty"`
-	Presets []store.PresetMeta  `json:"presets,omitempty"`
-	CtxSess string              `json:"ctx_sess,omitempty"`
-	CtxPath string              `json:"ctx_path,omitempty"`
-	Pairs   map[string]int64    `json:"pairs,omitempty"`
-	Usage   map[string]store.Usage `json:"usage,omitempty"`
-	GitBranches map[string]string `json:"git_branches,omitempty"`
-	Zoxide  []store.ZoxRow      `json:"zoxide,omitempty"`
+	Presets  []store.PresetMeta `json:"presets,omitempty"`
+	// Pairs holds co-occurrence scores for the session named by Request.SessID.
+	Pairs map[string]int64 `json:"pairs,omitempty"`
+	// StickyLabel is the sticky shape's display label, served so the client needs
+	// no store open just to render the header.
+	StickyLabel string                 `json:"sticky_label,omitempty"`
+	Usage       map[string]store.Usage `json:"usage,omitempty"`
+	GitBranches map[string]string      `json:"git_branches,omitempty"`
+	Zoxide      []store.ZoxRow         `json:"zoxide,omitempty"`
 
 	// status response fields
-	StatusCC     bool  `json:"status_cc,omitempty"`
-	StatusStore  bool  `json:"status_store,omitempty"`
-	CCErrs       int64 `json:"cc_errs,omitempty"`
-	CCTimeouts   int64 `json:"cc_timeouts,omitempty"`
-	StoreErrs    int64 `json:"store_errs,omitempty"`
-	Uptime       int64 `json:"uptime,omitempty"`
+	StatusCC    bool  `json:"status_cc,omitempty"`
+	StatusStore bool  `json:"status_store,omitempty"`
+	CCErrs      int64 `json:"cc_errs,omitempty"`
+	CCTimeouts  int64 `json:"cc_timeouts,omitempty"`
+	StoreErrs   int64 `json:"store_errs,omitempty"`
+	Uptime      int64 `json:"uptime,omitempty"`
 }
 
 // listenWithGuard binds the Unix socket with stale-socket detection.
@@ -96,14 +115,16 @@ func acquireLock(sockPath string) (func(), error) {
 	}, nil
 }
 
-// ServeIPC listens on Unix socket and handles IPC requests.
+// ServeIPC listens on the Unix socket and handles IPC requests.
+//
+// The path comes from the Daemon, which got it from Config — so the socket
+// ensureSocket watches and the socket bound here are the same value by
+// construction, and GOTOMUX_DATA_DIR relocates both.
 func ServeIPC(d *Daemon) error {
-	dir := os.Getenv("XDG_DATA_HOME")
-	if dir == "" {
-		home, _ := os.UserHomeDir()
-		dir = filepath.Join(home, ".local", "share")
+	sock := d.sockPath
+	if err := os.MkdirAll(filepath.Dir(sock), 0o755); err != nil {
+		return fmt.Errorf("mkdir socket dir: %w", err)
 	}
-	sock := filepath.Join(dir, "gotomux", "gotomux.sock")
 
 	unlock, err := acquireLock(sock)
 	if err != nil {
@@ -116,6 +137,7 @@ func ServeIPC(d *Daemon) error {
 		return err
 	}
 	defer os.Remove(sock)
+	d.setListener(l)
 
 	for {
 		conn, err := l.Accept()
@@ -126,38 +148,57 @@ func ServeIPC(d *Daemon) error {
 	}
 }
 
+// connIdle bounds how long a conn may sit between requests. Connections are
+// now multi-request, so without this a client that never closes would pin a
+// goroutine for the daemon's lifetime.
+const connIdle = 30 * time.Second
+
+// handleConn serves requests until the peer closes. It must stay a loop: the
+// CLI sends "list" and then "connect" (or "freeze") on the same connection, and
+// a one-shot handler silently dropped that second request — which is what killed
+// all open/pair telemetry and broke `gotomux -f`.
 func (d *Daemon) handleConn(conn net.Conn) {
 	defer conn.Close()
-	var req Request
-	if err := json.NewDecoder(conn).Decode(&req); err != nil {
-		log.Printf("[ipc] [WARN] decode request: %v", err)
-		json.NewEncoder(conn).Encode(Response{OK: false, Error: "bad request"})
-		return
-	}
+	dec := json.NewDecoder(conn)
 	enc := json.NewEncoder(conn)
+	for {
+		_ = conn.SetReadDeadline(time.Now().Add(connIdle))
+		var req Request
+		if err := dec.Decode(&req); err != nil {
+			if !errors.Is(err, io.EOF) && !errors.Is(err, os.ErrDeadlineExceeded) {
+				log.Printf("[ipc] [WARN] decode request: %v", err)
+				_ = enc.Encode(Response{OK: false, Error: "bad request"})
+			}
+			return
+		}
+		_ = conn.SetReadDeadline(time.Time{})
+		if err := d.serveRequest(enc, req); err != nil {
+			return
+		}
+	}
+}
+
+// serveRequest writes exactly one Response per request. Every branch responds,
+// including unknown commands — a silently closed connection just makes the
+// client wait out its full decode timeout.
+func (d *Daemon) serveRequest(enc *json.Encoder, req Request) error {
 	switch req.Cmd {
 	case "ping":
-		enc.Encode(Response{OK: true})
+		return enc.Encode(Response{OK: true})
 	case "status":
-		enc.Encode(d.buildStatusResponse())
+		return enc.Encode(d.buildStatusResponse())
 	case "list":
-		v := d.stateVersion.Load()
-		if req.Version == v {
-			enc.Encode(Response{OK: true, Version: v})
-			return
-		}
-		resp := d.buildListResponse()
-		resp.Version = v
-		enc.Encode(resp)
+		return enc.Encode(d.buildListResponse(req.SessID))
 	case "connect":
 		d.handleConnect(req.Name)
-		enc.Encode(Response{OK: true})
+		return enc.Encode(Response{OK: true})
 	case "freeze":
 		if err := d.handleFreeze(req.Name); err != nil {
-			enc.Encode(Response{OK: false, Error: err.Error()})
-			return
+			return enc.Encode(Response{OK: false, Error: err.Error()})
 		}
-		enc.Encode(Response{OK: true})
+		return enc.Encode(Response{OK: true})
+	default:
+		return enc.Encode(Response{OK: false, Error: "unknown cmd " + req.Cmd})
 	}
 }
 
@@ -168,13 +209,17 @@ func (d *Daemon) buildStatusResponse() Response {
 		stOK = d.st.Ping() == nil
 	}
 	d.stMu.Unlock()
-	ccOK := d.cc != nil
 
 	return Response{
-		OK: true,
-		StatusCC: ccOK, StatusStore: stOK,
-		CCErrs: d.ccErrs.Load(), StoreErrs: d.storeErrs.Load(),
-		Uptime: int64(time.Since(d.startedAt).Seconds()),
+		OK:    true,
+		Ready: d.ready.Load(), SyncedAt: d.syncedAt.Load(),
+		// StatusCC tracks whether the last control-mode exchange actually
+		// succeeded. It used to be `d.cc != nil`, which is never false — the
+		// daemon reported healthy while logging an error every single poll.
+		StatusCC: d.ccOK.Load(), StatusStore: stOK,
+		CCErrs: d.ccErrs.Load(), CCTimeouts: d.ccTimeouts(),
+		StoreErrs: d.storeErrs.Load(),
+		Uptime:    int64(time.Since(d.startedAt).Seconds()),
 	}
 }
 
@@ -187,6 +232,7 @@ func (d *Daemon) handleConnect(name string) {
 	}
 	log.Printf("[store] [INFO] connect: %s", name)
 	st.RecordOpen(name)
+	_ = st.Touch(name) // no-op unless name is a saved preset
 	sessions := d.listLiveViaControl()
 	if sessions != nil {
 		others := make([]string, 0, len(sessions))
@@ -212,28 +258,44 @@ func (d *Daemon) handleFreeze(name string) error {
 	if d.ctl == nil {
 		return fmt.Errorf("freeze: tmux unavailable")
 	}
-	if d.st == nil {
+	// Copy the store pointer under stMu like every other reader. Reading d.st
+	// directly raced with ensureDB, which Closes and replaces that same pointer
+	// on a failed Ping — an unsynchronized read plus a use-after-Close, during a
+	// freeze that can take seconds.
+	d.stMu.Lock()
+	st := d.st
+	d.stMu.Unlock()
+	if st == nil {
 		return fmt.Errorf("freeze: store unavailable")
 	}
 	log.Printf("freeze: %s", name)
-	_, _, err := template.FreezeRemember(d.ctl, d.st, name)
+	_, _, err := template.FreezeRemember(d.ctl, st, name)
 	return err
 }
 
-func (d *Daemon) buildListResponse() Response {
-	d.ensureGitBranches()
-
+// buildListResponse assembles the payload. sessID is the client's tmux session id
+// ("$0" from its own $TMUX), used to pick the right pair-score map.
+func (d *Daemon) buildListResponse(sessID string) Response {
 	d.cacheMu.RLock()
 	sessions := d.cachedSessions
 	presets := d.cachedPresets
 	zoxide := d.cachedZoxide
-	ctxSess, ctxPath := d.ctxSess, d.ctxPath
-	pairs := d.cachedPairs
+	allPairs := d.cachedPairs
 	usage := d.cachedUsage
 	gitBranches := d.cachedGitBranches
+	sticky := d.cachedSticky
 	d.cacheMu.RUnlock()
 
-	return Response{OK: true, Sessions: sessions, Presets: presets,
-		CtxSess: ctxSess, CtxPath: ctxPath, Pairs: pairs, Usage: usage,
+	// Look up, never compute: the maps are built per live session during sync.
+	var pairs map[string]int64
+	if cur, ok := tmux.FindByID(sessions, sessID); ok {
+		pairs = allPairs[cur.Name]
+	}
+
+	return Response{OK: true,
+		Ready: d.ready.Load(), SyncedAt: d.syncedAt.Load(),
+		Version:  d.stateVersion.Load(),
+		Sessions: sessions, Presets: presets,
+		Pairs: pairs, Usage: usage, StickyLabel: sticky,
 		GitBranches: gitBranches, Zoxide: zoxide}
 }

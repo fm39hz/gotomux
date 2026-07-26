@@ -13,8 +13,8 @@ type testSource struct {
 	hide  bool
 }
 
-func (s *testSource) Snapshot() []Item          { return s.items }
-func (s *testSource) Refresh() tea.Cmd           { return nil }
+func (s *testSource) Snapshot() []Item { return s.items }
+func (s *testSource) Refresh() tea.Cmd { return nil }
 func (s *testSource) FlattenFilter(string) FlattenFilter {
 	return FlattenFilter{Cap: s.cap, Hide: s.hide}
 }
@@ -95,34 +95,69 @@ func TestSnapshotAll(t *testing.T) {
 	}
 }
 
-func TestZoxideItemsDedup(t *testing.T) {
-	// zoxideItems should not produce items with names already in names/paths
-	names := map[string]bool{"existing": true}
-	paths := map[string]bool{}
-	items := zoxideItems([]string{"/home/user/existing", "/home/user/newpath"}, names, paths)
-	for _, it := range items {
-		if it.Name == "existing" {
-			t.Errorf("zoxideItems included deduped name 'existing'")
-		}
+func TestSourceCacheInvalidate(t *testing.T) {
+	cache := &sourceCache{
+		zoxSt:  nil,
+		zoxMu:  &sync.Mutex{},
+		seeded: true,
 	}
-	if len(items) != 1 {
-		t.Errorf("zoxideItems = %d items, want 1 (1 deduped)", len(items))
+	cache.tmuxDone.Store(true)
+	cache.presetDone.Store(true)
+	cache.invalidate()
+	if cache.tmuxDone.Load() || cache.presetDone.Load() {
+		t.Error("done flags should be cleared by invalidate")
+	}
+	// seeded must clear too: invalidate runs after a kill/delete/freeze, which
+	// makes the daemon's payload wrong. Leaving it set would re-serve the stale
+	// snapshot instead of re-reading tmux and SQLite.
+	if cache.seeded {
+		t.Error("seeded should be cleared by invalidate")
 	}
 }
 
-func TestSourceCacheInvalidate(t *testing.T) {
-	cache := &sourceCache{
-		zoxSt: nil,
-		zoxMu: &sync.Mutex{},
+func TestSeededCacheDoesNotFallBackToSources(t *testing.T) {
+	// A daemon legitimately reporting zero sessions and zero presets must not
+	// cause the sources to re-run tmux/SQLite behind our back. The old guards
+	// keyed off length, so "empty" was indistinguishable from "unknown".
+	cache := &sourceCache{zoxMu: &sync.Mutex{}, seeded: true}
+	cache.tmuxDone.Store(true)
+	cache.presetDone.Store(true)
+
+	ctl := &countingConnector{}
+	st := &countingStore{}
+	srcs := defaultSources(ctl, st, "", "", cache)
+	_ = snapshotAll(srcs)
+
+	if ctl.listLive != 0 {
+		t.Errorf("ListLive called %d times on a seeded cache, want 0", ctl.listLive)
 	}
-	cache.tmuxOK.Store(true)
-	cache.presetOK.Store(true)
-	cache.invalidate()
-	if cache.tmuxOK.Load() {
-		t.Error("tmuxOK should be false after invalidate")
+	if st.listMeta != 0 {
+		t.Errorf("ListMeta called %d times on a seeded cache, want 0", st.listMeta)
 	}
-	if cache.presetOK.Load() {
-		t.Error("presetOK should be false after invalidate")
+}
+
+func TestFlattenAppliesCapAfterDedup(t *testing.T) {
+	// Cap counts rows that survive dedup. Applying it to the raw slice first let
+	// duplicates consume the budget, so ZoxideCap=2 could yield fewer than 2 rows.
+	earlier := &testSource{items: []Item{{Name: "dup", Path: "/dup"}}}
+	capped := &testSource{
+		items: []Item{
+			{Name: "dup", Path: "/dup"}, // deduped against earlier
+			{Name: "a", Path: "/a"},
+			{Name: "b", Path: "/b"},
+			{Name: "c", Path: "/c"},
+		},
+		cap: 2,
+	}
+	bySrc := map[Source][]Item{earlier: earlier.items, capped: capped.items}
+	got := flattenSources([]Source{earlier, capped}, bySrc, "")
+
+	// earlier's "dup" plus exactly cap=2 surviving rows from capped.
+	if len(got) != 3 {
+		t.Fatalf("flattened %d items, want 3: %+v", len(got), got)
+	}
+	if got[1].Name != "a" || got[2].Name != "b" {
+		t.Errorf("capped source contributed %q,%q; want a,b", got[1].Name, got[2].Name)
 	}
 }
 

@@ -7,9 +7,11 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	tea "charm.land/bubbletea/v2"
@@ -81,69 +83,117 @@ func initEventBus() {
 	template.SetEventBus(event.New())
 }
 
-func daemonStateFile() string {
-	dir := os.Getenv("XDG_DATA_HOME")
-	if dir == "" {
-		home, _ := os.UserHomeDir()
-		dir = filepath.Join(home, ".local", "share")
-	}
-	return filepath.Join(dir, "gotomux", "state.ver")
-}
-
-func daemonSocket() string {
-	dir := os.Getenv("XDG_DATA_HOME")
-	if dir == "" {
-		home, _ := os.UserHomeDir()
-		dir = filepath.Join(home, ".local", "share")
-	}
-	return filepath.Join(dir, "gotomux", "gotomux.sock")
-}
-
 func runPicker(cfg *config.Config) error {
-	sock := daemonSocket()
+	trace("start")
+	sock := cfg.SocketPath()
 	if conn, err := net.DialTimeout("unix", sock, 50*time.Millisecond); err == nil {
+		trace("daemon dialed")
 		return runPickerIPC(cfg, conn)
 	}
+	trace("no daemon")
+	// No daemon: serve this run locally and start one for the next. Without this,
+	// "instant" depended on the user having run `make install-all` to enable the
+	// systemd unit — on any other machine every invocation paid full cold start
+	// forever.
+	spawnDaemon()
 	return runPickerStandalone(cfg)
+}
+
+// spawnDaemon launches gotomuxd detached and does not wait for it.
+//
+// Racing invocations are harmless: the daemon's own flock plus its stale-socket
+// guard mean the second instance exits cleanly on its own. Set
+// GOTOMUX_NO_AUTOSTART=1 to opt out.
+func spawnDaemon() {
+	if os.Getenv("GOTOMUX_NO_AUTOSTART") != "" {
+		return
+	}
+	bin, err := exec.LookPath("gotomuxd")
+	if err != nil {
+		// Fall back to a sibling of this binary, which is how it is laid out both
+		// in the package and in a local `make build-all` tree.
+		self, serr := os.Executable()
+		if serr != nil {
+			return
+		}
+		cand := filepath.Join(filepath.Dir(self), "gotomuxd")
+		if st, serr := os.Stat(cand); serr != nil || st.IsDir() {
+			return
+		}
+		bin = cand
+	}
+
+	devNull, err := os.OpenFile(os.DevNull, os.O_RDWR, 0)
+	if err != nil {
+		return
+	}
+	defer devNull.Close()
+
+	cmd := exec.Command(bin)
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = devNull, devNull, devNull
+	// Setsid detaches it from this process group so it survives our exit and does
+	// not receive the terminal's signals.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	if err := cmd.Start(); err != nil {
+		return
+	}
+	// Release the child; never Wait, or this process would block on it.
+	_ = cmd.Process.Release()
 }
 
 func runPickerIPC(cfg *config.Config, conn net.Conn) error {
 	defer conn.Close()
 	enc, dec := json.NewEncoder(conn), json.NewDecoder(conn)
-	enc.Encode(daemon.Request{Cmd: "list"})
+	enc.Encode(daemon.Request{Cmd: "list", SessID: tmux.CurrentSessionID()})
 	var resp daemon.Response
-	if err := decodeWithTimeout(dec, &resp); err != nil || !resp.OK {
+	if err := decodeWithTimeout(dec, &resp); err != nil || !usablePayload(cfg, resp) {
+		trace("payload unusable")
 		return runPickerStandalone(cfg)
 	}
+	trace("payload decoded")
 
 	cwd, _ := os.Getwd()
 	root := project.FindProjectRoot(cwd)
 	name := project.SessionName(root)
 
 	ctl, _ := tmux.New()
-	st, stErr := store.OpenWithConfig(cfg)
-	if stErr != nil {
-		return fmt.Errorf("store: %w", stErr)
-	}
-	defer st.Close()
 
-	// Preload git branch cache from daemon to avoid filesystem I/O in the picker.
-	if len(resp.GitBranches) > 0 {
-		picker.PreloadCache(resp.GitBranches)
+	// The store stays closed. Everything the list needs is in the payload, so
+	// opening SQLite here would put an open + migration probes + WAL setup on cold
+	// start for data already in hand. lazyStore hands one to the action keys and
+	// to the connect branches, which are the only things that need it.
+	st := lazyStore(cfg)
+	defer st.close()
+
+	// Git branches come from the daemon so the picker does no filesystem walk.
+	// Misses are seeded too: the daemon reports only real branches, and without
+	// marking the rest as "not a repo" every non-repository row would be re-read
+	// locally, reintroducing the very I/O the payload exists to avoid.
+	picker.PreloadCache(resp.GitBranches)
+	picker.PreloadMisses(payloadPaths(resp), resp.GitBranches)
+
+	// Resolve our own session with zero forks: $TMUX carries the session index and
+	// the payload carries #{session_id}. Previously this was two `tmux
+	// display-message` forks on the path documented as doing no tmux I/O — and the
+	// CtxSess/CtxPath fields the daemon sent were ignored, which was just as well:
+	// they describe the daemon's process, which has no $TMUX and so always reported
+	// nothing.
+	env := picker.Context{Pairs: resp.Pairs, Usage: resp.Usage, Now: time.Now().Unix()}
+	if cur, ok := tmux.FindByID(resp.Sessions, tmux.CurrentSessionID()); ok {
+		env.Session, env.Path = cur.Name, cur.Path
 	}
 
-	ctx := context.Background()
-	env := picker.Context{
-		Session: ctl.CurrentSession(ctx), Path: ctl.CurrentSessionPath(ctx),
-		Pairs: resp.Pairs, Usage: resp.Usage, Now: time.Now().Unix(),
+	seed := picker.Seed{
+		Sessions:    resp.Sessions,
+		Presets:     resp.Presets,
+		ZoxideItems: picker.ZoxRowsToItems(resp.Zoxide),
+		StickyLabel: resp.StickyLabel,
+		Env:         &env,
 	}
+	deps := picker.Deps{Ctl: ctl, OpenStore: st.get}
 
-	var zoxideItems []picker.Item
-	if len(resp.Zoxide) > 0 {
-		zoxideItems = picker.ZoxRowsToItems(resp.Zoxide)
-	}
-
-	m := picker.NewModelFromDaemon(cfg, ctl, st, name, root, resp.Sessions, resp.Presets, env, zoxideItems)
+	m := picker.NewModelFromDaemon(cfg, deps, name, root, seed)
+	trace("model built (ipc)")
 	opts, _, err := picker.TeaOpts()
 	if err != nil {
 		return err
@@ -169,22 +219,95 @@ func runPickerIPC(cfg *config.Config, conn net.Conn) error {
 	}
 	it := res.Item
 
-	enc.Encode(daemon.Request{Cmd: "connect", Name: it.Name})
-	var ack daemon.Response
-	decodeWithTimeout(dec, &ack)
+	// Record telemetry before connecting — ctl.Connect ends in syscall.Exec.
+	// Prefer the daemon (it owns the store), but fall back to writing locally if
+	// the ack does not come back, so a daemon that dies mid-session cannot
+	// silently stop frecency from updating.
+	if !recordOpenViaDaemon(enc, dec, it.Name) {
+		recordOpen(st.get(), it.Name, liveNames(resp.Sessions))
+	}
 
+	ctx := context.Background()
 	switch it.Kind {
 	case picker.KindActive:
+		// No store needed: attaching to a live session touches nothing on disk.
 		return ctl.Connect(ctx, it.Name, "")
 	case picker.KindPreset:
-		p, e := st.Get(it.Name)
+		p, e := st.get().Get(it.Name)
 		if e != nil {
 			return e
 		}
 		return ctl.ConnectPreset(ctx, p)
 	default:
-		return template.ConnectProject(ctl, st, it.Name, it.Path)
+		return template.ConnectProject(ctl, st.get(), it.Name, it.Path)
 	}
+}
+
+// storeHandle opens the store at most once, on first use.
+type storeHandle struct {
+	cfg  *config.Config
+	once sync.Once
+	st   *store.Store
+}
+
+// lazyStore defers store.OpenWithConfig until something actually needs it. On the
+// daemon path that is never, for a plain browse-and-attach.
+func lazyStore(cfg *config.Config) *storeHandle { return &storeHandle{cfg: cfg} }
+
+func (h *storeHandle) get() store.Storer {
+	h.once.Do(func() {
+		st, err := store.OpenWithConfig(h.cfg)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "gotomux: store: %v\n", err)
+			return
+		}
+		h.st = st
+	})
+	if h.st == nil {
+		return nil
+	}
+	return h.st
+}
+
+func (h *storeHandle) close() {
+	if h.st != nil {
+		_ = h.st.Close()
+	}
+}
+
+// recordOpenViaDaemon asks the daemon to record the open. Reports whether it
+// acknowledged; a false return means the caller must record locally.
+func recordOpenViaDaemon(enc *json.Encoder, dec *json.Decoder, name string) bool {
+	if name == "" {
+		return false
+	}
+	if enc.Encode(daemon.Request{Cmd: "connect", Name: name}) != nil {
+		return false
+	}
+	var ack daemon.Response
+	if decodeWithTimeout(dec, &ack) != nil {
+		return false
+	}
+	return ack.OK
+}
+
+// usablePayload decides whether a daemon response may be trusted instead of
+// gathering everything locally.
+//
+// OK alone is not enough: a daemon that has not completed a sync answers OK with
+// an empty payload, and the picker cannot tell that apart from "you genuinely
+// have no sessions and no presets". Requiring Ready plus a recent SyncedAt makes
+// the degraded case representable, so the silent fallback actually fires.
+func usablePayload(cfg *config.Config, resp daemon.Response) bool {
+	if !resp.OK || !resp.Ready {
+		return false
+	}
+	maxAge := 30 * time.Second
+	if cfg != nil && cfg.PollInterval > 0 {
+		maxAge = 3 * cfg.PollInterval
+	}
+	age := time.Since(time.Unix(resp.SyncedAt, 0))
+	return age >= 0 && age <= maxAge
 }
 
 // decodeWithTimeout reads one JSON value with a 2-second timeout.
@@ -229,6 +352,7 @@ func runPickerStandalone(cfg *config.Config) error {
 		root = project.FindProjectRoot(cwd)
 	}()
 	wg.Wait()
+	trace("parallel init done")
 	if ctlErr != nil {
 		return fmt.Errorf("tmux: %w", ctlErr)
 	}
@@ -237,8 +361,9 @@ func runPickerStandalone(cfg *config.Config) error {
 	}
 	defer st.Close()
 	name := project.SessionName(root)
-	return picker.RunPicker(cfg, ctl, st, name, root, func(it picker.Item) error {
-		return connectItem(ctl, st, it)
+	trace("model build (standalone)")
+	return picker.RunPicker(cfg, ctl, st, name, root, func(res picker.Result) error {
+		return connectItem(ctl, st, res)
 	})
 }
 
@@ -298,8 +423,10 @@ func profileRun(cfg *config.Config) error {
 	return nil
 }
 
-func connectItem(ctl tmux.Connector, st store.Storer, it picker.Item) error {
+func connectItem(ctl tmux.Connector, st store.Storer, res picker.Result) error {
 	ctx := context.Background()
+	it := res.Item
+	recordOpen(st, it.Name, res.Live)
 	switch it.Kind {
 	case picker.KindCreate, picker.KindZoxide:
 		return template.ConnectProject(ctl, st, it.Name, it.Path)
@@ -319,38 +446,59 @@ func connectItem(ctl tmux.Connector, st store.Storer, it picker.Item) error {
 	}
 }
 
-func freezeCLI(cfg *config.Config, name string) error {
-	if conn, err := net.DialTimeout("unix", daemonSocket(), 50*time.Millisecond); err == nil {
-		defer conn.Close()
-		enc, dec := json.NewEncoder(conn), json.NewDecoder(conn)
-		enc.Encode(daemon.Request{Cmd: "list"})
-		var listResp daemon.Response
-		if err := decodeWithTimeout(dec, &listResp); err == nil && listResp.OK {
-			if name == "" {
-				if listResp.CtxSess != "" {
-					name = listResp.CtxSess
-				} else if len(listResp.Sessions) > 0 {
-					items := make([]string, 0, len(listResp.Sessions))
-					for _, s := range listResp.Sessions {
-						items = append(items, s.Name)
-					}
-					name, err = picker.Pick(items)
-					if err != nil || name == "" {
-						return errCancel
-					}
-				}
-			}
-			if name != "" {
-				enc.Encode(daemon.Request{Cmd: "freeze", Name: name})
-				var fr daemon.Response
-				decodeWithTimeout(dec, &fr)
-				if fr.OK {
-					fmt.Printf("froze %s\n", name)
-					return nil
-				}
-				return fmt.Errorf("freeze via daemon: %s", fr.Error)
-			}
+// recordOpen bumps frecency and co-occurrence for a session about to be opened.
+//
+// It must run BEFORE the connect: outside tmux, Ctl.Connect ends in syscall.Exec,
+// which replaces this process — nothing after it runs, defers included.
+//
+// This is the standalone path's only telemetry write, and it did not exist. The
+// comment in internal/tmux/ctl.go claimed the daemon's background poll handled
+// it, but that poll depended on a control transport that never worked, so the
+// usage table went unwritten and the recency tier of the ranking was frozen.
+func recordOpen(st store.Storer, name string, live []string) {
+	if st == nil || name == "" {
+		return
+	}
+	_ = st.RecordOpen(name)
+	_ = st.Touch(name) // no-op unless name is a saved preset
+	others := make([]string, 0, len(live))
+	for _, n := range live {
+		if n != name {
+			others = append(others, n)
 		}
+	}
+	if len(others) > 0 {
+		st.RecordPairsWithLive(name, others)
+	}
+}
+
+// payloadPaths lists every path the payload mentions, matching what the daemon
+// resolved git labels for.
+func payloadPaths(resp daemon.Response) []string {
+	out := make([]string, 0, len(resp.Sessions)+len(resp.Presets)+len(resp.Zoxide))
+	for _, s := range resp.Sessions {
+		out = append(out, s.Path)
+	}
+	for _, p := range resp.Presets {
+		out = append(out, p.Cwd)
+	}
+	for _, z := range resp.Zoxide {
+		out = append(out, z.Path)
+	}
+	return out
+}
+
+func liveNames(sessions []tmux.LiveSession) []string {
+	out := make([]string, 0, len(sessions))
+	for _, s := range sessions {
+		out = append(out, s.Name)
+	}
+	return out
+}
+
+func freezeCLI(cfg *config.Config, name string) error {
+	if handled, err := freezeViaDaemon(cfg, name); handled {
+		return err
 	}
 
 	// Fallback: standalone freeze
@@ -391,6 +539,66 @@ func freezeCLI(cfg *config.Config, name string) error {
 	}
 	fmt.Printf("froze %s\n", name)
 	return nil
+}
+
+// freezeViaDaemon attempts the freeze over IPC.
+//
+// handled=false means "caller should run the standalone freeze" and is returned
+// for every transport or daemon-side failure — IPC is an accelerator, never a
+// dependency. Only a completed freeze, or a user cancellation (which must not
+// re-prompt), counts as handled.
+func freezeViaDaemon(cfg *config.Config, name string) (handled bool, err error) {
+	conn, dialErr := net.DialTimeout("unix", cfg.SocketPath(), 50*time.Millisecond)
+	if dialErr != nil {
+		return false, nil
+	}
+	defer conn.Close()
+
+	enc, dec := json.NewEncoder(conn), json.NewDecoder(conn)
+	if enc.Encode(daemon.Request{Cmd: "list", SessID: tmux.CurrentSessionID()}) != nil {
+		return false, nil
+	}
+	var listResp daemon.Response
+	if decodeWithTimeout(dec, &listResp) != nil || !usablePayload(cfg, listResp) {
+		return false, nil
+	}
+
+	if name == "" {
+		// Resolve our own session from $TMUX + the payload's session ids; the daemon
+		// cannot tell us, it has no $TMUX of its own.
+		cur, inTmux := tmux.FindByID(listResp.Sessions, tmux.CurrentSessionID())
+		switch {
+		case inTmux:
+			name = cur.Name
+		case len(listResp.Sessions) > 0:
+			items := make([]string, 0, len(listResp.Sessions))
+			for _, s := range listResp.Sessions {
+				items = append(items, s.Name)
+			}
+			picked, perr := picker.Pick(items)
+			if perr != nil || picked == "" {
+				return true, errCancel
+			}
+			name = picked
+		}
+	}
+	if name == "" {
+		return false, nil
+	}
+
+	if enc.Encode(daemon.Request{Cmd: "freeze", Name: name}) != nil {
+		return false, nil
+	}
+	var fr daemon.Response
+	if decodeWithTimeout(dec, &fr) != nil || !fr.OK {
+		// Includes the daemon reporting tmux/store unavailable. Retrying locally
+		// both has a chance of working and produces a real error message; the
+		// old code returned fr.Error here, which for a dropped response was the
+		// empty string — "freeze via daemon: " with no cause.
+		return false, nil
+	}
+	fmt.Printf("froze %s\n", name)
+	return true, nil
 }
 
 func editCLI(cfg *config.Config, name string) error {

@@ -1,10 +1,10 @@
 package picker
 
 import (
-	"os/exec"
 	"time"
 
 	"github.com/fm39hz/gotomux/internal/store"
+	"github.com/fm39hz/gotomux/internal/zoxide"
 )
 
 func loadZoxItemsSync(cache *sourceCache) ([]Item, time.Duration, bool) {
@@ -52,61 +52,13 @@ func saveZoxItems(items []Item, cache *sourceCache) {
 	cache.zoxMu.Unlock()
 }
 
-func zoxideQueryFresh() []string {
-	out, err := exec.Command("zoxide", "query", "-l").Output()
-	if err != nil {
-		return nil
-	}
-	var paths []string
-	for _, line := range splitLines(string(out)) {
-		if line != "" {
-			paths = append(paths, line)
-		}
-	}
-	return paths
-}
-
-func splitLines(s string) []string {
-	var out []string
-	start := 0
-	for i := 0; i < len(s); i++ {
-		if s[i] == '\n' {
-			line := trimSpace(s[start:i])
-			if line != "" {
-				out = append(out, line)
-			}
-			start = i + 1
-		}
-	}
-	if start < len(s) {
-		line := trimSpace(s[start:])
-		if line != "" {
-			out = append(out, line)
-		}
-	}
-	return out
-}
-
-func trimSpace(s string) string {
-	for len(s) > 0 && (s[0] == ' ' || s[0] == '\t' || s[0] == '\r') {
-		s = s[1:]
-	}
-	for len(s) > 0 {
-		c := s[len(s)-1]
-		if c != ' ' && c != '\t' && c != '\r' {
-			break
-		}
-		s = s[:len(s)-1]
-	}
-	return s
-}
-
+// rebuildZoxItems re-queries zoxide and refreshes both caches.
+//
+// Row derivation lives in internal/zoxide so the daemon produces byte-identical
+// rows; deriving them here independently is what made daemon-fed and
+// standalone-fed zoxide entries rank differently.
 func rebuildZoxItems(cache *sourceCache) []Item {
-	paths := zoxideQueryFresh()
-	if len(paths) == 0 {
-		return nil
-	}
-	items := zoxideItems(paths, nil, nil)
+	items := ZoxRowsToItems(zoxide.Rows(zoxide.Query()))
 	if len(items) > 0 {
 		saveZoxItems(items, cache)
 	}
@@ -123,7 +75,7 @@ func zoxideList(cache *sourceCache) []string {
 		}
 		return out
 	}
-	return zoxideQueryFresh()
+	return zoxide.Query()
 }
 
 func ZoxRowsToItems(rows []store.ZoxRow) []Item {
@@ -134,7 +86,7 @@ func ZoxRowsToItems(rows []store.ZoxRow) []Item {
 			title = "[Zoxide] " + r.Name
 		}
 		out = append(out, Item{
-			Kind: KindZoxide,
+			Kind:  KindZoxide,
 			Title: title, Desc: r.Desc, Name: r.Name, Path: r.Path, Recency: r.Recency,
 		})
 	}

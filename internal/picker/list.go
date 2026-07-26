@@ -1,11 +1,9 @@
 package picker
 
 import (
-	"fmt"
 	"path/filepath"
 	"slices"
 
-	"github.com/fm39hz/gotomux/internal/project"
 	"github.com/fm39hz/gotomux/internal/store"
 )
 
@@ -27,7 +25,9 @@ func (it Item) ID() ID { return ID(it.Name) }
 
 // Item is one picker row from any Source.
 type Item struct {
-	Busy    string // non-shell tool in active pane (glance badge)
+	// Host is reserved for the remote-tmux source in docs/todo.md; nothing sets
+	// it yet. Busy used to live here too but was never read — the non-shell tool
+	// badge is rendered through Desc (see mkBusy/badgeFromBusy).
 	Host    string // "" = local; remote: "hostname"
 	Kind    Kind
 	Title   string
@@ -43,64 +43,16 @@ type Item struct {
 	GitBranch string
 }
 
-var zoxCap = 40 // default; overridden by Config.ZoxideCap
+// defaultZoxCap is the fallback when Config.ZoxideCap is unset. The effective
+// cap lives on sourceCache, not in a package-level var mutated during model
+// construction.
+const defaultZoxCap = 40
 
 func normPath(p string) string {
 	if p == "" {
 		return ""
 	}
 	return filepath.Clean(p)
-}
-
-func occupancy(items []Item) (names, paths map[string]bool) {
-	names = map[string]bool{}
-	paths = map[string]bool{}
-	for _, it := range items {
-		names[it.Name] = true
-		if p := normPath(it.Path); p != "" {
-			paths[p] = true
-		}
-	}
-	return names, paths
-}
-
-// zoxideItems: collapse path -> project root; recency from zoxide order.
-func zoxideItems(zpaths []string, names, paths map[string]bool) []Item {
-	if names == nil {
-		names = map[string]bool{}
-	}
-	if paths == nil {
-		paths = map[string]bool{}
-	}
-	var out []Item
-	n := len(zpaths)
-	for i, p := range zpaths {
-		name, root := project.Session(p)
-		if name == "" {
-			continue
-		}
-		nr := normPath(root)
-		if names[name] || (nr != "" && paths[nr]) {
-			continue
-		}
-		names[name] = true
-		if nr != "" {
-			paths[nr] = true
-		}
-		desc := p
-		if nr != "" && normPath(p) != nr {
-			desc = root
-		}
-		out = append(out, Item{
-			Kind:    KindZoxide,
-			Title:   fmt.Sprintf("[Zoxide] %s", name),
-			Desc:    desc,
-			Name:    name,
-			Path:    root,
-			Recency: int64(n - i),
-		})
-	}
-	return out
 }
 
 func rankItems(q string, pool []Item) []Item {

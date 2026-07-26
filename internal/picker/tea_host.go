@@ -43,12 +43,6 @@ func truncateRunes(s string, n int) string {
 	return string(r[:n-3]) + "..."
 }
 
-// isModifierChord: ctrl/alt/meta combo that is not plain text.
-// Prevents ctrl+l etc. from inserting "l" into the filter.
-func isModifierChord(msg tea.KeyPressMsg) bool {
-	return msg.Key().Mod != 0 && msg.Key().Mod != tea.ModShift
-}
-
 // ClearInline erases n lines of residual bubbletea inline UI (fzf-style).
 // Bubble Tea stop() only clears the current line - the rest stays in scrollback.
 func ClearInline(n int) {

@@ -10,6 +10,7 @@ import (
 	"github.com/fm39hz/gotomux/internal/project"
 	"github.com/fm39hz/gotomux/internal/store"
 	"github.com/fm39hz/gotomux/internal/tmux"
+	"github.com/fm39hz/gotomux/internal/zoxide"
 )
 
 func BenchmarkReadyNoZoxide(b *testing.B) {
@@ -50,7 +51,7 @@ func BenchmarkReadyWithZoxide(b *testing.B) {
 		cache.zoxSt = st
 		cache.zoxMu = &sync.Mutex{}
 		_ = snapshotAll(defaultSources(ctl, st, name, root, &cache))
-		_ = zoxideItems(zoxideList(&cache), nil, nil)
+		_ = ZoxRowsToItems(zoxide.Rows(zoxideList(&cache)))
 		st.Close()
 	}
 }

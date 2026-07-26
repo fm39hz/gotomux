@@ -208,7 +208,6 @@ func TestLoadKhoCongShape(t *testing.T) {
 	}
 }
 
-
 // Freeze often stores a middle window named like the session (cwd basename).
 // new-window -t bare name then fails with "index N in use".
 func TestLoadWindowNamedLikeSession(t *testing.T) {

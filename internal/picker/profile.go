@@ -6,14 +6,17 @@ import (
 	"sync"
 	"time"
 
-	"charm.land/bubbles/v2/help"
-
 	"github.com/fm39hz/gotomux/internal/config"
 	"github.com/fm39hz/gotomux/internal/store"
-	"github.com/fm39hz/gotomux/internal/template"
 	"github.com/fm39hz/gotomux/internal/tmux"
 )
 
+// ProfileRun times the standalone construction path.
+//
+// It ends by calling newModelCore rather than re-assembling a model literal. The
+// third hand-maintained copy of that literal used to live here, which meant the
+// profiler could report timings for a construction sequence the real picker no
+// longer used.
 func ProfileRun(cfg *config.Config, ctl tmux.Connector, st store.Storer, createName, createCwd string) {
 	fmt.Fprintln(os.Stderr, "  picker init:")
 
@@ -23,10 +26,11 @@ func ProfileRun(cfg *config.Config, ctl tmux.Connector, st store.Storer, createN
 		fmt.Fprintf(os.Stderr, "    %-26s %v\n", name, time.Since(start))
 	}
 
+	// Stage timings for the pieces newModelCore composes, so the breakdown stays
+	// useful now that construction itself is a single call.
 	var cache *sourceCache
-	log("sourceCache+uicfg", func() {
-		cache = &sourceCache{zoxSt: st, zoxMu: &sync.Mutex{}}
-		applyUICfg(cfg)
+	log("sourceCache", func() {
+		cache = &sourceCache{zoxSt: st, zoxMu: &sync.Mutex{}, zoxCap: zoxCapFrom(cfg)}
 	})
 
 	var srcs []Source
@@ -48,29 +52,7 @@ func ProfileRun(cfg *config.Config, ctl tmux.Connector, st store.Storer, createN
 		applyRankMeta(bySrc, st, env)
 	})
 
-	log("StickyLabel", func() {
-		template.StickyLabel(st)
-	})
-
-	log("refilter", func() {
-		m := model{
-			sources:    srcs,
-			bySrc:      bySrc,
-			cache:      cache,
-			ctl:        ctl,
-			store:      st,
-			cfg:        cfg,
-			tmpl:       "",
-			env:        env,
-			createName: createName,
-			createCwd:  createCwd,
-			ui: viewModel{
-				queryInput: initInput(),
-				helpModel:  help.New(),
-				maxShow:    maxShow(cfg),
-				started:    time.Now(),
-			},
-		}
-		m.refilter()
+	log("newModelCore (whole)", func() {
+		_ = newModelCore(cfg, Deps{Ctl: ctl, Store: st}, createName, createCwd, Seed{})
 	})
 }

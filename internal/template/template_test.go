@@ -335,8 +335,8 @@ func TestWindowChromeFromTools(t *testing.T) {
 	sh := ToShape(&model.Session{
 		Name: "proj", Cwd: "/work/proj",
 		Windows: []model.Window{
-			{Name: "proj", Panes: []model.Pane{{Cmd: "nvim"}}},          // session-like name -> editor via tool
-			{Name: "cong", Panes: []model.Pane{{Cmd: "nvim"}}},          // branch label -> editor via tool
+			{Name: "proj", Panes: []model.Pane{{Cmd: "nvim"}}}, // session-like name -> editor via tool
+			{Name: "cong", Panes: []model.Pane{{Cmd: "nvim"}}}, // branch label -> editor via tool
 			{Name: "whatever", Layout: "even-vertical", Panes: []model.Pane{{}, {}}},
 			{Name: "/home/x/.cache/", Panes: []model.Pane{{Cmd: "yazi"}}},
 			{Name: "opencode", Panes: []model.Pane{{Cmd: "opencode"}}},
