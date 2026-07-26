@@ -19,8 +19,10 @@ package zoxide
 
 import (
 	"fmt"
+	"hash/fnv"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/fm39hz/gotomux/internal/project"
@@ -92,4 +94,23 @@ func clean(p string) string {
 		return ""
 	}
 	return filepath.Clean(p)
+}
+
+// Signature fingerprints a raw zoxide path list.
+//
+// Deriving rows from paths costs ~0.9ms per path — FindProjectRoot walks up
+// stat-ing for project markers, roughly 10k stat() calls for a 300-entry list, or
+// ~270ms cold. The derived rows are already persisted, so that work only needs to
+// happen when the *list itself* changes. Comparing signatures turns "has anything
+// changed?" into a single string compare.
+//
+// Order matters: zoxide returns paths most-frecent first, and Rows derives Recency
+// from position, so a reordering is a real change.
+func Signature(paths []string) string {
+	h := fnv.New64a()
+	for _, p := range paths {
+		_, _ = h.Write([]byte(p))
+		_, _ = h.Write([]byte{'\n'})
+	}
+	return strconv.FormatUint(h.Sum64(), 16)
 }

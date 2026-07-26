@@ -63,6 +63,14 @@ type Response struct {
 	Uptime      int64 `json:"uptime,omitempty"`
 }
 
+// ErrAlreadyRunning means another instance owns the socket or the lock.
+//
+// This is deliberately NOT a failure: with Restart=on-failure, exiting non-zero
+// because a healthy daemon already exists produces an infinite restart loop.
+// Observed at restart counter 8 after an autostarted instance held the flock while
+// systemd kept relaunching the unit.
+var ErrAlreadyRunning = errors.New("daemon already running")
+
 // listenWithGuard binds the Unix socket with stale-socket detection.
 // Tries to dial first; if a live daemon responds, returns an error.
 // If the socket is stale (dial fails), removes and re-listens.
@@ -74,7 +82,7 @@ func listenWithGuard(sock string) (net.Listener, error) {
 	// Bind failed — check if a live daemon is already listening
 	if conn, dialErr := net.DialTimeout("unix", sock, 100*time.Millisecond); dialErr == nil {
 		conn.Close()
-		return nil, fmt.Errorf("daemon already running on %s", sock)
+		return nil, fmt.Errorf("%w on %s", ErrAlreadyRunning, sock)
 	}
 	// Stale socket — clean and retry
 	os.Remove(sock)
@@ -105,7 +113,7 @@ func acquireLock(sockPath string) (func(), error) {
 
 	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
 		_ = f.Close()
-		return nil, fmt.Errorf("daemon already running (lock %s)", lockPath)
+		return nil, fmt.Errorf("%w (lock %s)", ErrAlreadyRunning, lockPath)
 	}
 
 	return func() {

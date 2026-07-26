@@ -16,6 +16,7 @@ import (
 type Storer interface {
 	Close() error
 	Prune()
+	Checkpoint()
 
 	Get(name string) (*model.Session, error)
 	Save(s *model.Session) error
@@ -49,8 +50,8 @@ type Storer interface {
 	RecordFork(key, body string) error
 	ForkHits(key string) int64
 
-	LoadZox() (rows []ZoxRow, updated int64, ok bool)
-	SaveZox(rows []ZoxRow) error
+	LoadZox() (rows []ZoxRow, updated int64, sig string, ok bool)
+	SaveZox(rows []ZoxRow, sig string) error
 }
 
 type Store struct {
@@ -98,6 +99,17 @@ func OpenWithConfig(cfg *config.Config) (*Store, error) {
 }
 
 // pragma: personal-tool hygiene - WAL + reasonable sync + busy wait.
+// Checkpoint folds the WAL back into the main DB.
+//
+// Nothing did this: the daemon holds the connection open for its whole life, so
+// SQLite never got the "last connection closed" moment that normally triggers a
+// checkpoint, and the WAL grew without bound (observed at 1.3 MB against a 124 KB
+// database). Every reader has to walk the WAL index, so this is a read-latency
+// problem, not just disk use. PASSIVE never blocks a writer.
+func (s *Store) Checkpoint() {
+	_, _ = s.db.Exec(`PRAGMA wal_checkpoint(PASSIVE)`)
+}
+
 func (s *Store) pragma() error {
 	// modernc accepts these; ignore failures on exotic builds
 	pragmas := []string{
@@ -223,7 +235,7 @@ func (s *Store) Ping() error {
 // The migration itself stays additive-only and idempotent — the fast path is an
 // optimisation, not a replacement, so a DB from a future version or one that
 // somehow lost user_version still gets the full run.
-const schemaVersion = 1
+const schemaVersion = 2
 
 func (s *Store) migrate() error {
 	var have int
@@ -296,7 +308,8 @@ CREATE TABLE IF NOT EXISTS pair (
 	if _, err = s.db.Exec(`
 CREATE TABLE IF NOT EXISTS zox_meta (
   id      INTEGER PRIMARY KEY CHECK (id = 1),
-  updated INTEGER NOT NULL DEFAULT 0
+  updated INTEGER NOT NULL DEFAULT 0,
+  sig     TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS zox_item (
   ord     INTEGER PRIMARY KEY,
@@ -344,6 +357,14 @@ CREATE TABLE IF NOT EXISTS sticky (
 			return err
 		}
 		if err := tx.Commit(); err != nil {
+			return err
+		}
+	}
+	// Old DBs have zox_meta without sig.
+	var zoxHasSig int
+	_ = s.db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('zox_meta') WHERE name='sig'`).Scan(&zoxHasSig)
+	if zoxHasSig == 0 {
+		if _, err := s.db.Exec(`ALTER TABLE zox_meta ADD COLUMN sig TEXT NOT NULL DEFAULT ''`); err != nil {
 			return err
 		}
 	}

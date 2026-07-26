@@ -92,6 +92,7 @@ type model struct {
 	tmpl       string
 	createName string
 	createCwd  string
+	sessID     string
 	ui         viewModel
 }
 
@@ -187,6 +188,10 @@ type Deps struct {
 	// (kill/freeze/delete/edit) do — so the SQLite open moves off cold start and
 	// onto the first action instead of being skipped or forced.
 	OpenStore func() store.Storer
+	// SessionID is this process's tmux session id ("$0"), read from $TMUX at the
+	// edge. Holding it here rather than calling os.Getenv deep in the package keeps
+	// context derivation testable and independent of where the test runs.
+	SessionID string
 }
 
 // Seed carries pre-computed picker inputs, normally straight from the daemon.
@@ -202,6 +207,42 @@ type Seed struct {
 	// Seeded marks the payload authoritative: empty slices then mean "empty",
 	// not "unknown", and no source may fall back to tmux or SQLite.
 	Seeded bool
+}
+
+// assemble builds the model value and produces the first ranked list. Split out
+// so the profiler can time it as one stage of a single pass instead of repeating
+// the whole construction — and so there remains exactly one place where this
+// struct is populated.
+func assemble(cfg *config.Config, d Deps, createName, createCwd string,
+	cache *sourceCache, srcs []Source, bySrc map[Source][]Item,
+	env Context, stickyLabel string) model {
+
+	tmpl := stickyLabel
+	if tmpl == "" && d.Store != nil {
+		tmpl = template.StickyLabel(d.Store)
+	}
+	m := model{
+		sources:    srcs,
+		bySrc:      bySrc,
+		cache:      cache,
+		ctl:        d.Ctl,
+		store:      d.Store,
+		openStore:  d.OpenStore,
+		cfg:        cfg,
+		tmpl:       tmpl,
+		env:        env,
+		createName: createName,
+		createCwd:  createCwd,
+		sessID:     d.SessionID,
+		ui: viewModel{
+			queryInput: initInput(),
+			helpModel:  help.New(),
+			maxShow:    maxShow(cfg),
+			started:    time.Now(),
+		},
+	}
+	m.refilter()
+	return m
 }
 
 // newModelCore is the single construction path. Both NewModel and
@@ -235,7 +276,7 @@ func newModelCore(cfg *config.Config, d Deps, createName, createCwd string, seed
 	if seed.Env != nil {
 		env = *seed.Env
 	} else {
-		env = newContext(d.Ctl, d.Store)
+		env = newContext(d.Ctl, d.Store, cache.tmuxSnap, d.SessionID)
 	}
 	// Co-occurrence is meaningless without a current session. The guard lived
 	// only in newContext, so the daemon path — which built Context by hand in
@@ -248,31 +289,7 @@ func newModelCore(cfg *config.Config, d Deps, createName, createCwd string, seed
 	}
 	applyRankMeta(bySrc, d.Store, env)
 
-	tmpl := seed.StickyLabel
-	if tmpl == "" && d.Store != nil {
-		tmpl = template.StickyLabel(d.Store)
-	}
-
-	m := model{
-		sources:    srcs,
-		bySrc:      bySrc,
-		cache:      cache,
-		ctl:        d.Ctl,
-		store:      d.Store,
-		openStore:  d.OpenStore,
-		cfg:        cfg,
-		tmpl:       tmpl,
-		env:        env,
-		createName: createName,
-		createCwd:  createCwd,
-		ui: viewModel{
-			queryInput: initInput(),
-			helpModel:  help.New(),
-			maxShow:    maxShow(cfg),
-			started:    time.Now(),
-		},
-	}
-	m.refilter()
+	m := assemble(cfg, d, createName, createCwd, cache, srcs, bySrc, env, seed.StickyLabel)
 	if !seed.Seeded {
 		// Fill git labels for the rows about to be shown, so the first paint is
 		// visually complete. This is safe to do after ranking because GitBranch is
@@ -334,7 +351,8 @@ func NewModelFromDaemon(cfg *config.Config, d Deps, createName, createCwd string
 
 // NewModel builds the picker by reading everything locally.
 func NewModel(cfg *config.Config, ctl tmux.Connector, st store.Storer, createName, createCwd string) model {
-	return newModelCore(cfg, Deps{Ctl: ctl, Store: st}, createName, createCwd, Seed{})
+	d := Deps{Ctl: ctl, Store: st, SessionID: tmux.CurrentSessionID()}
+	return newModelCore(cfg, d, createName, createCwd, Seed{})
 }
 
 // liveNames returns the live session names already held in the source cache. No
@@ -667,7 +685,7 @@ func (m *model) reload() {
 	m.cache.invalidate()
 	m.sources = defaultSources(m.ctl, st, m.createName, m.createCwd, m.cache)
 	m.bySrc = snapshotAll(m.sources)
-	m.env = newContext(m.ctl, st)
+	m.env = newContext(m.ctl, st, m.cache.tmuxSnap, m.sessID)
 	applyRankMeta(m.bySrc, st, m.env)
 	enrichAllSyncWith(m.bySrc, gitConc(m.cfg))
 	m.refilter()

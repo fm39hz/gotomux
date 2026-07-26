@@ -129,7 +129,18 @@ Documented in the header comment of `internal/template/edit.go` (`Format`/`Parse
 
 `Source` = `Snapshot()` (paint) + `Refresh()` (background `tea.Cmd`) + `FlattenFilter(query)` (per-source cap / hide-when-typing). Order, dedup first-wins by name *and* normalized path: create → tmux → preset → zoxide. Create hides itself once a query is typed; zoxide caps at `ZoxideCap` (40) only when the query is empty.
 
-Ranking (`internal/picker/score.go`) is a **tiered tuple sort**, not a score sum: `tier > recency > cooccur > kind > detail > busy > pathQ > idx`. Frecency comes from the `usage` table (day-decayed opens minus kill penalty, pure integer math). Multi-token queries AND together: tier = worst token's tier, detail = sum. Matching folds diacritics (Vietnamese `đ`→`d`) and splits labels on delimiters plus CamelCase/acronym boundaries.
+#### Cold start — where the time actually goes (measured, do not re-derive)
+
+Measured with `hyperfine` on ~300 zoxide entries. `gotomux -p` profiles the **standalone** path only; it never consults the daemon.
+
+- **The zoxide cache is keyed by content, not by age.** Deriving rows from raw paths costs ~0.9ms *per path* — `project.Session` → `FindProjectRoot` walks up stat-ing for project markers, ~10k `stat()` calls for a 300-entry list, ~270ms cold — plus ~50ms for the `zoxide query -l` fork itself. A 30s time-based expiry used to discard the already-derived rows in `zox_item`, so **almost every invocation paid ~340ms** (30s is shorter than the gap between two picker opens). Now: `zox_meta.sig` stores `zoxide.Signature(paths)`; the paint serves persisted rows regardless of age, and the background `Refresh` re-derives only when the path list actually changed. The one remaining synchronous rebuild is an empty `zox_item`, i.e. genuinely the first run ever. Do not reintroduce an age-based expiry.
+- **Deriving the ranking context must not fork.** `newContext` used to call `CurrentSession` + `CurrentSessionPath` — two tmux forks, ~5.5ms, roughly half the standalone construction — for data already available: `$TMUX`'s third field is the session index and `LiveSession.ID` carries `#{session_id}`. It now resolves from the live list already fetched, with `CurrentContext` (one fork) only as a fallback. The session id enters through `Deps.SessionID` so nothing deep in the package reads the environment.
+- **Binary size is not a lever.** `modernc.org/sqlite` is +4.3 MB of the 9.7 MB CLI, but demand paging never reads unused pages: cold `gotomux -v` is 5ms against 3ms for a 1.6 MB binary. Removing sqlite from the CLI would buy ~2ms and cost a large refactor.
+- **The daemon must checkpoint the WAL.** It holds the connection open for its whole life, so SQLite never gets the last-connection-close that normally checkpoints; the WAL was observed at 1.3 MB against a 124 KB database, and every client read walks the WAL index. `store.Checkpoint()` (PASSIVE) runs on the 60s zoxide cadence — often, so it stays cheap.
+
+Current numbers: standalone ~13ms warm, ~16ms after an idle gap; startup alone (`-v`) ~5ms; IPC round trip ~1.2ms for a 45 KB payload; building the model from a payload ~150µs.
+
+Ranking (`internal/picker/score.go`) is a **tiered tuple sort**, not a score sum: `tier > recency > cooccur > kind > detail > pathQ > idx`. Frecency comes from the `usage` table (day-decayed opens minus kill penalty, pure integer math). Multi-token queries AND together: tier = worst token's tier, detail = sum. Matching folds diacritics (Vietnamese `đ`→`d`) and splits labels on delimiters plus CamelCase/acronym boundaries.
 
 Inside tmux (`Context.Session` set), items matching the current session name or path are dropped and co-occurrence scores from the `pair` table apply. Outside tmux, everything is visible and cooccur is 0. Same algorithm either way — only the inputs change.
 

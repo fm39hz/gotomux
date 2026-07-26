@@ -99,15 +99,42 @@ func runPicker(cfg *config.Config) error {
 	return runPickerStandalone(cfg)
 }
 
-// spawnDaemon launches gotomuxd detached and does not wait for it.
+// spawnDaemon starts the daemon without waiting for it.
 //
-// Racing invocations are harmless: the daemon's own flock plus its stale-socket
-// guard mean the second instance exits cleanly on its own. Set
-// GOTOMUX_NO_AUTOSTART=1 to opt out.
+// It asks systemd first when the unit is installed. Forking directly would create
+// an instance systemd does not know about, which then holds the single-instance
+// flock — so `systemctl restart gotomuxd` could never acquire it, and with
+// Restart=on-failure the unit relaunched in a loop. That happened; the raw fork is
+// now only the fallback for machines with no user unit.
+//
+// Racing invocations are harmless either way: the loser sees ErrAlreadyRunning and
+// exits zero. Set GOTOMUX_NO_AUTOSTART=1 to opt out entirely.
 func spawnDaemon() {
 	if os.Getenv("GOTOMUX_NO_AUTOSTART") != "" {
 		return
 	}
+	if startViaSystemd() {
+		return
+	}
+	spawnDaemonDirect()
+}
+
+// startViaSystemd reports whether it handed the job to the user's service manager.
+func startViaSystemd() bool {
+	sctl, err := exec.LookPath("systemctl")
+	if err != nil {
+		return false
+	}
+	// Only if the unit actually exists; otherwise `start` fails and we would have
+	// silently done nothing.
+	if out, err := exec.Command(sctl, "--user", "list-unit-files", "gotomuxd.service").Output(); err != nil ||
+		!strings.Contains(string(out), "gotomuxd.service") {
+		return false
+	}
+	return exec.Command(sctl, "--user", "start", "--no-block", "gotomuxd.service").Run() == nil
+}
+
+func spawnDaemonDirect() {
 	bin, err := exec.LookPath("gotomuxd")
 	if err != nil {
 		// Fall back to a sibling of this binary, which is how it is laid out both

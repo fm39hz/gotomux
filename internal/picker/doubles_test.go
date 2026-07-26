@@ -23,6 +23,7 @@ type countingStore struct {
 	usage   map[string]store.Usage
 	pairs   map[string]int64
 	zox     []store.ZoxRow
+	zoxSig  string
 
 	listMeta   int
 	allUsage   int
@@ -52,17 +53,17 @@ func (s *countingStore) PairScores(session string, now int64) (map[string]int64,
 	return s.pairs, nil
 }
 
-func (s *countingStore) LoadZox() ([]store.ZoxRow, int64, bool) {
+func (s *countingStore) LoadZox() ([]store.ZoxRow, int64, string, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.loadZox++
 	if len(s.zox) == 0 {
-		return nil, 0, false
+		return nil, 0, "", false
 	}
-	return s.zox, 0, true
+	return s.zox, 0, s.zoxSig, true
 }
 
-func (s *countingStore) SaveZox(rows []store.ZoxRow) error { return nil }
+func (s *countingStore) SaveZox(rows []store.ZoxRow, sig string) error { return nil }
 
 // StickyID returning "" short-circuits template.StickyLabel to "default" without
 // touching the shape tables.
@@ -92,6 +93,7 @@ type countingConnector struct {
 	listLive       int
 	currentSession int
 	currentPath    int
+	currentCtx     int
 }
 
 func (c *countingConnector) ListLive(ctx context.Context) ([]tmux.LiveSession, error) {
@@ -115,8 +117,15 @@ func (c *countingConnector) CurrentSessionPath(ctx context.Context) string {
 	return c.path
 }
 
+func (c *countingConnector) CurrentContext(ctx context.Context) (string, string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.currentCtx++
+	return c.session, c.path
+}
+
 func (c *countingConnector) calls() int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.listLive + c.currentSession + c.currentPath
+	return c.listLive + c.currentSession + c.currentPath + c.currentCtx
 }

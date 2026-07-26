@@ -48,7 +48,16 @@ func main() {
 	}
 
 	d.Close()
-	if err != nil && !errors.Is(err, net.ErrClosed) {
+	switch {
+	case err == nil, errors.Is(err, net.ErrClosed):
+		// Clean shutdown.
+	case errors.Is(err, daemon.ErrAlreadyRunning):
+		// Another instance is serving, so there is nothing to do and nothing has
+		// gone wrong. Exiting zero matters: with Restart=on-failure, treating this
+		// as an error makes systemd relaunch forever against a lock it can never
+		// take.
+		log.Printf("%v — exiting; the existing instance keeps serving", err)
+	default:
 		log.Fatal(err)
 	}
 }

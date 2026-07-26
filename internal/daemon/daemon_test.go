@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"encoding/json"
+	"errors"
 	"net"
 	"os"
 	"os/exec"
@@ -290,4 +291,75 @@ func TestDaemonAttachesToAnExistingServer(t *testing.T) {
 		time.Sleep(100 * time.Millisecond)
 	}
 	t.Fatal("daemon never attached to the server that appeared after it started")
+}
+
+// TestPrewarmPathsAreRealFiles: the list must contain only existing regular
+// files, deduped through symlinks — a bad entry would just waste a syscall, but a
+// duplicated 9.7 MB binary would double the I/O this is meant to minimise.
+func TestPrewarmPathsAreRealFiles(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("GOTOMUX_DATA_DIR", dir)
+	paths := prewarmPaths(config.Load())
+
+	seen := map[string]bool{}
+	for _, p := range paths {
+		fi, err := os.Stat(p)
+		if err != nil {
+			t.Errorf("prewarm path %q does not exist", p)
+			continue
+		}
+		if fi.IsDir() {
+			t.Errorf("prewarm path %q is a directory", p)
+		}
+		if seen[p] {
+			t.Errorf("duplicate prewarm path %q", p)
+		}
+		seen[p] = true
+	}
+}
+
+func TestPrewarmRespectsOptOut(t *testing.T) {
+	t.Setenv("GOTOMUX_NO_PREWARM", "1")
+	// Must return promptly without touching anything; the assertion is that it does
+	// not panic or block.
+	done := make(chan struct{})
+	go func() { prewarm(config.Load()); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("prewarm ignored GOTOMUX_NO_PREWARM")
+	}
+}
+
+// TestAlreadyRunningIsNotAFailure: a second instance must report
+// ErrAlreadyRunning so main can exit zero. Returning a plain error made systemd
+// (Restart=on-failure) relaunch the unit forever against a lock held by an
+// autostarted instance — observed at restart counter 8.
+func TestAlreadyRunningIsNotAFailure(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("XDG_RUNTIME_DIR", dir)
+
+	sock := filepath.Join(dir, "gotomux.sock")
+	unlock, err := acquireLock(sock)
+	if err != nil {
+		t.Fatalf("first acquireLock: %v", err)
+	}
+	defer unlock()
+
+	// Same process cannot re-take its own flock via a second fd on Linux? It can,
+	// so assert the classification path instead: the error a second holder gets
+	// must be recognisable.
+	if _, err := acquireLock(sock); err != nil && !errors.Is(err, ErrAlreadyRunning) {
+		t.Errorf("second acquireLock error = %v; must wrap ErrAlreadyRunning", err)
+	}
+
+	// And a live listener must produce the same classification.
+	l, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer l.Close()
+	if _, err := listenWithGuard(sock); !errors.Is(err, ErrAlreadyRunning) {
+		t.Errorf("listenWithGuard against a live socket = %v; must wrap ErrAlreadyRunning", err)
+	}
 }

@@ -82,3 +82,25 @@ func TestSplitLines(t *testing.T) {
 		}
 	}
 }
+
+func TestSignature(t *testing.T) {
+	a := []string{"/x", "/y", "/z"}
+	if Signature(a) != Signature([]string{"/x", "/y", "/z"}) {
+		t.Error("same list gave different signatures")
+	}
+	// Order is part of the identity: Rows derives Recency from position, so a
+	// reordered list is a genuinely different result.
+	if Signature(a) == Signature([]string{"/y", "/x", "/z"}) {
+		t.Error("reordered list gave the same signature")
+	}
+	if Signature(a) == Signature([]string{"/x", "/y"}) {
+		t.Error("shorter list gave the same signature")
+	}
+	if Signature(nil) != Signature([]string{}) {
+		t.Error("nil and empty disagree")
+	}
+	// Must not be confusable by concatenation ("/a"+"/b" vs "/a/b").
+	if Signature([]string{"/a", "/b"}) == Signature([]string{"/a/b"}) {
+		t.Error("delimiter collision")
+	}
+}

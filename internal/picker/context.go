@@ -19,11 +19,29 @@ type Context struct {
 	Now     int64
 }
 
-func newContext(ctl tmux.Connector, st store.Storer) Context {
+// newContext derives the ranking context.
+//
+// live is the session list already fetched for the picker. Resolving our own
+// session out of it costs nothing: $TMUX carries the session index and
+// LiveSession.ID carries #{session_id}. This used to call CurrentSession and
+// CurrentSessionPath — two tmux forks, ~5.5ms, about half the standalone
+// construction cost — for data that was already in hand. It also makes standalone
+// derive the context exactly the way the daemon path does.
+//
+// The fork remains only as a fallback for when the id is not in the list (the
+// list read failed, or we are attached to a session the picker filters out).
+//
+// sessID is passed in rather than read from $TMUX here: the environment is read
+// once at the edge (Deps.SessionID), which keeps this function testable and keeps
+// env access out of the middle of the package.
+func newContext(ctl tmux.Connector, st store.Storer, live []tmux.LiveSession, sessID string) Context {
 	ctx := Context{Now: time.Now().Unix()}
-	if ctl != nil {
-		ctx.Session = ctl.CurrentSession(context.Background())
-		ctx.Path = ctl.CurrentSessionPath(context.Background())
+	if sessID != "" {
+		if cur, ok := tmux.FindByID(live, sessID); ok {
+			ctx.Session, ctx.Path = cur.Name, cur.Path
+		} else if ctl != nil {
+			ctx.Session, ctx.Path = ctl.CurrentContext(context.Background())
+		}
 	}
 	if st != nil {
 		// Usage is unconditional. It used to share the Session != "" guard with

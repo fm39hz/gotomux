@@ -8,6 +8,7 @@ import (
 	"github.com/fm39hz/gotomux/internal/config"
 	"github.com/fm39hz/gotomux/internal/store"
 	"github.com/fm39hz/gotomux/internal/tmux"
+	"github.com/fm39hz/gotomux/internal/zoxide"
 )
 
 // fixture is one set of inputs, used to drive BOTH run modes: read locally in one
@@ -75,12 +76,13 @@ func TestPathParity(t *testing.T) {
 
 	for _, tc := range []struct {
 		name    string
+		sessID  string
 		session string
 		path    string
 		pairs   map[string]int64
 	}{
 		{name: "outside tmux"},
-		{name: "inside tmux", session: "alpha", path: "/w/alpha",
+		{name: "inside tmux", sessID: "$0", session: "alpha", path: "/w/alpha",
 			pairs: map[string]int64{"beta": 500, "gamma": 200}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -90,7 +92,10 @@ func TestPathParity(t *testing.T) {
 			ctlA, stA := f.doubles()
 			stA.pairs = tc.pairs
 			ctlA.session, ctlA.path = tc.session, tc.path
-			local := newModelCore(cfg, Deps{Ctl: ctlA, Store: stA}, "newproj", "/w/newproj", Seed{})
+			// SessionID rather than $TMUX: the fixture decides which session we are
+			// "in", so the test result does not depend on where it runs.
+			local := newModelCore(cfg, Deps{Ctl: ctlA, Store: stA, SessionID: tc.sessID},
+				"newproj", "/w/newproj", Seed{})
 
 			// Daemon path: identical data, handed over instead of read.
 			ctlB, stB := f.doubles()
@@ -261,5 +266,76 @@ func TestSeededZoxideNeverExecs(t *testing.T) {
 	}
 	if cache.zoxSt != nil {
 		t.Error("seeded zoxide source should not have acquired a store")
+	}
+}
+
+// TestZoxideSnapshotServesStaleRows pins the cold-start fix.
+//
+// Rows persisted in zox_item used to be discarded once older than 30 seconds,
+// which forced a full `zoxide query -l` (≈50ms) plus re-deriving a project root
+// per path (≈0.9ms each, ≈270ms for 300 entries) on essentially every invocation,
+// because 30s is shorter than the gap between two picker opens. Age must not gate
+// the paint; only an empty cache may trigger a synchronous rebuild.
+func TestZoxideSnapshotServesStaleRows(t *testing.T) {
+	st := &countingStore{
+		zox: []store.ZoxRow{
+			{Name: "old1", Path: "/o1", Recency: 2},
+			{Name: "old2", Path: "/o2", Recency: 1},
+		},
+		zoxSig: "sig-abc",
+	}
+	// zoxAt far in the past; zoxMem empty so the store is consulted.
+	cache := &sourceCache{zoxMu: &sync.Mutex{}, zoxSt: st, zoxAt: time.Now().Add(-24 * time.Hour)}
+	src := &zoxideSource{cache: cache}
+
+	got := src.Snapshot()
+	if len(got) != 2 {
+		t.Fatalf("Snapshot = %d items, want 2 — stale rows were discarded", len(got))
+	}
+	if got[0].Name != "old1" || got[1].Name != "old2" {
+		t.Errorf("Snapshot returned %v, not the persisted rows", itemNames(got))
+	}
+	if st.loadZox != 1 {
+		t.Errorf("LoadZox called %d times, want exactly 1", st.loadZox)
+	}
+	if cache.zoxSig != "sig-abc" {
+		t.Errorf("signature not carried into the cache: %q", cache.zoxSig)
+	}
+}
+
+// TestValidateSkipsDerivationOnSameSignature: the background validator must not
+// re-derive when the zoxide list is unchanged, and must report "no change" so the
+// view is never repainted — and therefore never reordered — for nothing.
+func TestValidateSkipsDerivationOnSameSignature(t *testing.T) {
+	paths := []string{"/p/one", "/p/two", "/p/three"}
+	sig := zoxide.Signature(paths)
+	original := []Item{{Name: "one", Path: "/p/one"}}
+
+	cache := &sourceCache{
+		zoxMu:  &sync.Mutex{},
+		zoxMem: original,
+		zoxSig: sig,
+		zoxAt:  time.Now().Add(-time.Hour),
+	}
+
+	got := validateZoxItems(cache, sig, paths)
+	if got != nil {
+		t.Errorf("matching signature returned %d items; want nil so the caller skips the repaint", len(got))
+	}
+	if len(cache.zoxMem) != 1 || cache.zoxMem[0].Name != "one" {
+		t.Errorf("rows were re-derived despite an unchanged list: %v", itemNames(cache.zoxMem))
+	}
+	if time.Since(cache.zoxAt) > time.Minute {
+		t.Error("freshness stamp not bumped; the validator would re-run on every keystroke cycle")
+	}
+
+	// A changed list must be re-derived. These paths do not exist, so Rows yields
+	// whatever FindProjectRoot returns for them — the point is that it ran.
+	changed := append(paths, "/p/four")
+	if got := validateZoxItems(cache, sig, changed); got == nil {
+		t.Error("changed list returned nil; the new entry would never appear")
+	}
+	if cache.zoxSig == sig {
+		t.Error("signature not updated after re-derivation")
 	}
 }

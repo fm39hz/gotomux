@@ -14,22 +14,27 @@ type ZoxRow struct {
 	Recency int64  `json:"recency,omitempty"`
 }
 
-// LoadZox returns cached zoxide rows and cache age (unix updated).
-func (s *Store) LoadZox() (rows []ZoxRow, updated int64, ok bool) {
+// LoadZox returns the cached rows, when they were written, and the signature of
+// the raw zoxide path list they were derived from.
+//
+// sig lets a caller decide whether re-deriving is necessary without paying for it:
+// see zoxide.Signature.
+func (s *Store) LoadZox() (rows []ZoxRow, updated int64, sig string, ok bool) {
 	var upd int64
-	err := s.db.QueryRow(`SELECT updated FROM zox_meta WHERE id = 1`).Scan(&upd)
+	var sg string
+	err := s.db.QueryRow(`SELECT updated, COALESCE(sig, '') FROM zox_meta WHERE id = 1`).Scan(&upd, &sg)
 	if err != nil {
-		return nil, 0, false
+		return nil, 0, "", false
 	}
 	q, err := s.db.Query(`SELECT name, path, title, desc, recency FROM zox_item ORDER BY ord`)
 	if err != nil {
-		return nil, 0, false
+		return nil, 0, "", false
 	}
 	defer q.Close()
 	for q.Next() {
 		var r ZoxRow
 		if err := q.Scan(&r.Name, &r.Path, &r.Title, &r.Desc, &r.Recency); err != nil {
-			return nil, 0, false
+			return nil, 0, "", false
 		}
 		if r.Name == "" {
 			continue
@@ -40,13 +45,14 @@ func (s *Store) LoadZox() (rows []ZoxRow, updated int64, ok bool) {
 		rows = append(rows, r)
 	}
 	if err := q.Err(); err != nil || len(rows) == 0 {
-		return nil, 0, false
+		return nil, 0, "", false
 	}
-	return rows, upd, true
+	return rows, upd, sg, true
 }
 
-// SaveZox replaces the zoxide cache in one transaction.
-func (s *Store) SaveZox(rows []ZoxRow) error {
+// SaveZox replaces the zoxide cache in one transaction. sig is the signature of
+// the path list the rows came from.
+func (s *Store) SaveZox(rows []ZoxRow, sig string) error {
 	tx, err := s.db.Begin()
 	if err != nil {
 		return err
@@ -57,9 +63,9 @@ func (s *Store) SaveZox(rows []ZoxRow) error {
 	}
 	now := time.Now().Unix()
 	if _, err := tx.Exec(`
-INSERT INTO zox_meta(id, updated) VALUES(1, ?)
-ON CONFLICT(id) DO UPDATE SET updated = excluded.updated
-`, now); err != nil {
+INSERT INTO zox_meta(id, updated, sig) VALUES(1, ?, ?)
+ON CONFLICT(id) DO UPDATE SET updated = excluded.updated, sig = excluded.sig
+`, now, sig); err != nil {
 		return err
 	}
 	for i, r := range rows {

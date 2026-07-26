@@ -13,6 +13,7 @@ import (
 	"github.com/fm39hz/gotomux/internal/store"
 	"github.com/fm39hz/gotomux/internal/tmux"
 	"github.com/fm39hz/gotomux/internal/toolclass"
+	"github.com/fm39hz/gotomux/internal/zoxide"
 )
 
 // FlattenFilter controls how flattenSources processes items from this source.
@@ -48,6 +49,7 @@ type sourceCache struct {
 	presetDone atomic.Bool
 	zoxMem     []Item
 	zoxAt      time.Time
+	zoxSig     string
 	zoxMu      *sync.Mutex
 	zoxSt      store.Storer
 	zoxCap     int
@@ -193,28 +195,24 @@ type zoxideSource struct {
 	cache *sourceCache
 }
 
-const zoxCacheMaxAge = 30 * time.Second
+// zoxRevalidate is how long the persisted rows are served before the background
+// validator bothers re-querying zoxide. It is NOT an expiry: rows older than this
+// are still painted immediately, they are just checked afterwards.
+const zoxRevalidate = 30 * time.Second
 
 func (s *zoxideSource) Snapshot() []Item {
-	items, age, ok := loadZoxItemsSync(s.cache)
-	if ok && age > zoxCacheMaxAge {
-		s.cache.zoxMu.Lock()
-		s.cache.zoxMem = nil
-		s.cache.zoxMu.Unlock()
-		ok = false
-	}
+	items, _, _, ok := loadZoxItemsSync(s.cache)
 	if !ok {
 		if s.cache.seeded {
 			// The daemon owns zoxide in this mode; never exec from the hot path.
 			return nil
 		}
-		// Cold or stale cache: query zoxide synchronously so the FIRST paint is
-		// already complete. snapshotAll runs sources concurrently, so this
-		// overlaps the tmux and preset reads rather than adding to them.
+		// Nothing persisted yet — a genuinely first-ever run. Query synchronously so
+		// even that first paint is complete, and accept the one-time ~340ms.
 		//
-		// The query used to happen only in Refresh, which meant the very first run
-		// on a machine painted with zero zoxide rows and then reordered the list
-		// under the user a moment later.
+		// This is the ONLY synchronous rebuild. It used to also fire whenever the
+		// cache was older than 30s, which in practice meant almost every
+		// invocation paid the full query plus a re-derivation of every path.
 		items = rebuildZoxItems(s.cache)
 		if len(items) == 0 {
 			return nil
@@ -240,16 +238,28 @@ func (s *zoxideSource) FlattenFilter(query string) FlattenFilter {
 	return FlattenFilter{Cap: s.cache.cap()}
 }
 
+// Refresh validates the painted rows in the background.
+//
+// It re-queries zoxide off the render path and re-derives only if the path list
+// changed, so the common case costs one fork and a string compare instead of
+// ~270ms of project-root resolution. Returning nil items means "nothing changed",
+// and Update skips the repaint — so an unchanged list never reorders the view
+// under the user.
 func (s *zoxideSource) Refresh() tea.Cmd {
+	if s.cache.seeded {
+		// The daemon revalidates on its own schedule; the client must not fork.
+		return nil
+	}
 	src := Source(s)
 	return func() tea.Msg {
 		s.cache.zoxMu.Lock()
-		recent := len(s.cache.zoxMem) > 0 && time.Since(s.cache.zoxAt) < 30*time.Second
+		fresh := len(s.cache.zoxMem) > 0 && time.Since(s.cache.zoxAt) < zoxRevalidate
+		sig := s.cache.zoxSig
 		s.cache.zoxMu.Unlock()
-		if recent {
+		if fresh {
 			return nil
 		}
-		return sourceMsg{src: src, items: rebuildZoxItems(s.cache)}
+		return sourceMsg{src: src, items: validateZoxItems(s.cache, sig, zoxide.Query())}
 	}
 }
 

@@ -128,6 +128,9 @@ func New(cfg *config.Config) (*Daemon, error) {
 	d.wg.Add(2)
 	go d.pollLoop()
 	go d.watchEvents()
+	// Off the startup path: this is bulk I/O whose only purpose is to be finished
+	// before the user's first picker open, not before the socket is bound.
+	go prewarm(cfg)
 	return d, nil
 }
 
@@ -430,16 +433,40 @@ func (d *Daemon) recordTelemetry(name string, all []tmux.LiveSession) {
 // path, and time.Now() as recency — three divergences from the picker, the last
 // of which put every directory ahead of every live session in the ranking.
 func (d *Daemon) syncZoxide() {
-	rows := zoxide.Rows(zoxide.Query())
-	if len(rows) == 0 {
+	paths := zoxide.Query()
+	if len(paths) == 0 {
 		return
 	}
+	sig := zoxide.Signature(paths)
 
 	d.stMu.Lock()
 	st := d.st
 	d.stMu.Unlock()
+
+	// Deriving rows resolves a project root per path — ~0.9ms each, ~270ms for a
+	// 300-entry list. Skip it entirely when the path list has not changed, which is
+	// the common case for a 60s refresh cycle.
 	if st != nil {
-		_ = st.SaveZox(rows)
+		if cached, _, storedSig, ok := st.LoadZox(); ok && storedSig == sig {
+			d.cacheMu.Lock()
+			same := len(d.cachedZoxide) == len(cached)
+			if !same {
+				d.cachedZoxide = cached
+			}
+			d.cacheMu.Unlock()
+			if !same {
+				d.stateVersion.Add(1)
+			}
+			return
+		}
+	}
+
+	rows := zoxide.Rows(paths)
+	if len(rows) == 0 {
+		return
+	}
+	if st != nil {
+		_ = st.SaveZox(rows, sig)
 	}
 
 	d.cacheMu.Lock()
@@ -463,6 +490,19 @@ func (d *Daemon) prune() {
 	d.stMu.Unlock()
 	if st != nil {
 		st.Prune()
+	}
+}
+
+// checkpoint folds the WAL back into the DB. Runs on the zoxide cadence, not the
+// prune cadence: a PASSIVE checkpoint on a small WAL is sub-millisecond, and doing
+// it often is what keeps the WAL small — letting it grow for an hour is what makes
+// the eventual checkpoint expensive and every client read slower in the meantime.
+func (d *Daemon) checkpoint() {
+	d.stMu.Lock()
+	st := d.st
+	d.stMu.Unlock()
+	if st != nil {
+		st.Checkpoint()
 	}
 }
 
@@ -490,6 +530,7 @@ func (d *Daemon) pollLoop() {
 			if time.Since(lastZox) >= zoxideRefresh {
 				lastZox = time.Now()
 				d.syncZoxide()
+				d.checkpoint()
 			}
 			if time.Since(lastPrune) >= pruneEvery {
 				lastPrune = time.Now()
