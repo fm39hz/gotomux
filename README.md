@@ -193,14 +193,14 @@ make help && make test
 
 ## Acknowledgements
 
-[tmux](https://github.com/tmux/tmux): Obviously, what do you expect?
-[zoxide](https://github.com/ajeetdsouza/zoxide): Smart directory jump
-[Bubble Tea](https://github.com/charmbracelet/bubbletea): TUI library
-[fzf](https://github.com/junegunn/fzf): Fuzzy match core engine
-[modernc sqlite](https://gitlab.com/cznic/sqlite): Go version of Sqlite
-[gopsutil](https://github.com/shirou/gopsutil): psutil for Go
-[projectdetect](https://github.com/richardwooding/projectdetect): Detect project type
-[go-devicons](https://github.com/epilande/go-devicons): Nerd font icon
+- [tmux](https://github.com/tmux/tmux): Obviously, what do you expect?
+- [zoxide](https://github.com/ajeetdsouza/zoxide): Smart directory jump
+- [Bubble Tea](https://github.com/charmbracelet/bubbletea): TUI library
+- [fzf](https://github.com/junegunn/fzf): Fuzzy match core engine
+- [modernc sqlite](https://gitlab.com/cznic/sqlite): Go version of Sqlite
+- [gopsutil](https://github.com/shirou/gopsutil): psutil for Go
+- [projectdetect](https://github.com/richardwooding/projectdetect): Detect project type
+- [go-devicons](https://github.com/epilande/go-devicons): Nerd font icon
 
 ## License
 
