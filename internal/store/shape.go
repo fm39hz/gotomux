@@ -193,12 +193,39 @@ func (s *Store) GetShapeByKey(key string) (id, body string, ok bool) {
 }
 
 // GetShapeMeta returns body + updated_at for merge decisions.
-func (s *Store) GetShapeMeta(id string) (body string, updated int64, ok bool) {
+// ShapeMeta is a shape row plus the state of its config-dir mirror.
+//
+// MirrorSig is the signature of the body last written to MirrorPath. It is what
+// lets the mirror tell "the user edited this file" from "the DB moved on" — a
+// distinction timestamps cannot make, because both sides have one-second
+// resolution and a freeze writes the row and the file within the same second.
+type ShapeMeta struct {
+	Body       string
+	UpdatedAt  int64
+	MirrorPath string
+	MirrorSig  string
+}
+
+func (s *Store) GetShapeMeta(id string) (ShapeMeta, bool) {
 	if id == "" {
-		return "", 0, false
+		return ShapeMeta{}, false
 	}
-	err := s.db.QueryRow(`SELECT body, COALESCE(updated_at, created_at, 0) FROM shape WHERE id = ?`, id).Scan(&body, &updated)
-	return body, updated, err == nil && body != ""
+	var m ShapeMeta
+	err := s.db.QueryRow(`
+SELECT body, COALESCE(updated_at, created_at, 0),
+       COALESCE(mirror_path, ''), COALESCE(mirror_sig, '')
+FROM shape WHERE id = ?`, id).Scan(&m.Body, &m.UpdatedAt, &m.MirrorPath, &m.MirrorSig)
+	return m, err == nil && m.Body != ""
+}
+
+// SetShapeMirror records which file this shape was mirrored to and the signature
+// of the body written there.
+func (s *Store) SetShapeMirror(id, path, sig string) error {
+	if id == "" {
+		return nil
+	}
+	_, err := s.db.Exec(`UPDATE shape SET mirror_path = ?, mirror_sig = ? WHERE id = ?`, path, sig, id)
+	return err
 }
 
 // GetShape returns body by id.

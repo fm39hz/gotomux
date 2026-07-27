@@ -38,7 +38,8 @@ type Storer interface {
 	RememberShapeOnly(shapeID, shapeKey, shapeBody string) (outID string, created bool, err error)
 	GetShape(id string) (body string, ok bool)
 	GetShapeByKey(key string) (id, body string, ok bool)
-	GetShapeMeta(id string) (body string, updated int64, ok bool)
+	GetShapeMeta(id string) (ShapeMeta, bool)
+	SetShapeMirror(id, path, sig string) error
 	PutShape(id, key, body string) (outID string, created bool, err error)
 	UpsertShapeByID(id, key, body string) error
 	ListShapes() ([]string, error)
@@ -235,7 +236,7 @@ func (s *Store) Ping() error {
 // The migration itself stays additive-only and idempotent — the fast path is an
 // optimisation, not a replacement, so a DB from a future version or one that
 // somehow lost user_version still gets the full run.
-const schemaVersion = 2
+const schemaVersion = 3
 
 func (s *Store) migrate() error {
 	var have int
@@ -327,7 +328,9 @@ CREATE TABLE IF NOT EXISTS shape (
   key        TEXT NOT NULL UNIQUE,
   body       TEXT NOT NULL,
   created_at INTEGER NOT NULL DEFAULT 0,
-  updated_at INTEGER NOT NULL DEFAULT 0
+  updated_at INTEGER NOT NULL DEFAULT 0,
+  mirror_path TEXT NOT NULL DEFAULT '',
+  mirror_sig  TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS sticky (
   id       INTEGER PRIMARY KEY CHECK (id = 1),
@@ -360,6 +363,17 @@ CREATE TABLE IF NOT EXISTS sticky (
 			return err
 		}
 	}
+	// Old DBs have shape without the mirror bookkeeping columns.
+	for _, col := range []string{"mirror_path", "mirror_sig"} {
+		var has int
+		_ = s.db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('shape') WHERE name = ?`, col).Scan(&has)
+		if has == 0 {
+			if _, err := s.db.Exec(`ALTER TABLE shape ADD COLUMN ` + col + ` TEXT NOT NULL DEFAULT ''`); err != nil {
+				return err
+			}
+		}
+	}
+
 	// Old DBs have zox_meta without sig.
 	var zoxHasSig int
 	_ = s.db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('zox_meta') WHERE name='sig'`).Scan(&zoxHasSig)

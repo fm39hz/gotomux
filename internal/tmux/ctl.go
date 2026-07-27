@@ -2,6 +2,7 @@ package tmux
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -80,13 +81,31 @@ func InferSplit(layout string, nPanes int) string {
 	return "even-horizontal"
 }
 
-// IsNoServerError checks if a tmux error means the server isn't running.
-// Callers can distinguish "no server" (cold start) from real failures.
+// IsNoServerError reports whether a tmux error means the server isn't running,
+// so callers can tell "nothing to list" from a real failure.
+//
+// It must inspect ExitError.Stderr, not just err.Error(). tmux writes "no server
+// running on …" to stderr, and exec.Cmd.Output() puts that in ExitError.Stderr
+// while err.Error() is only "exit status 1". Checking the message alone made this
+// function always return false on the ListLive path — so its `return nil, nil`
+// branch was dead code, and `gotomux -f` with no server reported
+// "tmux list: exit status 1" instead of "no active sessions".
 func IsNoServerError(err error) bool {
 	if err == nil {
 		return false
 	}
-	msg := strings.ToLower(err.Error())
+	if noServerText(err.Error()) {
+		return true
+	}
+	var ee *exec.ExitError
+	if errors.As(err, &ee) && noServerText(string(ee.Stderr)) {
+		return true
+	}
+	return false
+}
+
+func noServerText(s string) bool {
+	msg := strings.ToLower(s)
 	switch {
 	case strings.Contains(msg, "no server running"):
 		return true

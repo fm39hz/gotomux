@@ -9,7 +9,9 @@ permissions:
   contents: read
 
 jobs:
-  test:
+  # Fast gate with no external tools, which also proves the -short path really is
+  # self-contained.
+  unit:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -21,6 +23,41 @@ jobs:
       - name: vet
         run: go vet ./...
 
-      - name: test
-        # -short skips live-tmux load tests (no tmux server in CI)
+      - name: test (-short)
         run: go test ./... -count=1 -short
+
+  # The suite that actually exercises what this tool does.
+  #
+  # Running only -short meant CI never touched the control-mode transport, the
+  # daemon, or the regression guard against destroying the user's tmux sessions.
+  # Every one of those tests existed and none of them ran; a test that is never
+  # executed is documentation, not verification.
+  #
+  # Safe in CI for the same reason it is safe locally: tmuxtest.Isolate points tmux
+  # at a private socket directory and refuses to proceed unless it can prove the
+  # socket landed there.
+  integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: install tmux (and zoxide if available)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y tmux
+          tmux -V
+          # zoxide is optional at runtime; install it so the zoxide-backed paths are
+          # covered instead of silently no-oping.
+          sudo apt-get install -y zoxide || echo "zoxide unavailable; those paths no-op"
+
+      - name: test (full, race detector)
+        # The daemon runs a poll loop, an event watcher and a prewarm goroutine over
+        # shared caches; -race is where that gets checked.
+        run: go test ./... -count=1 -race
+
+      - name: test (transport + daemon, verbose)
+        run: go test ./internal/tmux/ ./internal/daemon/ -count=1 -v

@@ -184,75 +184,164 @@ func TestJSONRoundtrip(t *testing.T) {
 	}
 }
 
-func TestConfigHandEditWinsByMtime(t *testing.T) {
+// mirrorFileFor finds the mirror file whose body mentions id.
+func mirrorFileFor(t *testing.T, shapesDir, id string) string {
+	t.Helper()
+	ents, _ := os.ReadDir(shapesDir)
+	for _, e := range ents {
+		p := filepath.Join(shapesDir, e.Name())
+		raw, err := os.ReadFile(p)
+		if err == nil && strings.Contains(string(raw), id) {
+			return p
+		}
+	}
+	t.Fatalf("no mirror file for %s in %s", id, shapesDir)
+	return ""
+}
+
+// TestHandEditSurvivesSameSecondFreeze is the data-loss regression.
+//
+// Authorship used to be decided by `mtime > dbUpd`. Both sides are unix seconds and
+// a freeze writes the row and the mirror file inside the same second, so a tie was
+// the common case — and a tie meant "DB wins", which silently overwrote the edit.
+// Authorship is now decided by comparing the file against the signature of the body
+// we last wrote there, so timestamps do not participate at all.
+func TestHandEditSurvivesSameSecondFreeze(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("XDG_DATA_HOME", filepath.Join(dir, "data"))
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(dir, "cfg"))
+	shapes := filepath.Join(dir, "cfg", "gotomux", "shapes")
+
 	st, err := store.Open()
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer st.Close()
 
-	// create shape via freeze path
+	// Three windows so the shape is NOT the builtin default: ensureDefault rewrites
+	// "default" at the end of every sync, which would mask what is under test.
 	p := &model.Session{
 		Name: "s", Cwd: "/r",
 		Windows: []model.Window{
-			{Name: "main", Panes: []model.Pane{{}}},
-			{Name: "aux", Panes: []model.Pane{{Cwd: "x"}}},
+			{Name: "editor", Panes: []model.Pane{{Cmd: "nvim"}}},
+			{Name: "shell", Panes: []model.Pane{{}}},
+			{Name: "logs", Panes: []model.Pane{{Cwd: "logs"}}},
 		},
 	}
 	id, _, err := RememberShape(st, p)
-	if err != nil || id == "" {
-		t.Fatal(id, err)
+	if err != nil || id == "" || id == "default" {
+		t.Fatalf("RememberShape: %q %v (must be a distinct shape)", id, err)
 	}
-	// find mirrored file for id (label--suffix.json)
-	var path string
-	entsH, _ := os.ReadDir(filepath.Join(dir, "cfg", "gotomux", "shapes"))
-	for _, e := range entsH {
-		raw, _ := os.ReadFile(filepath.Join(dir, "cfg", "gotomux", "shapes", e.Name()))
-		if strings.Contains(string(raw), id) {
-			path = filepath.Join(dir, "cfg", "gotomux", "shapes", e.Name())
-			break
-		}
-	}
-	if path == "" {
-		// write new label-style path
-		path = filepath.Join(dir, "cfg", "gotomux", "shapes", "hand--test.json")
-	}
-	// hand-edit: add third window role name change in topology
+	path := mirrorFileFor(t, shapes, id)
+
+	// Hand edit: a fourth window.
 	hand := &model.Session{
 		Name: id,
 		Windows: []model.Window{
-			{Name: "main", Panes: []model.Pane{{}}},
-			{Name: "aux", Panes: []model.Pane{{Cwd: "x"}}},
+			{Name: "editor", Panes: []model.Pane{{Cmd: "nvim"}}},
+			{Name: "shell", Panes: []model.Pane{{}}},
+			{Name: "logs", Panes: []model.Pane{{Cwd: "logs"}}},
 			{Name: "extra", Panes: []model.Pane{{}}},
 		},
 	}
-	body := Format(ToShape(hand, id))
-	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+	edited := Format(ToShape(hand, id))
+	if err := os.WriteFile(path, []byte(edited), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	// bump mtime into the future relative to DB
-	future := time.Now().Add(2 * time.Second)
-	_ = os.Chtimes(path, future, future)
+	// Deliberately make the file look OLDER than the row: under the old rule this
+	// guaranteed the edit was discarded. It must now be imported regardless.
+	past := time.Now().Add(-time.Hour)
+	if err := os.Chtimes(path, past, past); err != nil {
+		t.Fatal(err)
+	}
 
-	// new store + new process sync: re-open DB same path but syncOnce already ran in this process.
-	// Call Upsert path by simulating merge rule unit-level:
-	fi, _ := os.Stat(path)
-	_, dbUpd, ok := st.GetShapeMeta(id)
+	syncConfigToDB(st)
+
+	got, ok := st.GetShape(id)
 	if !ok {
-		t.Fatal("meta")
+		t.Fatal("shape gone after sync")
 	}
-	if fi.ModTime().Unix() <= dbUpd {
-		t.Fatal("mtime should be newer")
-	}
-	pure := ToShape(hand, id)
-	_ = st.UpsertShapeByID(id, ShapeKey(pure), Format(pure))
-	got, _ := st.GetShape(id)
 	gp, err := Parse(got)
-	if err != nil || len(gp.Windows) != 3 {
-		t.Fatalf("hand-edit not in DB: %v %+v", err, gp)
+	if err != nil {
+		t.Fatalf("parse stored body: %v", err)
+	}
+	if len(gp.Windows) != 4 {
+		t.Errorf("hand edit not imported: DB has %d windows, want 4", len(gp.Windows))
+	}
+}
+
+// TestUntouchedMirrorDoesNotOverwriteDB: a file we wrote and nobody changed must
+// not be treated as an edit, or every reconcile would push the mirror back into the
+// DB and a genuine DB update could never win.
+func TestUntouchedMirrorDoesNotOverwriteDB(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("XDG_DATA_HOME", filepath.Join(dir, "data"))
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(dir, "cfg"))
+	shapes := filepath.Join(dir, "cfg", "gotomux", "shapes")
+
+	st, err := store.Open()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	p := &model.Session{
+		Name: "s", Cwd: "/r",
+		Windows: []model.Window{
+			{Name: "editor", Panes: []model.Pane{{Cmd: "nvim"}}},
+			{Name: "shell", Panes: []model.Pane{{}}},
+			{Name: "logs", Panes: []model.Pane{{Cwd: "logs"}}},
+		},
+	}
+	id, _, err := RememberShape(st, p)
+	if err != nil || id == "default" {
+		t.Fatalf("RememberShape: %q %v (must be a distinct shape)", id, err)
+	}
+	_ = mirrorFileFor(t, shapes, id)
+
+	before, _ := st.GetShape(id)
+	syncConfigToDB(st)
+	after, _ := st.GetShape(id)
+	if before != after {
+		t.Errorf("untouched mirror changed the DB body:\nbefore %q\nafter  %q", before, after)
+	}
+
+	meta, ok := st.GetShapeMeta(id)
+	if !ok || meta.MirrorSig == "" {
+		t.Error("mirror signature not recorded; authorship cannot be determined")
+	}
+	if meta.MirrorPath == "" {
+		t.Error("mirror path not recorded; a renamed label would leave a stale file")
+	}
+}
+
+// TestReconcileKeepsUnknownFiles: the sweep used to delete every *.json whose name
+// was not produced in the current pass, which removed hand-authored shapes the DB
+// had never seen — exactly what this directory exists to let you write.
+func TestReconcileKeepsUnknownFiles(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("XDG_DATA_HOME", filepath.Join(dir, "data"))
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(dir, "cfg"))
+	shapes := filepath.Join(dir, "cfg", "gotomux", "shapes")
+
+	st, err := store.Open()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	if err := os.MkdirAll(shapes, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	stray := filepath.Join(shapes, "my-own-notes--deadbeef.json")
+	if err := os.WriteFile(stray, []byte(`{"label":"mine","windows":[{"name":"shell","panes":[{}]}]}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	reconcileConfigShapes(st)
+
+	if _, err := os.Stat(stray); err != nil {
+		t.Errorf("hand-authored file was deleted by reconcile: %v", err)
 	}
 }
 

@@ -41,10 +41,14 @@ make install-all       # CLI + daemon + systemd unit + enable
 ## Usage
 
 ```bash
-gotomux             # interactive picker (auto-detect daemon)
-gotomux -f [name]   # freeze session
-gotomux -e [name]   # edit preset in $EDITOR
-gotomux -h          # show help
+Usage: gotomux [flags]
+
+Flags:
+  -h, --help     Show this help
+  -v, --version  Show version
+  -f, --freeze   Freeze current or named session as a preset
+  -e, --edit     Edit a named preset (or freeze-then-edit)
+  -p, --profile  Profile cold-start
 ```
 
 The picker opens instantly. Type to filter, Enter to connect.
@@ -94,9 +98,9 @@ $env.config.keybindings ++= [{
 ### Tmux popup
 
 ```tmux
-bind-key C-b display-popup -E -w 80% -h 70% "gotomux"
-bind-key C-e display-popup -E -w 90% -h 90% "gotomux -e"
-bind-key -n C-f run-shell "gotomux -f >/dev/null 2>&1; tmux display-message 'Froze #{session_name}'"
+bind-key C-b display-popup -T " Go to mux " -w 80% -h 70% -x C -y C -E "$HOME/go/bin/gotomux"
+bind-key C-e run-shell "$HOME/go/bin/gotomux -e"
+bind-key -n C-f run-shell "tmux display-message \"$($HOME/go/bin/gotomux -f)\""
 ```
 
 ## Behaviour

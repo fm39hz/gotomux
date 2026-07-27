@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/fm39hz/gotomux/internal/config"
@@ -37,6 +38,12 @@ const prewarmBudget = 30 * time.Second
 // Set GOTOMUX_NO_PREWARM=1 to skip.
 func prewarm(cfg *config.Config) {
 	if os.Getenv("GOTOMUX_NO_PREWARM") != "" {
+		return
+	}
+	// Only worth it on seek-bound storage. On an SSD the cold path is already
+	// milliseconds, so reading ~12 MB would be pure waste — of I/O, of page cache,
+	// and of battery on a laptop.
+	if !onRotationalDisk(cfg) {
 		return
 	}
 	deadline := time.Now().Add(prewarmBudget)
@@ -120,4 +127,56 @@ func readThrough(path string) int64 {
 		return 0
 	}
 	return n
+}
+
+// onRotationalDisk reports whether the store lives on a spinning disk.
+//
+// Determined from the block device backing the data dir via
+// /sys/block/<dev>/queue/rotational. Unknown answers count as "not rotational":
+// skipping a speculative optimisation is always safe, doing 12 MB of pointless I/O
+// on someone's SSD is not.
+func onRotationalDisk(cfg *config.Config) bool {
+	if v := os.Getenv("GOTOMUX_FORCE_PREWARM"); v != "" {
+		return true
+	}
+	if cfg == nil {
+		return false
+	}
+	dev, err := backingDevice(cfg.ResolveDataDir())
+	if err != nil || dev == "" {
+		return false
+	}
+	raw, err := os.ReadFile(filepath.Join("/sys/block", dev, "queue", "rotational"))
+	if err != nil {
+		return false
+	}
+	return strings.TrimSpace(string(raw)) == "1"
+}
+
+// backingDevice maps a path to the parent block device name ("sda" for /dev/sda1).
+func backingDevice(path string) (string, error) {
+	out, err := exec.Command("df", "--output=source", path).Output()
+	if err != nil {
+		return "", err
+	}
+	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+	if len(lines) < 2 {
+		return "", nil
+	}
+	src := strings.TrimSpace(lines[len(lines)-1])
+	if !strings.HasPrefix(src, "/dev/") {
+		return "", nil // tmpfs, overlay, network fs — nothing to page in from a platter
+	}
+	part := filepath.Base(src)
+	// A partition has a "../<parent>" link; a whole device does not.
+	if link, err := os.Readlink(filepath.Join("/sys/class/block", part)); err == nil {
+		segs := strings.Split(link, "/")
+		if len(segs) >= 2 {
+			parent := segs[len(segs)-2]
+			if parent != "block" && parent != "" {
+				return parent, nil
+			}
+		}
+	}
+	return part, nil
 }

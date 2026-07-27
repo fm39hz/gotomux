@@ -30,12 +30,14 @@ go test ./... -count=1 -short      # what CI runs
 
 Test gating (matters when a test "doesn't run"):
 
-- `-short` skips live-tmux tests in `internal/tmux/load_test.go`, `internal/tmux/control_test.go` and `internal/daemon/daemon_test.go`. CI has no tmux server, so it always passes `-short`. Run without `-short` locally to exercise real `new-session`/`split-window` and the control-mode transport.
+- `-short` skips live-tmux tests in `internal/tmux/load_test.go`, `internal/tmux/control_test.go` and `internal/daemon/daemon_test.go`. The `unit` CI job passes `-short`; the `integration` job installs tmux and runs everything. Locally, run without `-short` to exercise real `new-session`/`split-window` and the control-mode transport.
 - Env-gated, off by default: `MIGRATE_USER=1` (`template/migrate_user_test.go`), `RECONCILE_USER=1` (`template/reconcile_test.go`) — these touch the *real* `~/.config/gotomux/shapes`. `STARTUP_BENCH=1` (`picker/startup_bench_test.go`).
 
 **Any test that touches tmux must go through `tmuxtest.Isolate` (`internal/tmuxtest`). Never set `TMUX_TMPDIR` by hand and never call `kill-server` in a test.** Setting `TMUX_TMPDIR` is not sufficient isolation: if the directory does not exist, tmux **silently ignores it**, `start-server` still returns 0, and the test operates on the developer's default socket — so the cleanup `kill-server` destroys their live sessions with no error anywhere. This is not hypothetical; it happened while building the control-mode transport. `Isolate` creates the directory, then *proves* isolation by checking `#{socket_path}` is inside it, and registers teardown only after that check passes. Verified discriminator: with the dir present the socket is `$TMUX_TMPDIR/tmux-<uid>/default`; with it absent the socket is `/tmp/tmux-<uid>/default`.
 
-CI (`.github/workflows/ci.yml`) runs `go vet` + `go test -short`. No linter beyond vet. Tags `v*` trigger release + AUR push.
+**Store tests must use `isolatedStore` (`internal/store/learn_test.go`), never `store.Open()` without redirecting the data dir.** Three tests used to run against the developer's real `state.db` — one with a comment admitting it — so `go test ./...` mutated live presets.
+
+CI (`.github/workflows/ci.yml`) has two jobs: `unit` (`go vet` + `go test -short`, no external tools) and `integration` (installs tmux, runs the full suite under `-race`, then the transport and daemon packages verbosely). The second exists because running only `-short` meant CI never executed the control-mode transport, the daemon, or the guard against destroying the user's sessions — those tests existed and none of them ran. No linter beyond vet. Tags `v*` trigger release + AUR push.
 
 ## Architecture
 
@@ -106,7 +108,11 @@ Placement and fork learning are silent and never user-facing. They fire from `ob
 
 ### Config-dir mirror
 
-Every shape is mirrored to `$XDG_CONFIG_HOME/gotomux/shapes/<label>--<id8>.json` (`template/config.go`). `ensureShapesReady` syncs config→DB on read; `mirrorAfter` reconciles DB→config after writes. Hand-edited files are picked up. Legacy `layouts/` is auto-renamed to `shapes/`.
+Every shape is mirrored to `$XDG_CONFIG_HOME/gotomux/shapes/<label>--<id8>.json` (`template/config.go`). `ensureShapesReady` syncs config→DB on read; `mirrorAfter` reconciles DB→config after writes. Legacy `layouts/` is auto-renamed to `shapes/`.
+
+**Authorship is decided by content, never by timestamps.** `shape.mirror_sig` stores the signature of the body last written to `shape.mirror_path`; on import, a file whose signature still matches is ours and the DB stays authoritative, while any difference means a human edited it and the file wins. The rule used to be `mtime > dbUpd`, and since both sides are unix *seconds* while a freeze writes the row and the file inside the same second, ties were routine — and a tie meant "DB wins", silently destroying the edit. There is also no `sync.Once` around the import any more: with one, a daemon alive for hours imported the directory exactly once at startup and could never see an edit again.
+
+**The sweep only removes what it can prove is disposable** (`sweepStaleMirrors`): a file that does not parse, or one that resolves to a shape the DB already wrote under its canonical name. A file that parses but names a shape the DB does not know is **kept** — the next import adopts it. The old sweep deleted everything it had not written in that pass, which took hand-authored shapes.
 
 ### Edit / shape file format is JSON
 
@@ -136,6 +142,8 @@ Measured with `hyperfine` on ~300 zoxide entries. `gotomux -p` profiles the **st
 - **The zoxide cache is keyed by content, not by age.** Deriving rows from raw paths costs ~0.9ms *per path* — `project.Session` → `FindProjectRoot` walks up stat-ing for project markers, ~10k `stat()` calls for a 300-entry list, ~270ms cold — plus ~50ms for the `zoxide query -l` fork itself. A 30s time-based expiry used to discard the already-derived rows in `zox_item`, so **almost every invocation paid ~340ms** (30s is shorter than the gap between two picker opens). Now: `zox_meta.sig` stores `zoxide.Signature(paths)`; the paint serves persisted rows regardless of age, and the background `Refresh` re-derives only when the path list actually changed. The one remaining synchronous rebuild is an empty `zox_item`, i.e. genuinely the first run ever. Do not reintroduce an age-based expiry.
 - **Deriving the ranking context must not fork.** `newContext` used to call `CurrentSession` + `CurrentSessionPath` — two tmux forks, ~5.5ms, roughly half the standalone construction — for data already available: `$TMUX`'s third field is the session index and `LiveSession.ID` carries `#{session_id}`. It now resolves from the live list already fetched, with `CurrentContext` (one fork) only as a fallback. The session id enters through `Deps.SessionID` so nothing deep in the package reads the environment.
 - **Binary size is not a lever.** `modernc.org/sqlite` is +4.3 MB of the 9.7 MB CLI, but demand paging never reads unused pages: cold `gotomux -v` is 5ms against 3ms for a 1.6 MB binary. Removing sqlite from the CLI would buy ~2ms and cost a large refactor.
+- **`IsNoServerError` must read `ExitError.Stderr`, not just the message.** tmux writes "no server running on …" to stderr, and `exec.Cmd.Output()` puts it in `ExitError.Stderr` while `err.Error()` is only "exit status 1". Matching the message alone made the function always false on the `ListLive` path, so its `return nil, nil` branch was dead and `gotomux -f` with no server reported a raw exit status.
+- **`prewarm` is gated on rotational storage** (`/sys/block/<dev>/queue/rotational`). It reads ~12 MB into the page cache at daemon start, which took the cold picker from ~285ms to ~13ms on this project's HDD dev machine and is pure waste on an SSD. `GOTOMUX_FORCE_PREWARM=1` overrides, `GOTOMUX_NO_PREWARM=1` disables.
 - **The daemon must checkpoint the WAL.** It holds the connection open for its whole life, so SQLite never gets the last-connection-close that normally checkpoints; the WAL was observed at 1.3 MB against a 124 KB database, and every client read walks the WAL index. `store.Checkpoint()` (PASSIVE) runs on the 60s zoxide cadence — often, so it stays cheap.
 
 Current numbers: standalone ~13ms warm, ~16ms after an idle gap; startup alone (`-v`) ~5ms; IPC round trip ~1.2ms for a 45 KB payload; building the model from a payload ~150µs.

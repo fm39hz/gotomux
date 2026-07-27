@@ -32,8 +32,15 @@ var errCancel = picker.ErrCancel
 
 func init() { algo.Init("default") }
 
-type cli struct {
-	Version bool `short:"v" help:"Show version"`
+func printUsage() {
+	fmt.Println(`Usage: gotomux [flags]
+
+Flags:
+  -h, --help     Show this help
+  -v, --version  Show version
+  -f, --freeze   Freeze current or named session as a preset
+  -e, --edit     Edit a named preset (or freeze-then-edit)
+  -p, --profile  Profile cold-start performance`)
 }
 
 func main() {
@@ -42,6 +49,9 @@ func main() {
 
 	if len(os.Args) > 1 {
 		switch os.Args[1] {
+		case "-h", "--help":
+			printUsage()
+			return
 		case "-v", "--version":
 			fmt.Println(version)
 			return

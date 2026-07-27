@@ -7,13 +7,7 @@ import (
 )
 
 func TestSaveOverwritesAliasAndCwd(t *testing.T) {
-	s, err := Open()
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer s.Close()
-	// isolate: use unique cwd under temp - but store is real user db.
-	// Use distinctive names that won't collide with user presets.
+	s := isolatedStore(t)
 	a := &model.Session{
 		Name: "zztestalias",
 		Cwd:  "/tmp/gotomux-save-test-root",
@@ -68,13 +62,7 @@ func TestSessionAliasKey(t *testing.T) {
 }
 
 func TestSaveFreezeAtomic(t *testing.T) {
-	dir := t.TempDir()
-	t.Setenv("XDG_DATA_HOME", dir)
-	st, err := Open()
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer st.Close()
+	st := isolatedStore(t)
 
 	p := &model.Session{
 		Name: "zz-acid",
@@ -109,13 +97,7 @@ func TestSaveFreezeAtomic(t *testing.T) {
 }
 
 func TestRebindNameMergesUsageAndPairs(t *testing.T) {
-	dir := t.TempDir()
-	t.Setenv("XDG_DATA_HOME", dir)
-	st, err := Open()
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer st.Close()
+	st := isolatedStore(t)
 
 	if err := st.RecordOpen("old-sess"); err != nil {
 		t.Fatal(err)

@@ -14,8 +14,9 @@ import (
 
 type mockStorer struct {
 	store.Storer
-	shapes   map[string]string // id -> body
-	keys     map[string]string // key -> id
+	shapes   map[string]string    // id -> body
+	keys     map[string]string    // key -> id
+	mirrors  map[string][2]string // id -> {path, sig}
 	stickyID string
 	presets  map[string]*model.Session
 	ucalls   []string
@@ -25,8 +26,23 @@ func newMockStorer() *mockStorer {
 	return &mockStorer{
 		shapes:  map[string]string{},
 		keys:    map[string]string{},
+		mirrors: map[string][2]string{},
 		presets: map[string]*model.Session{},
 	}
+}
+
+func (m *mockStorer) GetShapeMeta(id string) (store.ShapeMeta, bool) {
+	body, ok := m.shapes[id]
+	if !ok {
+		return store.ShapeMeta{}, false
+	}
+	mp := m.mirrors[id]
+	return store.ShapeMeta{Body: body, MirrorPath: mp[0], MirrorSig: mp[1]}, true
+}
+
+func (m *mockStorer) SetShapeMirror(id, path, sig string) error {
+	m.mirrors[id] = [2]string{path, sig}
+	return nil
 }
 
 func (m *mockStorer) StickyID() string {

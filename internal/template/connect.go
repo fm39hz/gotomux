@@ -91,7 +91,7 @@ func ensureDefault(st store.Storer) error {
 	if err := st.UpsertShapeByID(id, key, body); err != nil {
 		return err
 	}
-	writeConfigMirror(id, body)
+	writeConfigMirror(st, id, body)
 	return nil
 }
 

@@ -1,6 +1,8 @@
 package template
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"log"
 	"os"
 	"path/filepath"
@@ -8,6 +10,7 @@ import (
 	"sync"
 
 	"github.com/fm39hz/gotomux/internal/config"
+	"github.com/fm39hz/gotomux/internal/model"
 	"github.com/fm39hz/gotomux/internal/store"
 )
 
@@ -70,7 +73,12 @@ func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
 	return os.Rename(tmp, path)
 }
 
-func writeConfigMirror(id, body string) {
+// writeConfigMirror writes one shape's mirror file and records what it wrote.
+//
+// Recording matters even here: without a signature the next import cannot tell
+// this file from a hand edit, so it would be re-imported and then overwritten
+// again on every single sync.
+func writeConfigMirror(st store.Storer, id, body string) {
 	if id == "" || body == "" {
 		return
 	}
@@ -80,7 +88,13 @@ func writeConfigMirror(id, body string) {
 		return
 	}
 	_ = os.MkdirAll(filepath.Dir(path), 0o755)
-	_ = writeFileAtomic(path, []byte(body), 0o644)
+	if err := writeFileAtomic(path, []byte(body), 0o644); err != nil {
+		log.Printf("mirror %s: %v", path, err)
+		return
+	}
+	if st != nil {
+		_ = st.SetShapeMirror(id, path, bodySig(body))
+	}
 }
 
 func shapeLabelFromBody(id, body string) string {
@@ -93,6 +107,42 @@ func shapeLabelFromBody(id, body string) string {
 		return "default"
 	}
 	return "shape"
+}
+
+// bodySig fingerprints a shape body. Used to decide authorship of a mirror file,
+// never for identity — ShapeKey is what identifies a shape.
+func bodySig(body string) string {
+	sum := sha256.Sum256([]byte(body))
+	return hex.EncodeToString(sum[:8])
+}
+
+// resolveShapeID recovers the shape id a mirror file belongs to: from the body's
+// own id, else the filename stem, else the "--<suffix>" tail matched against known
+// shapes, else the literal "default". Empty means "cannot tell".
+func resolveShapeID(st store.Storer, fileName string, parsed *model.Session) string {
+	if parsed != nil && isShapeID(parsed.Name) {
+		return parsed.Name
+	}
+	stem := strings.TrimSuffix(fileName, ".json")
+	if isShapeID(stem) {
+		return stem
+	}
+	if i := strings.LastIndex(stem, "--"); i >= 0 {
+		suf := stem[i+2:]
+		id := "shape-" + suf
+		if ids, _ := st.ListShapes(); len(ids) > 0 {
+			for _, cand := range ids {
+				if strings.HasSuffix(cand, suf) || cand == id {
+					return cand
+				}
+			}
+		}
+		return id
+	}
+	if stem == "default" {
+		return "default"
+	}
+	return ""
 }
 
 func reconcileConfigShapes(st store.Storer) {
@@ -128,8 +178,43 @@ func reconcileConfigShapes(st store.Storer) {
 		if path == "" {
 			continue
 		}
-		_ = writeFileAtomic(path, []byte(body), 0o644)
+		if err := writeFileAtomic(path, []byte(body), 0o644); err != nil {
+			log.Printf("mirror %s: %v", path, err)
+			continue
+		}
 		keep[filepath.Base(path)] = true
+
+		// Remember what we wrote, so a later read can tell our own output from a
+		// human edit. Also lets us retire the previous filename when the label —
+		// and therefore the filename — changes.
+		prev := ""
+		if meta, ok := st.GetShapeMeta(id); ok {
+			prev = meta.MirrorPath
+		}
+		_ = st.SetShapeMirror(id, path, bodySig(body))
+		if prev != "" && prev != path && filepath.Dir(prev) == dir {
+			_ = os.Remove(prev)
+		}
+	}
+	sweepStaleMirrors(st, dir, ids, keep)
+}
+
+// sweepStaleMirrors removes files that cannot be a shape we still need, and only
+// those.
+//
+// The old sweep deleted every *.json not written in the current pass, which took
+// hand-authored files whose shape id the DB had not imported yet — the exact
+// content this directory exists to let you write. The discriminator is now what the
+// file *is*, not whether we happened to write it this pass:
+//
+//   - unparseable: junk, remove.
+//   - resolves to a shape the DB knows, under a non-canonical name: a stale name for
+//     something we already wrote correctly, remove.
+//   - resolves to a shape the DB does not know: keep — the next import adopts it.
+func sweepStaleMirrors(st store.Storer, dir string, ids []string, keep map[string]bool) {
+	known := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		known[id] = true
 	}
 	ents, err := os.ReadDir(dir)
 	if err != nil {
@@ -139,19 +224,41 @@ func reconcileConfigShapes(st store.Storer) {
 		if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
 			continue
 		}
-		if !keep[e.Name()] {
-			_ = os.Remove(filepath.Join(dir, e.Name()))
+		if keep[e.Name()] {
+			continue
+		}
+		path := filepath.Join(dir, e.Name())
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		pr, err := Parse(string(raw))
+		if err != nil {
+			_ = os.Remove(path)
+			continue
+		}
+		id := resolveShapeID(st, e.Name(), pr)
+		if id != "" && known[id] {
+			_ = os.Remove(path)
 		}
 	}
 }
 
-var syncOnce sync.Once
+// syncMu serialises directory imports; there is no once-per-process guard.
+//
+// syncConfigToDB used to run under a sync.Once, which meant the daemon — alive for
+// hours — imported the shapes directory exactly once at startup and never noticed
+// an edit again, while every subsequent freeze reconciled the directory back to the
+// DB. Hand edits were therefore unreachable in the mode most people run.
+var syncMu sync.Mutex
 
 func syncConfigToDB(st store.Storer) {
 	if st == nil {
 		return
 	}
-	syncOnce.Do(func() {
+	syncMu.Lock()
+	defer syncMu.Unlock()
+	func() {
 		dir := configShapesDir(nil)
 		seenFile := map[string]bool{}
 		if dir != "" {
@@ -166,36 +273,13 @@ func syncConfigToDB(st store.Storer) {
 					if err != nil {
 						continue
 					}
-					fi, err := os.Stat(path)
-					if err != nil {
-						continue
-					}
-					mtime := fi.ModTime().Unix()
 					pr, err := Parse(string(raw))
 					if err != nil {
 						continue
 					}
-					id := pr.Name
-					if !isShapeID(id) {
-						stem := strings.TrimSuffix(e.Name(), ".json")
-						if isShapeID(stem) {
-							id = stem
-						} else if i := strings.LastIndex(stem, "--"); i >= 0 {
-							suf := stem[i+2:]
-							id = "shape-" + suf
-							if ids, _ := st.ListShapes(); len(ids) > 0 {
-								for _, cand := range ids {
-									if strings.HasSuffix(cand, suf) || cand == id {
-										id = cand
-										break
-									}
-								}
-							}
-						} else if stem == "default" {
-							id = "default"
-						} else {
-							continue
-						}
+					id := resolveShapeID(st, e.Name(), pr)
+					if id == "" {
+						continue
 					}
 					pure := ToShape(pr, id)
 					pure.Name = id
@@ -203,25 +287,42 @@ func syncConfigToDB(st store.Storer) {
 					body := Format(pure)
 					seenFile[id] = true
 
-					dbBody, dbUpd, ok := st.GetShapeMeta(id)
-					if !ok {
+					meta, ok := st.GetShapeMeta(id)
+					switch {
+					case !ok:
+						// No row: the file is the only source. Import it.
 						if err := st.UpsertShapeByID(id, key, body); err != nil {
 							log.Printf("upsert shape: %v", err)
 						}
-						continue
-					}
-					if mtime > dbUpd {
+					case meta.MirrorSig == "":
+						// Never mirrored (or written before mirror bookkeeping existed), so
+						// we cannot claim authorship of this file. Treat it as the user's.
 						if err := st.UpsertShapeByID(id, key, body); err != nil {
 							log.Printf("upsert shape: %v", err)
 						}
-					} else if body != dbBody {
-						writeConfigMirror(id, dbBody)
+						_ = st.SetShapeMirror(id, path, bodySig(body))
+					case bodySig(string(raw)) == meta.MirrorSig:
+						// Byte-identical to what we last wrote: untouched. The DB stays
+						// authoritative, and reconcileConfigShapes will refresh the file if
+						// the row has since changed.
+					default:
+						// The file differs from what we wrote there, so a human changed it.
+						// Import rather than overwrite.
+						//
+						// This used to be decided by `mtime > dbUpd`. Both sides have
+						// one-second resolution and a freeze writes the row and the file
+						// inside the same second, so a tie was common — and a tie resolved
+						// to "DB wins", silently destroying the edit.
+						if err := st.UpsertShapeByID(id, key, body); err != nil {
+							log.Printf("upsert shape: %v", err)
+						}
+						_ = st.SetShapeMirror(id, path, bodySig(body))
 					}
 				}
 			}
 		}
 		_ = ensureDefault(st)
-	})
+	}()
 }
 
 func mirrorAfter(st store.Storer, _ string) { reconcileConfigShapes(st) }

@@ -1,6 +1,12 @@
 package tmux
 
-import "testing"
+import (
+	"context"
+	"errors"
+	"fmt"
+	"os/exec"
+	"testing"
+)
 
 // row builds one S line in the exact shape ListSessFmt produces.
 func row(id, name, windows, path, lastAttached, activity, created, attached string) string {
@@ -87,5 +93,50 @@ func TestFindByID(t *testing.T) {
 	}
 	if _, ok := FindByID(live, ""); ok {
 		t.Error("FindByID matched an empty id")
+	}
+}
+
+// TestIsNoServerErrorReadsStderr pins a dead branch that mattered.
+//
+// tmux reports "no server running on …" on stderr. exec.Cmd.Output() surfaces that
+// through ExitError.Stderr, but err.Error() is only "exit status 1" — so matching
+// on the message alone made IsNoServerError always false for ListLive, leaving its
+// (nil, nil) branch unreachable and `gotomux -f` reporting a raw exit status
+// instead of "no active sessions".
+func TestIsNoServerErrorReadsStderr(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("TMUX_TMPDIR", dir)
+	t.Setenv("TMUX", "")
+
+	c, err := New()
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	live, err := c.ListLive(context.Background())
+	if err != nil {
+		t.Fatalf("ListLive with no server = %v; want (nil, nil) via IsNoServerError", err)
+	}
+	if len(live) != 0 {
+		t.Errorf("ListLive returned %d sessions with no server", len(live))
+	}
+}
+
+func TestIsNoServerErrorClassification(t *testing.T) {
+	if IsNoServerError(nil) {
+		t.Error("nil classified as no-server")
+	}
+	if !IsNoServerError(errors.New("no server running on /tmp/tmux-1000/default")) {
+		t.Error("plain message not classified")
+	}
+	if IsNoServerError(errors.New("exit status 1")) {
+		t.Error("bare exit status classified as no-server")
+	}
+	// The shape Output() actually produces: message says nothing, stderr says it.
+	wrapped := fmt.Errorf("tmux list: %w", &exec.ExitError{
+		ProcessState: nil,
+		Stderr:       []byte("no server running on /tmp/tmux-1000/default\n"),
+	})
+	if !IsNoServerError(wrapped) {
+		t.Error("stderr-carried no-server not classified through a wrap")
 	}
 }
