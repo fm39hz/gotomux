@@ -68,6 +68,29 @@ func Classify(bin string) Kind {
 	}
 }
 
+// ClassLabel returns the fork-class name for a tool binary.
+// Classes are the portable grouping key for fork matching.
+// KindEditor→"editor", KindShell→"shell", KindFiles→"files",
+// KindGit→"git", KindAgent→"agent", others→the binary name itself.
+func ClassLabel(bin string) string {
+	bin = Base(bin)
+	if bin == "" || IsShell(bin) {
+		return "shell"
+	}
+	switch Classify(bin) {
+	case KindEditor:
+		return "editor"
+	case KindFiles:
+		return "files"
+	case KindGit:
+		return "git"
+	case KindAgent:
+		return "agent"
+	default:
+		return bin
+	}
+}
+
 // IsShell reports shell/login wrappers.
 func IsShell(bin string) bool {
 	return Classify(bin) == KindShell || shells[Base(bin)]

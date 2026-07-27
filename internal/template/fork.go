@@ -4,95 +4,129 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
-	"fmt"
 	"log"
 	"strings"
 
 	"github.com/fm39hz/gotomux/internal/model"
 	"github.com/fm39hz/gotomux/internal/store"
 	"github.com/fm39hz/gotomux/internal/tmux"
+	"github.com/fm39hz/gotomux/internal/toolclass"
 )
 
-// Fork = one window essence unit.
-// Learned silently on freeze/stick. Same pattern → same fork key.
-// Readable label for JSON files, hashed key for DB.
-// Hit counters in DB only — fork label is human-readable everywhere.
+// Fork = multi-window tool-group essence.
+// A fork groups several windows into a reusable pattern.
+// Same class pattern across windows → same fork key.
 
-// WindowForkLabel returns a human-readable fork identifier like "2|even-vertical|nvim,sh".
-func WindowForkLabel(w model.Window) string {
-	n := len(w.Panes)
-	if n == 0 {
-		n = 1
+// PaneClass returns the fork class name for a pane command.
+func PaneClass(cmd string) string {
+	base := toolclass.Base(cmd)
+	if base == "" {
+		return "shell"
 	}
-	split := tmux.LayoutForShape(w.Layout, n)
-	var b strings.Builder
-	b.WriteString(fmt.Sprintf("%d", n))
-	b.WriteByte('|')
-	b.WriteString(split)
-	b.WriteByte('|')
-	for j := 0; j < n; j++ {
-		if j > 0 {
-			b.WriteByte(',')
-		}
-		if j < len(w.Panes) {
-			b.WriteString(tmux.ToolIntent(w.Panes[j].Cmd))
-		}
-	}
-	return b.String()
+	return toolclass.ClassLabel(base)
 }
 
-// WindowForkKey returns a stable hash key for DB storage.
+// paneClassSlice returns ordered class names for a window's panes.
+func paneClassSlice(w model.Window) []string {
+	n := len(w.Panes)
+	if n == 0 {
+		return []string{"shell"}
+	}
+	classes := make([]string, n)
+	for i := range w.Panes {
+		classes[i] = PaneClass(w.Panes[i].Cmd)
+	}
+	return classes
+}
+
+// WindowForkKey returns the class key for ONE window — a building block.
+// Examples: "editor", "editor,shell", "shell,shell".
 func WindowForkKey(w model.Window) string {
-	label := WindowForkLabel(w)
-	sum := sha256.Sum256([]byte(label))
+	classes := paneClassSlice(w)
+	return strings.Join(classes, ",")
+}
+
+// ShapeForkKey returns the multi-window fork key for a whole shape.
+// Hashes the ordered window class keys so same class profile = same fork.
+func ShapeForkKey(p *model.Session) string {
+	sh := ToShape(p, "fork")
+	var keys []string
+	for _, w := range sh.Windows {
+		keys = append(keys, WindowForkKey(w))
+	}
+	sum := sha256.Sum256([]byte(strings.Join(keys, "|")))
 	return hex.EncodeToString(sum[:8])
 }
 
-// WindowForkBody — JSON fragment for DB storage (product, readable, no cwd).
-func WindowForkBody(w model.Window) string {
-	n := len(w.Panes)
-	if n == 0 {
-		n = 1
-	}
+// ShapeForkBody returns JSON for the shape-level fork: all windows + example tools.
+func ShapeForkBody(p *model.Session) string {
+	sh := ToShape(p, "fork")
 	type pane struct {
-		Cmd string `json:"cmd,omitempty"`
+		Tool string `json:"tool,omitempty"`
 	}
 	type win struct {
-		Fork  string `json:"fork,omitempty"`
+		Fork  string `json:"fork"`
 		Split string `json:"split,omitempty"`
 		Panes []pane `json:"panes"`
 	}
-	ww := win{
-		Fork:  WindowForkLabel(w),
-		Split: tmux.LayoutForShape(w.Layout, n),
-	}
-	for j := 0; j < n; j++ {
-		var c string
-		if j < len(w.Panes) {
-			c = tmux.ToolIntent(w.Panes[j].Cmd)
+	var wins []win
+	for _, w := range sh.Windows {
+		n := len(w.Panes)
+		if n == 0 {
+			n = 1
 		}
-		ww.Panes = append(ww.Panes, pane{Cmd: c})
+		wj := win{
+			Fork:  WindowForkKey(w),
+			Split: tmux.LayoutForShape(w.Layout, n),
+		}
+		for j := 0; j < n; j++ {
+			var cmd string
+			if j < len(w.Panes) {
+				cmd = tmux.ToolIntent(w.Panes[j].Cmd)
+			}
+			wj.Panes = append(wj.Panes, pane{Tool: cmd})
+		}
+		wins = append(wins, wj)
 	}
-	b, err := json.Marshal(ww)
+	out := struct {
+		Key     string `json:"key"`
+		NWins   int    `json:"nWindows"`
+		Windows []win  `json:"windows"`
+	}{
+		Key:     ShapeForkKey(p),
+		NWins:   len(wins),
+		Windows: wins,
+	}
+	b, err := json.Marshal(out)
 	if err != nil {
 		return ""
 	}
 	return string(b)
 }
 
-// ObserveForks records every window as a fork unit.
+// ObserveForks records the whole shape as one multi-window fork unit.
 func ObserveForks(st store.Storer, p *model.Session) {
 	if st == nil || p == nil {
 		return
 	}
-	sh := ToShape(p, "fork")
-	for _, w := range sh.Windows {
-		key := WindowForkKey(w)
-		if key == "" {
-			continue
-		}
-		if err := st.RecordFork(key, WindowForkBody(w)); err != nil {
-			log.Printf("record fork: %v", err)
+	key := ShapeForkKey(p)
+	if key == "" {
+		return
+	}
+	if err := st.RecordFork(key, ShapeForkBody(p)); err != nil {
+		log.Printf("record fork: %v", err)
+	}
+}
+
+// ForkClassKeyString returns "editor,shell" format from a pane command slice.
+func ForkClassKeyString(cmds []string) string {
+	classes := make([]string, len(cmds))
+	for i, c := range cmds {
+		if c == "" {
+			classes[i] = "shell"
+		} else {
+			classes[i] = toolclass.ClassLabel(c)
 		}
 	}
+	return strings.Join(classes, ",")
 }

@@ -170,6 +170,12 @@ func reconcileConfigShapes(st store.Storer) {
 				if err := st.UpsertShapeByID(id, ShapeKey(pure), clean); err != nil {
 					log.Printf("upsert shape: %v", err)
 				}
+				// UpsertShapeByID may have merged this id into an existing one
+				// (same class-based key) and deleted the row. If so, skip mirror.
+				if _, ok := st.GetShape(id); !ok {
+					body = ""
+					continue
+				}
 				body = clean
 			}
 		}
@@ -291,15 +297,21 @@ func syncConfigToDB(st store.Storer) {
 					switch {
 					case !ok:
 						// No row: the file is the only source. Import it.
+						// Write the canonical body back so it stays in sync with the row.
 						if err := st.UpsertShapeByID(id, key, body); err != nil {
 							log.Printf("upsert shape: %v", err)
 						}
+						_ = writeFileAtomic(path, []byte(body), 0o644)
+						_ = st.SetShapeMirror(id, path, bodySig(body))
 					case meta.MirrorSig == "":
-						// Never mirrored (or written before mirror bookkeeping existed), so
-						// we cannot claim authorship of this file. Treat it as the user's.
+						// Never mirrored (or mirror metadata cleared by migration). The file
+						// may still have old-format content — rewrite it so the on-disk body
+						// matches the signature we are about to record; otherwise every future
+						// startup sees a sig mismatch and re-imports in an infinite loop.
 						if err := st.UpsertShapeByID(id, key, body); err != nil {
 							log.Printf("upsert shape: %v", err)
 						}
+						_ = writeFileAtomic(path, []byte(body), 0o644)
 						_ = st.SetShapeMirror(id, path, bodySig(body))
 					case bodySig(string(raw)) == meta.MirrorSig:
 						// Byte-identical to what we last wrote: untouched. The DB stays
@@ -316,6 +328,7 @@ func syncConfigToDB(st store.Storer) {
 						if err := st.UpsertShapeByID(id, key, body); err != nil {
 							log.Printf("upsert shape: %v", err)
 						}
+						_ = writeFileAtomic(path, []byte(body), 0o644)
 						_ = st.SetShapeMirror(id, path, bodySig(body))
 					}
 				}

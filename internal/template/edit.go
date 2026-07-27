@@ -19,7 +19,9 @@ import (
 // Shape (essence - freeze/sticky mirror under shapes/<id>.json):
 //
 //	{
-//	  "name": "shape-...",
+//	  "id": "shape-...",
+//	  "label": "editor+v2+yazi",
+//	  "fork": "abc12345678def01",
 //	  "windows": [
 //	    {"name": "editor", "panes": [{"cmd": "nvim"}]},
 //	    {"name": "shell", "split": "even-vertical", "panes": [{}, {}]},
@@ -27,18 +29,20 @@ import (
 //	  ]
 //	}
 //
+//	fork:  multi-window pattern key (hash of window class profile)
 //	split: even-horizontal | even-vertical | main-* | tiled
 //	       omit -> bake infers even-horizontal when panes > 1
 //	cmd:   tool intent on that pane (nvim, yazi, opencode, ...); omit = shell
 //	never: tmux dump strings, abs paths, % ratios, cwd on pure shapes
 //
 // Instance presets may add "cwd" for restore-that-session only.
-// Legacy key "layout" accepted on parse; dumps classified to split class.
+// Legacy keys "fork", "class", "layout" accepted on parse.
 
 type presetJSON struct {
 	// Shape product: id (stable) + label (human). Instance: name = session.
 	ID      string       `json:"id,omitempty"`
 	Label   string       `json:"label,omitempty"`
+	Fork    string       `json:"fork,omitempty"`
 	Name    string       `json:"name,omitempty"`
 	Cwd     string       `json:"cwd,omitempty"`
 	Windows []windowJSON `json:"windows"`
@@ -55,8 +59,9 @@ type windowJSON struct {
 }
 
 type paneJSON struct {
-	Cwd string `json:"cwd,omitempty"`
-	Cmd string `json:"cmd,omitempty"`
+	Class string `json:"class,omitempty"`
+	Cwd   string `json:"cwd,omitempty"`
+	Cmd   string `json:"cmd,omitempty"`
 }
 
 func (w windowJSON) splitValue() string {
@@ -73,14 +78,15 @@ func Format(p *model.Session) string {
 	root := p.Cwd
 	j := presetJSON{}
 	if isShapeID(p.Name) || (p.Cwd == "" && looksLikeShapeTree(p)) {
-		// pure shape: id inside, label for humans
+		// pure shape: id inside, label + fork for humans
 		j.ID = p.Name
 		if j.ID == "" || j.ID == "tmp" {
 			j.ID = "shape"
 		}
 		j.Label = ShapeLabel(p)
-		// keep name = label for legacy readers; id is canonical
-		j.Name = j.Label
+		if fk := ShapeForkKey(p); fk != "" {
+			j.Fork = fk
+		}
 	} else {
 		j.Name = p.Name
 		if root != "" {
@@ -89,7 +95,6 @@ func Format(p *model.Session) string {
 	}
 	for _, w := range p.Windows {
 		wj := windowJSON{
-			Fork:  WindowForkLabel(w),
 			Name:  w.Name,
 			Split: tmux.LayoutForShape(w.Layout, len(w.Panes)),
 		}

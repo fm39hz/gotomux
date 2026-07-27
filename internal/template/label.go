@@ -75,12 +75,12 @@ func paneTools(w model.Window) []string {
 	var out []string
 	seen := map[string]bool{}
 	for _, pn := range w.Panes {
-		t := tmux.ToolIntent(pn.Cmd)
-		if t == "" || seen[t] {
+		c := PaneClass(pn.Cmd)
+		if c == "shell" || seen[c] {
 			continue
 		}
-		seen[t] = true
-		out = append(out, t)
+		seen[c] = true
+		out = append(out, c)
 	}
 	return out
 }

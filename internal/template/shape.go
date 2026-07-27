@@ -3,7 +3,6 @@ package template
 import (
 	"crypto/sha256"
 	"encoding/hex"
-	"fmt"
 	"path/filepath"
 	"strings"
 
@@ -70,22 +69,19 @@ func ShapeKey(p *model.Session) string {
 		if i > 0 {
 			b.WriteByte('|')
 		}
+		// Fork key (class-based) replaces exact tool hash
+		fk := WindowForkKey(w)
+		b.WriteString(fk)
 		n := len(w.Panes)
 		if n == 0 {
 			n = 1
 		}
-		b.WriteByte('#')
-		b.WriteString(fmt.Sprintf("%d", i))
-		b.WriteByte('x')
-		b.WriteString(fmt.Sprintf("%d", n))
-		b.WriteByte('@')
-		b.WriteString(tmux.LayoutForShape(w.Layout, n))
-		for j := 0; j < n; j++ {
-			b.WriteByte(',')
-			if j < len(w.Panes) {
-				b.WriteString(tmux.ToolIntent(w.Panes[j].Cmd))
-			}
+		split := tmux.LayoutForShape(w.Layout, n)
+		if split != "" {
+			b.WriteByte('@')
+			b.WriteString(split)
 		}
+		_ = i
 	}
 	sum := sha256.Sum256([]byte(b.String()))
 	return hex.EncodeToString(sum[:8])

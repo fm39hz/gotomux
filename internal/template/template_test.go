@@ -64,15 +64,25 @@ func TestShapeKeyIgnoresPathsKeepsTools(t *testing.T) {
 	if ShapeKey(a) != ShapeKey(b) {
 		t.Fatalf("paths must not affect key: %s vs %s", ShapeKey(a), ShapeKey(b))
 	}
-	// different tool intent -> different key
+	// different tool class -> different key
 	c := ToShape(&model.Session{
 		Windows: []model.Window{
-			{Panes: []model.Pane{{Cmd: "vim"}}},
+			{Panes: []model.Pane{{Cmd: "yazi"}}},
 			{Panes: []model.Pane{{}, {}}},
 		},
 	}, "z")
 	if ShapeKey(a) == ShapeKey(c) {
-		t.Fatal("tool intent must affect key")
+		t.Fatal("tool class must affect key (editor != files)")
+	}
+	// same class (different exact tool) -> same key
+	d := ToShape(&model.Session{
+		Windows: []model.Window{
+			{Panes: []model.Pane{{Cmd: "vim"}}},
+			{Panes: []model.Pane{{}, {}}},
+		},
+	}, "w")
+	if ShapeKey(a) != ShapeKey(d) {
+		t.Fatal("same class (vim/nvim) must produce same key")
 	}
 }
 

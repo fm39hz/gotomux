@@ -46,7 +46,7 @@ func TestObserveForksLearnsFromFreeze(t *testing.T) {
 			{Name: "yazi", Panes: []model.Pane{{Cmd: "yazi"}}},
 		},
 	}
-	// two freezes -> hit counts
+	// two freezes -> hit counts on the multi-window fork
 	if _, _, err := FreezeSave(st, p, false); err != nil {
 		t.Fatal(err)
 	}
@@ -62,19 +62,13 @@ func TestObserveForksLearnsFromFreeze(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	ek := WindowForkKey(ToShape(p, "t").Windows[0])
-	sk := WindowForkKey(ToShape(p, "t").Windows[1])
-	yk := WindowForkKey(ToShape(p, "t").Windows[2])
-	if st.ForkHits(ek) < 2 {
-		t.Fatalf("editor-nvim hits %d want >=2", st.ForkHits(ek))
+	// same class pattern across projects → same shape-level fork
+	fk := ShapeForkKey(p)
+	if st.ForkHits(fk) < 2 {
+		t.Fatalf("shape fork hits %d want >=2", st.ForkHits(fk))
 	}
-	if st.ForkHits(sk) < 2 {
-		t.Fatalf("shell-v2 hits %d", st.ForkHits(sk))
-	}
-	if st.ForkHits(yk) < 2 {
-		t.Fatalf("yazi hits %d", st.ForkHits(yk))
-	}
-	// divergence: new agent window -> new fork key
+
+	// divergence: different tool set → different fork
 	p3 := &model.Session{
 		Name: "z", Cwd: "/z",
 		Windows: []model.Window{
@@ -83,11 +77,11 @@ func TestObserveForksLearnsFromFreeze(t *testing.T) {
 		},
 	}
 	ObserveForks(st, p3)
-	ak := WindowForkKey(ToShape(p3, "t").Windows[1])
+	ak := ShapeForkKey(p3)
 	if st.ForkHits(ak) < 1 {
-		t.Fatal("opencode fork not learned")
+		t.Fatal("shape fork not learned")
 	}
-	if ak == ek {
-		t.Fatal("agent != editor")
+	if ak == fk {
+		t.Fatal("nvim+opencode != nvim+v2+yazi")
 	}
 }

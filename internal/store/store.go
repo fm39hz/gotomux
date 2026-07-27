@@ -236,7 +236,7 @@ func (s *Store) Ping() error {
 // The migration itself stays additive-only and idempotent — the fast path is an
 // optimisation, not a replacement, so a DB from a future version or one that
 // somehow lost user_version still gets the full run.
-const schemaVersion = 3
+const schemaVersion = 4
 
 func (s *Store) migrate() error {
 	var have int
@@ -403,6 +403,11 @@ CREATE TABLE IF NOT EXISTS fork (
 );`); err != nil {
 		return err
 	}
+	// Schema 4: class-based fork keys (editor,shell) replace hashed keys (2942bbbd…);
+	// old fork data is stale — clear it. Reset mirror metadata so reconcileConfigShapes
+	// re-writes all files with new JSON format (class fields + class-based fork keys).
+	_, _ = s.db.Exec(`DELETE FROM fork`)
+	_, _ = s.db.Exec(`UPDATE shape SET mirror_path = '', mirror_sig = ''`)
 	_, err = s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_session_last_used ON session(last_used DESC)`)
 	return err
 }

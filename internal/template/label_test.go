@@ -17,10 +17,11 @@ func TestShapeLabelFromEssence(t *testing.T) {
 		},
 	}, "shape-abc")
 	lab := ShapeLabel(p)
-	if lab != "nvim+v2+yazi" {
+	// class-based labels: nvim→editor, yazi→files
+	if lab != "editor+v2+files" {
 		t.Fatalf("got %q", lab)
 	}
-	if !strings.Contains(LabelFileSlug(lab), "nvim") {
+	if !strings.Contains(LabelFileSlug(lab), "editor") {
 		t.Fatal(LabelFileSlug(lab))
 	}
 }
