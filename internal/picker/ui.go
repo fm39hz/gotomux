@@ -53,7 +53,6 @@ type viewModel struct {
 	maxShow    int
 	helpOpen   bool
 	helpModel  help.Model
-	started    time.Time
 	editPath   string
 	editOld    string
 }
@@ -238,7 +237,6 @@ func assemble(cfg *config.Config, d Deps, createName, createCwd string,
 			queryInput: initInput(),
 			helpModel:  help.New(),
 			maxShow:    maxShow(cfg),
-			started:    time.Now(),
 		},
 	}
 	m.refilter()
@@ -429,6 +427,10 @@ func (m model) Init() tea.Cmd {
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
+	case cancelMsg:
+		m.ui.done = Result{Action: ActionQuit}
+		return m, tea.Quit
+
 	case sourceMsg:
 		if len(msg.items) == 0 {
 			return m, nil
@@ -456,9 +458,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.KeyPressMsg:
 		switch {
 		case key.Matches(msg, defaultKeyMap.Quit):
-			if msg.String() == "esc" && time.Since(m.ui.started) < 500*time.Millisecond {
-				return m, nil
-			}
 			m.ui.done = Result{Action: ActionQuit}
 			return m, tea.Quit
 
@@ -616,7 +615,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.ui.status = err.Error()
 					return m, nil
 				}
-				ClearInline(m.FrameLines())
 				return m, cmd
 			case KindPreset:
 				cmd, err := m.beginEdit(it.Name)
@@ -624,7 +622,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.ui.status = err.Error()
 					return m, nil
 				}
-				ClearInline(m.FrameLines())
 				return m, cmd
 			default:
 				m.ui.status = "edit: pick Active or Preset"
@@ -653,7 +650,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 	case editDoneMsg:
-		ClearInline(m.FrameLines())
 		if msg.err != nil {
 			m.ui.status = msg.err.Error()
 		} else {
@@ -701,16 +697,6 @@ func (m *model) reload() {
 			m.ui.selID = m.ui.items[c].ID()
 		}
 	}
-}
-
-// FrameLines is fixed height of View - wipe residual inline UI after quit.
-func (m model) FrameLines() int {
-	maxShow := m.ui.maxShow
-	if maxShow <= 0 {
-		maxShow = 12
-	}
-	// prompt line + header + list + status
-	return maxShow + 3
 }
 
 type editDoneMsg struct {
@@ -783,13 +769,10 @@ func editorCmd(path string) *exec.Cmd {
 
 func (m model) View() tea.View {
 	if m.ui.done.Action != ActionNone {
-		if m.ui.done.Action != ActionConnect {
-			return tea.View{}
-		}
-		var b strings.Builder
-		b.WriteString(m.ui.done.Item.Title)
-		b.WriteByte('\n')
-		return tea.NewView(b.String())
+		// An empty View has zero geometry, so Bubble Tea loses the inline cursor
+		// anchor it needs to clear the old frame. A single blank cell is visually
+		// empty while preserving one owned row for the renderer's final diff.
+		return tea.NewView(" ")
 	}
 
 	var b strings.Builder

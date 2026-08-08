@@ -4,6 +4,34 @@ import (
 	"testing"
 )
 
+func TestViewKeepsBlankAnchorAfterDone(t *testing.T) {
+	for _, action := range []Action{ActionConnect, ActionQuit} {
+		m := model{ui: viewModel{done: Result{
+			Action: action,
+			Item:   Item{Title: "[Active] should-not-leak"},
+		}}}
+		if got := m.View().Content; got != " " {
+			t.Fatalf("action %v final frame = %q, want one blank anchor", action, got)
+		}
+	}
+}
+
+func TestCancelMsgUsesNormalQuitTransition(t *testing.T) {
+	m := model{}
+	next, cmd := m.Update(cancelMsg{})
+	got := next.(model)
+
+	if got.Done().Action != ActionQuit {
+		t.Fatalf("action = %v, want %v", got.Done().Action, ActionQuit)
+	}
+	if cmd == nil {
+		t.Fatal("cancel did not return tea.Quit")
+	}
+	if frame := got.View().Content; frame != " " {
+		t.Fatalf("final frame = %q, want one blank anchor", frame)
+	}
+}
+
 func TestScrollOffBoundaries(t *testing.T) {
 	v := viewModel{maxShow: 12}
 

@@ -1,7 +1,6 @@
 package picker
 
 import (
-	"fmt"
 	"os"
 	"strings"
 
@@ -9,8 +8,9 @@ import (
 )
 
 // TeaOpts: force /dev/tty so display-popup still gets a real TTY.
-// Inline always (fzf-style) — alt-screen inside tmux causes scrollback artifacts
-// because tmux intercepts terminal escape codes. ClearInline handles cleanup.
+// Inline (fzf-style). Bubble Tea owns its frame cleanup; the host shell owns its
+// prompt and mode repaint. Trying to erase a fixed number of rows here corrupts
+// output above multi-line prompts because their geometry is shell-specific.
 //
 // WithoutSignalHandler: main owns SIGINT for the picker phase only.
 //   - raw TTY: Ctrl+C arrives as KeyMsg -> ActionQuit (cancel)
@@ -41,28 +41,4 @@ func truncateRunes(s string, n int) string {
 		return strings.Repeat(".", n)
 	}
 	return string(r[:n-3]) + "..."
-}
-
-// ClearInline erases n lines of residual bubbletea inline UI (fzf-style).
-// Bubble Tea stop() only clears the current line - the rest stays in scrollback.
-func ClearInline(n int) {
-	if n <= 0 {
-		return
-	}
-	var b strings.Builder
-	// cursor is at start of last rendered line after stop(); go up n-1 then erase n
-	for i := 0; i < n; i++ {
-		if i > 0 {
-			b.WriteString("\x1b[1A") // up
-		}
-		b.WriteString("\x1b[2K") // erase line
-	}
-	b.WriteByte('\r')
-	// prefer /dev/tty - same surface as WithOutput(tty)
-	if tty, err := os.OpenFile("/dev/tty", os.O_WRONLY, 0); err == nil {
-		fmt.Fprint(tty, b.String())
-		tty.Close()
-		return
-	}
-	fmt.Fprint(os.Stdout, b.String())
 }

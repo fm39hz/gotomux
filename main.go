@@ -243,20 +243,19 @@ func runPickerIPC(cfg *config.Config, conn net.Conn) error {
 
 	fm, ok := final.(interface {
 		Done() picker.Result
-		FrameLines() int
 	})
 	if !ok {
 		return errCancel
 	}
 
-	picker.ClearInline(fm.FrameLines())
 	res := fm.Done()
 	if res.Action != picker.ActionConnect {
 		return errCancel
 	}
 	it := res.Item
 
-	// Record telemetry before connecting — ctl.Connect ends in syscall.Exec.
+	// Record telemetry before connecting — outside tmux, Connect replaces this
+	// process with the interactive client.
 	// Prefer the daemon (it owns the store), but fall back to writing locally if
 	// the ack does not come back, so a daemon that dies mid-session cannot
 	// silently stop frecency from updating.
@@ -485,8 +484,7 @@ func connectItem(ctl tmux.Connector, st store.Storer, res picker.Result) error {
 
 // recordOpen bumps frecency and co-occurrence for a session about to be opened.
 //
-// It must run BEFORE the connect: outside tmux, Ctl.Connect ends in syscall.Exec,
-// which replaces this process — nothing after it runs, defers included.
+// It must run before connect: outside tmux, Connect replaces this process.
 //
 // This is the standalone path's only telemetry write, and it did not exist. The
 // comment in internal/tmux/ctl.go claimed the daemon's background poll handled

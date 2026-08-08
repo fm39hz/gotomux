@@ -637,6 +637,39 @@ func cmdArgs(cmd string) []string {
 	return strings.Fields(cmd)
 }
 
+// execAttach replaces gotomux with an interactive tmux client while suppressing
+// only tmux's post-detach receipt. An attached tmux client transfers stdin's TTY
+// fd to the server, which renders through that fd; after detach, the client
+// prints "[detached ...]\n" separately on stdout. Redirecting stdout therefore
+// removes the receipt and its cursor-moving newline without touching TTY output.
+// Keep a close-on-exec copy so an exec failure can restore diagnostics.
+func execAttach(tmuxBin, name string) error {
+	devNull, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
+	if err != nil {
+		return err
+	}
+	defer devNull.Close()
+
+	savedStdout, err := syscall.Dup(int(os.Stdout.Fd()))
+	if err != nil {
+		return err
+	}
+	syscall.CloseOnExec(savedStdout)
+
+	if err := syscall.Dup2(int(devNull.Fd()), int(os.Stdout.Fd())); err != nil {
+		syscall.Close(savedStdout)
+		return err
+	}
+
+	execErr := syscall.Exec(tmuxBin, []string{"tmux", "attach-session", "-t", name}, os.Environ())
+	restoreErr := syscall.Dup2(savedStdout, int(os.Stdout.Fd()))
+	syscall.Close(savedStdout)
+	if execErr != nil {
+		return execErr
+	}
+	return restoreErr
+}
+
 func (c *Ctl) Connect(ctx context.Context, name, cwd string) error {
 	if !project.ValidSessionName(name) {
 		return fmt.Errorf("invalid session name %q", name)
@@ -659,18 +692,16 @@ func (c *Ctl) Connect(ctx context.Context, name, cwd string) error {
 		}
 		return nil
 	}
-	// Swap PID so gotomux doesn't linger as a zombie.
-	//
-	// NOTE: this replaces the process. Nothing after this point runs — no
-	// deferred close, no post-connect bookkeeping. Callers must record any
-	// telemetry BEFORE calling Connect. (A previous comment here claimed the
-	// daemon's background poll handled telemetry; it did not, and the usage table
-	// stayed empty as a result.)
+	// Replace gotomux with the interactive client. Its stdout is suppressed by
+	// execAttach, while the server continues to render through stdin's TTY fd.
 	tmuxBin, err := exec.LookPath("tmux")
 	if err != nil {
 		return fmt.Errorf("tmux not found: %w", err)
 	}
-	return syscall.Exec(tmuxBin, []string{"tmux", "attach-session", "-t", name}, os.Environ())
+	if err := execAttach(tmuxBin, name); err != nil {
+		return fmt.Errorf("attach to %q: %w", name, err)
+	}
+	return nil
 }
 
 func (c *Ctl) ConnectPreset(ctx context.Context, s *model.Session) error {

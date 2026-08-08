@@ -67,8 +67,11 @@ func RunPicker(cfg *config.Config, ctl tmux.Connector, st store.Storer, createNa
 	}
 }
 
+type cancelMsg struct{}
+
 // RunCancellable wraps a Bubble Tea program with SIGINT handling.
-// SIGINT triggers tea.Quit, returning the current model.
+// Route SIGINT through Update instead of stopping the renderer from outside so
+// every exit path publishes the same final, blank inline frame.
 // Returns tea.Model even on interrupt so caller can read Done().
 func RunCancellable(p *tea.Program) (tea.Model, error) {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
@@ -76,7 +79,7 @@ func RunCancellable(p *tea.Program) (tea.Model, error) {
 
 	go func() {
 		<-ctx.Done()
-		p.Quit()
+		p.Send(cancelMsg{})
 	}()
 
 	final, err := p.Run()
