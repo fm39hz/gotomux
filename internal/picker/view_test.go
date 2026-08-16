@@ -32,141 +32,80 @@ func TestCancelMsgUsesNormalQuitTransition(t *testing.T) {
 	}
 }
 
-func TestScrollOffBoundaries(t *testing.T) {
-	v := viewModel{maxShow: 12}
+func namedItems(n int) []Item {
+	items := make([]Item, n)
+	for i := range items {
+		items[i].Name = string(rune('a' + i))
+	}
+	return items
+}
 
-	// Empty list
-	if s := v.scrollOff(); s != 0 {
-		t.Fatalf("empty: got %d", s)
+func TestSelectionUsesCenterFollowViewport(t *testing.T) {
+	v := viewModel{maxShow: 12, items: namedItems(30)}
+	v.resetSelection()
+
+	for range 6 {
+		v.moveSelection(1)
+	}
+	if v.cursor != 6 || v.viewportStart != 0 {
+		t.Fatalf("before center-follow: cursor=%d start=%d", v.cursor, v.viewportStart)
 	}
 
-	// Fewer items than maxShow, cursor at 0
-	v.items = make([]Item, 5)
-	v.cursor = 0
-	if s := v.scrollOff(); s != 0 {
-		t.Fatalf("small list start: got %d", s)
+	v.moveSelection(1)
+	if v.cursor != 7 || v.viewportStart != 1 {
+		t.Fatalf("after center-follow: cursor=%d start=%d, want 7/1", v.cursor, v.viewportStart)
 	}
 
-	// Small list, cursor at end
-	v.cursor = 4
-	if s := v.scrollOff(); s != 0 {
-		t.Fatalf("small list end: got %d", s)
-	}
-
-	// Large list, cursor in middle
-	v.items = make([]Item, 30)
-	v.cursor = 15
-	// half=6, s=15-6=9, s+12=21 < 30 → s=9
-	if s := v.scrollOff(); s != 9 {
-		t.Fatalf("mid: want 9 got %d", s)
-	}
-
-	// Large list, cursor near end
-	v.cursor = 28
-	// half=6, s=28-6=22, s+12=34 > 30 → s=30-12=18
-	if s := v.scrollOff(); s != 18 {
-		t.Fatalf("near end: want 18 got %d", s)
-	}
-
-	// Large list, cursor at start (0 < half)
-	v.cursor = 3
-	// half=6, s=3-6=-3 → 0
-	if s := v.scrollOff(); s != 0 {
-		t.Fatalf("near start: want 0 got %d", s)
+	v.moveSelection(-1)
+	if v.cursor != 6 || v.viewportStart != 0 {
+		t.Fatalf("reverse center-follow: cursor=%d start=%d", v.cursor, v.viewportStart)
 	}
 }
 
-func TestScrollStableAfterShrink(t *testing.T) {
-	v := viewModel{maxShow: 12, items: make([]Item, 20), cursor: 10}
-
-	before := v.scrollOff() // half=6, s=10-6=4, s+12=16 < 20 → 4
-	if before != 4 {
-		t.Fatalf("before: want 4 got %d", before)
+func TestSelectionCyclesAtBoundaries(t *testing.T) {
+	v := viewModel{maxShow: 12, items: namedItems(20)}
+	v.resetSelection()
+	v.moveSelection(-1)
+	if v.cursor != 19 || v.viewportStart != 8 {
+		t.Fatalf("up at start: cursor=%d start=%d, want 19/8", v.cursor, v.viewportStart)
 	}
 
-	// Shrink list (simulate kill): 20 → 19 items
-	v.items = make([]Item, 19)
-	// Without adjustment: s=10-6=4, s+12=16 < 19 → 4 (same before → after)
-	after := v.scrollOff()
-	if after != 4 {
-		t.Fatalf("after shrink: want 4 got %d", after)
-	}
-
-	// Shrink more: 20 → 10 items
-	v.items = make([]Item, 10)
-	v.cursor = 10
-	after = v.scrollOff()
-	// half=6, s=10-6=4, s+12=16 > 10 → s=10-12=-2 → 0
-	// scroll changed from 4 to 0
-	if after != 0 {
-		t.Fatalf("after big shrink: want 0 got %d", after)
-	}
-
-	// After reload adjustment: cursor = savedScroll(4) + half(6) = 10 → clamp to 9
-	v.cursor = 9
-	after = v.scrollOff()
-	// half=6, s=9-6=3, s+12=15 > 10 → s=10-12=-2 → 0
-	if after != 0 {
-		t.Fatalf("after adjust: want 0 got %d", after)
-	}
-	// scrollOff vẫn là 0 vì list quá ngắn (10 < 12)
-}
-
-func TestScrollPreserveAfterAction(t *testing.T) {
-	v := viewModel{maxShow: 12, items: make([]Item, 25), cursor: 15}
-
-	shrunk := 20
-
-	// Simulate reload logic
-	savedScroll := v.scrollOff()
-	v.items = make([]Item, shrunk)
-	v.cursor = 15
-	if v.cursor >= shrunk {
-		v.cursor = shrunk - 1
-	}
-
-	// Restore scroll
-	half := v.maxShow / 2
-	c := savedScroll + half // 9 + 6 = 15
-	if c >= shrunk {
-		c = shrunk - 1
-	}
-	if c >= 0 {
-		v.cursor = c
-		v.selID = v.items[c].ID()
-	}
-
-	after := v.scrollOff()
-	// cursor=15, half=6, s=15-6=9, s+12=21>20 → s=20-12=8
-	if after != 8 {
-		t.Fatalf("after restore: want 8 got %d (saved=%d cursor=%d)", after, savedScroll, v.cursor)
+	v.moveSelection(1)
+	if v.cursor != 0 || v.viewportStart != 0 {
+		t.Fatalf("down at end: cursor=%d start=%d, want 0/0", v.cursor, v.viewportStart)
 	}
 }
 
-func TestCursorResetOnTyping(t *testing.T) {
-	v := viewModel{maxShow: 12, items: make([]Item, 20), cursor: 10}
-	v.selID = v.items[10].ID()
+func TestSelectionClampsAfterListShrinks(t *testing.T) {
+	v := viewModel{maxShow: 12, items: namedItems(25), cursor: 22, viewportStart: 13}
+	v.syncViewport()
+	v.items = v.items[:10]
+	v.syncViewport()
 
-	// refilterFromQuery resets cursor to 0
-	v.cursor = 0
-	v.selID = v.items[0].ID()
-
-	if v.cursor != 0 {
-		t.Fatal("cursor should be 0 after typing")
-	}
-	if s := v.scrollOff(); s != 0 {
-		t.Fatalf("scroll should be 0, got %d", s)
+	if v.cursor != 9 || v.viewportStart != 0 {
+		t.Fatalf("after shrink: cursor=%d start=%d, want 9/0", v.cursor, v.viewportStart)
 	}
 }
 
-func TestItemsCanRerankNoScrollJump(t *testing.T) {
-	v := viewModel{maxShow: 12, items: make([]Item, 30), cursor: 15}
-	saved := v.scrollOff() // 9
+func TestResetSelectionResetsViewport(t *testing.T) {
+	v := viewModel{maxShow: 12, items: namedItems(20), cursor: 10, viewportStart: 4}
+	v.resetSelection()
+	if v.cursor != 0 || v.viewportStart != 0 {
+		t.Fatalf("reset: cursor=%d start=%d", v.cursor, v.viewportStart)
+	}
+}
 
-	// Rerank: shuffle items, same count
-	// Without identity tracking, cursor stays at same index
-	v.cursor = 15
-	if s := v.scrollOff(); s != saved {
-		t.Fatalf("scroll changed after rerank: %d → %d", saved, s)
+func TestViewUsesRealTextCursorWithPromptOffset(t *testing.T) {
+	input := initInput()
+	input.SetValue("ab")
+	input.CursorEnd()
+	m := model{ui: viewModel{queryInput: input, maxShow: 1}}
+
+	view := m.View()
+	if view.Cursor == nil {
+		t.Fatal("view has no hardware cursor")
+	}
+	if view.Cursor.Position.X != 4 || view.Cursor.Position.Y != 0 {
+		t.Fatalf("cursor = (%d,%d), want (4,0)", view.Cursor.Position.X, view.Cursor.Position.Y)
 	}
 }

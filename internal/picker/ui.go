@@ -42,38 +42,63 @@ type Result struct {
 
 // viewModel — UI state, tách biệt khỏi business logic.
 type viewModel struct {
-	items      []Item
-	cursor     int
-	selID      ID
-	queryInput textinput.Model
-	status     string
-	done       Result
-	width      int
-	height     int
-	maxShow    int
-	helpOpen   bool
-	helpModel  help.Model
-	editPath   string
-	editOld    string
+	items         []Item
+	cursor        int
+	viewportStart int
+	queryInput    textinput.Model
+	status        string
+	done          Result
+	width         int
+	height        int
+	maxShow       int
+	helpOpen      bool
+	helpModel     help.Model
+	editPath      string
+	editOld       string
 }
 
-func (v *viewModel) scrollOff() int {
+func (v *viewModel) visibleRows() int {
 	ms := v.maxShow
 	if ms <= 0 {
 		ms = 12
 	}
-	half := ms / 2
-	s := v.cursor - half
-	if s < 0 {
-		s = 0
+	return ms
+}
+
+func (v *viewModel) clampViewport() {
+	maxStart := max(0, len(v.items)-v.visibleRows())
+	v.viewportStart = min(max(v.viewportStart, 0), maxStart)
+}
+
+// syncViewport keeps gotomux's center-follow navigation while making the
+// resulting viewport explicit state. View only renders this geometry.
+func (v *viewModel) syncViewport() {
+	if len(v.items) == 0 {
+		v.cursor = 0
+		v.viewportStart = 0
+		return
 	}
-	if s+ms > len(v.items) {
-		s = len(v.items) - ms
+
+	v.cursor = min(max(v.cursor, 0), len(v.items)-1)
+	v.viewportStart = v.cursor - v.visibleRows()/2
+	v.clampViewport()
+}
+
+func (v *viewModel) moveSelection(delta int) {
+	if len(v.items) == 0 {
+		return
 	}
-	if s < 0 {
-		s = 0
+	v.cursor = (v.cursor + delta) % len(v.items)
+	if v.cursor < 0 {
+		v.cursor += len(v.items)
 	}
-	return s
+	v.syncViewport()
+}
+
+func (v *viewModel) resetSelection() {
+	v.cursor = 0
+	v.viewportStart = 0
+	v.syncViewport()
 }
 
 // viewModel
@@ -174,6 +199,7 @@ func initInput() textinput.Model {
 	ti := textinput.New()
 	ti.Prompt = ""
 	ti.Placeholder = ""
+	ti.SetVirtualCursor(false)
 	ti.Focus()
 	return ti
 }
@@ -380,21 +406,11 @@ func (m *model) mergeSource(src Source, items []Item) {
 }
 
 func (m *model) refilter() {
-	// Preserve scroll offset so visual position doesn't jump on kill/delete.
+	// Preserve the current index. Query changes use refilterFromQuery and reset.
 	q := strings.ToLower(strings.TrimSpace(m.ui.queryInput.Value()))
 	m.ui.items = rankItems(q, m.pool())
 
-	if m.ui.cursor >= len(m.ui.items) {
-		m.ui.cursor = len(m.ui.items) - 1
-	}
-	if m.ui.cursor < 0 && len(m.ui.items) > 0 {
-		m.ui.cursor = 0
-	}
-	if len(m.ui.items) > 0 {
-		m.ui.selID = m.ui.items[m.ui.cursor].ID()
-	} else {
-		m.ui.selID = ""
-	}
+	m.ui.syncViewport()
 
 	for i := range m.ui.items {
 		setGitBranch(&m.ui.items[i])
@@ -402,13 +418,12 @@ func (m *model) refilter() {
 }
 
 func (m *model) refilterFromQuery() {
-	m.refilter()
-	m.ui.cursor = 0
-	if len(m.ui.items) > 0 {
-		m.ui.selID = m.ui.items[0].ID()
-	} else {
-		m.ui.selID = ""
+	q := strings.ToLower(strings.TrimSpace(m.ui.queryInput.Value()))
+	m.ui.items = rankItems(q, m.pool())
+	for i := range m.ui.items {
+		setGitBranch(&m.ui.items[i])
 	}
+	m.ui.resetSelection()
 }
 
 func (m *model) totalCount() int {
@@ -417,7 +432,6 @@ func (m *model) totalCount() int {
 
 func (m model) Init() tea.Cmd {
 	var cmds []tea.Cmd
-	cmds = append(cmds, textinput.Blink)
 	cmds = append(cmds, refreshCmds(m.sources)...)
 	if c := m.enrichRestCmd(); c != nil {
 		cmds = append(cmds, c)
@@ -454,6 +468,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.ui.maxShow = 12
 		}
 		m.ui.helpModel.SetWidth(msg.Width)
+		m.ui.queryInput.SetWidth(max(1, msg.Width-lipgloss.Width(iconPrompt())))
+		m.ui.syncViewport()
 
 	case tea.KeyPressMsg:
 		switch {
@@ -479,20 +495,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 
 		case key.Matches(msg, defaultKeyMap.Up):
-			if len(m.ui.items) > 0 {
-				m.ui.cursor--
-				if m.ui.cursor < 0 {
-					m.ui.cursor = len(m.ui.items) - 1
-				}
-				m.ui.selID = m.ui.items[m.ui.cursor].ID()
-			}
+			m.ui.moveSelection(-1)
 			return m, nil
 
 		case key.Matches(msg, defaultKeyMap.Down):
-			if len(m.ui.items) > 0 {
-				m.ui.cursor = (m.ui.cursor + 1) % len(m.ui.items)
-				m.ui.selID = m.ui.items[m.ui.cursor].ID()
-			}
+			m.ui.moveSelection(1)
 			return m, nil
 
 		case key.Matches(msg, defaultKeyMap.Sticky):
@@ -676,7 +683,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 // freeze makes the daemon's payload wrong, so this must read from tmux and SQLite
 // rather than re-serving what was handed over at startup.
 func (m *model) reload() {
-	savedScroll := m.ui.scrollOff()
+	savedScroll := m.ui.viewportStart
 	st := m.ensureStore()
 	m.cache.invalidate()
 	m.sources = defaultSources(m.ctl, st, m.createName, m.createCwd, m.cache)
@@ -685,16 +692,14 @@ func (m *model) reload() {
 	applyRankMeta(m.bySrc, st, m.env)
 	enrichAllSyncWith(m.bySrc, gitConc(m.cfg))
 	m.refilter()
-	// Actions (kill/freeze/delete/edit) change list length → preserve scroll.
-	if savedScroll > 0 && savedScroll != m.ui.scrollOff() {
-		half := m.ui.maxShow / 2
-		c := savedScroll + half
+	if savedScroll > 0 && savedScroll != m.ui.viewportStart {
+		c := savedScroll + m.ui.visibleRows()/2
 		if c >= len(m.ui.items) {
 			c = len(m.ui.items) - 1
 		}
 		if c >= 0 {
 			m.ui.cursor = c
-			m.ui.selID = m.ui.items[c].ID()
+			m.ui.syncViewport()
 		}
 	}
 }
@@ -792,10 +797,7 @@ func (m model) View() tea.View {
 	b.WriteString(styleHeader.Render(meta))
 	b.WriteByte('\n')
 
-	maxShow := m.ui.maxShow
-	if maxShow <= 0 {
-		maxShow = 12
-	}
+	maxShow := m.ui.visibleRows()
 
 	shown := 0
 	if len(m.ui.items) == 0 {
@@ -803,17 +805,7 @@ func (m model) View() tea.View {
 		b.WriteByte('\n')
 		shown = 1
 	} else {
-		half := maxShow / 2
-		start := m.ui.cursor - half
-		if start < 0 {
-			start = 0
-		}
-		if start+maxShow > len(m.ui.items) {
-			start = len(m.ui.items) - maxShow
-		}
-		if start < 0 {
-			start = 0
-		}
+		start := m.ui.viewportStart
 		end := start + maxShow
 		if end > len(m.ui.items) {
 			end = len(m.ui.items)
@@ -838,7 +830,7 @@ func (m model) View() tea.View {
 			if m.ui.width > 4 {
 				line = truncateRunes(line, m.ui.width-2)
 			}
-			if it.ID() == m.ui.selID {
+			if i == m.ui.cursor {
 				b.WriteString(styleCursor.Render(iconCursor() + line))
 			} else {
 				b.WriteString(styleFor(it.Kind).Render("  " + line))
@@ -856,5 +848,10 @@ func (m model) View() tea.View {
 		b.WriteString(styleStatus.Render(m.ui.status))
 	}
 	b.WriteByte('\n')
-	return tea.NewView(b.String())
+	view := tea.NewView(b.String())
+	view.Cursor = m.ui.queryInput.Cursor()
+	if view.Cursor != nil {
+		view.Cursor.Position.X += lipgloss.Width(iconPrompt())
+	}
+	return view
 }
