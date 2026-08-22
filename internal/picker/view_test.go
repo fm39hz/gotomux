@@ -2,6 +2,10 @@ package picker
 
 import (
 	"testing"
+
+	"github.com/charmbracelet/lipgloss"
+
+	"github.com/fm39hz/gotomux/internal/config"
 )
 
 func TestViewKeepsBlankAnchorAfterDone(t *testing.T) {
@@ -107,5 +111,23 @@ func TestViewUsesRealTextCursorWithPromptOffset(t *testing.T) {
 	}
 	if view.Cursor.Position.X != 4 || view.Cursor.Position.Y != 0 {
 		t.Fatalf("cursor = (%d,%d), want (4,0)", view.Cursor.Position.X, view.Cursor.Position.Y)
+	}
+}
+
+// TestCursorPrefixMatchesRowIndent pins the contract behind row alignment:
+// every list row is indented by a 2-cell prefix ("  " for idle rows), so the
+// cursor prefix must occupy exactly 2 cells in both icon modes. A narrower
+// prefix (e.g. a stripped Nerd glyph) shifts the cursor row left of the rest.
+func TestCursorPrefixMatchesRowIndent(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		model model
+	}{
+		{"nerd", model{}},
+		{"ascii", model{cfg: &config.Config{Icons: "ascii"}}},
+	} {
+		if got := lipgloss.Width(tc.model.iconCursor()); got != 2 {
+			t.Errorf("%s: iconCursor width = %d, want 2", tc.name, got)
+		}
 	}
 }

@@ -21,14 +21,14 @@ func (m model) nerdIcons() bool {
 
 func (m model) iconCursor() string {
 	if m.nerdIcons() {
-		return " " // nf-fa-caret_right
+		return "\uF0DA " // nf-fa-caret_right
 	}
 	return "> "
 }
 
 func (m model) iconSticky() string {
 	if m.nerdIcons() {
-		return " " // nf-fa-thumb_tack
+		return "\uF249 " // nf-fa-sticky_note
 	}
 	return "sticky:"
 }
