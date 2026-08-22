@@ -19,16 +19,30 @@ type mockStorer struct {
 	mirrors  map[string][2]string // id -> {path, sig}
 	stickyID string
 	presets  map[string]*model.Session
+	baseline map[string]*model.Session
 	ucalls   []string
 }
 
 func newMockStorer() *mockStorer {
 	return &mockStorer{
-		shapes:  map[string]string{},
-		keys:    map[string]string{},
-		mirrors: map[string][2]string{},
-		presets: map[string]*model.Session{},
+		shapes:   map[string]string{},
+		keys:     map[string]string{},
+		mirrors:  map[string][2]string{},
+		presets:  map[string]*model.Session{},
+		baseline: map[string]*model.Session{},
 	}
+}
+
+func (m *mockStorer) SaveBaseline(s *model.Session) error {
+	if m.baseline == nil {
+		m.baseline = map[string]*model.Session{}
+	}
+	m.baseline[s.Name] = s
+	return nil
+}
+
+func (m *mockStorer) GetBaseline(name string) (*model.Session, error) {
+	return m.baseline[name], nil
 }
 
 func (m *mockStorer) GetShapeMeta(id string) (store.ShapeMeta, bool) {
@@ -114,6 +128,7 @@ func (m *mockStorer) Touch(name string) error {
 
 func (m *mockStorer) RecordFork(key, body string) error             { return nil }
 func (m *mockStorer) RecordPlacement(shapeID, pattern string) error { return nil }
+func (m *mockStorer) BestPlacement(shapeID string) (string, bool)   { return "", false }
 func (m *mockStorer) ListShapes() ([]string, error) {
 	var ids []string
 	for id := range m.shapes {
@@ -133,6 +148,7 @@ func (m *mockConnector) Connect(ctx context.Context, name, cwd string) error { r
 func (m *mockConnector) Freeze(ctx context.Context, name string) (*model.Session, error) {
 	return &model.Session{Name: name, Cwd: "/tmp"}, nil
 }
+
 func (m *mockConnector) ConnectPreset(ctx context.Context, s *model.Session) error {
 	m.loadCall.Add(1)
 	return nil
@@ -170,7 +186,8 @@ func TestFreezeRemember(t *testing.T) {
 
 func TestFreezeSave(t *testing.T) {
 	st := newMockStorer()
-	s := &model.Session{Name: "test", Cwd: "/tmp",
+	s := &model.Session{
+		Name: "test", Cwd: "/tmp",
 		Windows: []model.Window{
 			{Name: "editor", Panes: []model.Pane{{Cmd: "nvim"}}},
 		},
@@ -192,7 +209,8 @@ func TestFreezeSave(t *testing.T) {
 
 func TestStickFrom(t *testing.T) {
 	st := newMockStorer()
-	p := &model.Session{Name: "test-session", Cwd: "/tmp",
+	p := &model.Session{
+		Name: "test-session", Cwd: "/tmp",
 		Windows: []model.Window{
 			{Name: "code", Panes: []model.Pane{{Cmd: "nvim"}}},
 			{Name: "term", Panes: []model.Pane{{}}},
@@ -232,7 +250,8 @@ func TestLoadActiveDefault(t *testing.T) {
 
 func TestLoadActiveSticky(t *testing.T) {
 	st := newMockStorer()
-	p := &model.Session{Name: "my-session", Cwd: "/tmp",
+	p := &model.Session{
+		Name: "my-session", Cwd: "/tmp",
 		Windows: []model.Window{
 			{Name: "editor", Panes: []model.Pane{{Cmd: "nvim"}}},
 		},

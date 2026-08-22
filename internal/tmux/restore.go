@@ -1,0 +1,111 @@
+package tmux
+
+import (
+	"context"
+	"fmt"
+	"strconv"
+	"strings"
+
+	"github.com/fm39hz/gotomux/internal/model"
+)
+
+// Restore building blocks: reshaping a live session without touching the
+// processes inside. move-window only renumbers — the pane tree (and every PID
+// in it) is untouched. new-window at a concrete index rebuilds a missing
+// window exactly like Load does.
+
+// paneCmd: the full command to recreate a pane — StartCmd when the freeze
+// captured one (keeps arguments like "sleep 300" instead of the detected
+// bare "sleep"), Cmd otherwise (pre-save presets have no StartCmd).
+func paneCmd(p model.Pane) string {
+	if p.StartCmd != "" {
+		return p.StartCmd
+	}
+	return p.Cmd
+}
+
+// windowBodyParts: post-creation sequence shared by Load and NewWindowAt —
+// automatic-rename off first (a rename after that would clobber our name),
+// then safe rename, remaining panes as splits, then layout.
+func windowBodyParts(t, session string, w model.Window) [][]string {
+	parts := [][]string{{"set-option", "-t", t, "automatic-rename", "off"}}
+	if safe := safeWindowName(w.Name, session); safe != "" {
+		parts = append(parts, []string{"rename-window", "-t", t, safe})
+	}
+	for _, pn := range w.Panes[1:] {
+		sp := []string{"split-window", "-t", t, "-h", "-c", pn.Cwd}
+		if cmd := paneCmd(pn); cmd != "" {
+			sp = append(sp, cmdArgs(cmd)...)
+		}
+		parts = append(parts, sp)
+	}
+	if w.Layout != "" {
+		parts = append(parts, []string{"select-layout", "-t", t, w.Layout})
+	}
+	return parts
+}
+
+// MoveWindow renumbers a window to a concrete index. It never kills anything:
+// the pane tree, processes, and layout are preserved.
+func (c *Ctl) MoveWindow(ctx context.Context, session string, from, to int) error {
+	return tmuxRun(ctx, "move-window", "-s", windowTarget(session, from), "-t", windowTarget(session, to))
+}
+
+// NewWindowAt creates a window at a concrete index with the same command /
+// split / layout sequence Load uses for preset windows. Fails if the index is
+// already occupied (callers vacate the target first).
+func (c *Ctl) NewWindowAt(ctx context.Context, session string, idx int, w model.Window, sessCwd string) error {
+	w = normalizeWindows([]model.Window{w}, sessCwd)[0]
+	t := windowTarget(session, idx)
+	p0 := w.Panes[0]
+	nw := []string{"new-window", "-d", "-t", t, "-c", p0.Cwd}
+	if cmd := paneCmd(p0); cmd != "" {
+		nw = append(nw, cmdArgs(cmd)...)
+	}
+	parts := [][]string{nw}
+	parts = append(parts, windowBodyParts(t, session, w)...)
+	return c.runChain(ctx, parts...)
+}
+
+// ActiveWindow reports the current window index of a session, so a restore
+// can leave the user exactly where they were working. Read via the
+// window_active flag (not display-message -t session): current window is
+// per-client, so a detached session answers "" to the latter.
+func (c *Ctl) ActiveWindow(ctx context.Context, session string) (int, error) {
+	out, err := tmuxCmd(ctx, "list-windows", "-t", session, "-F", "#{window_active}\t#{window_index}")
+	if err != nil {
+		return 0, err
+	}
+	for _, line := range strings.Split(out, "\n") {
+		parts := strings.SplitN(line, "\t", 2)
+		if len(parts) != 2 || parts[0] != "1" {
+			continue
+		}
+		n, err := strconv.Atoi(strings.TrimSpace(parts[1]))
+		if err != nil {
+			return 0, fmt.Errorf("active window: %w", err)
+		}
+		return n, nil
+	}
+	return 0, fmt.Errorf("active window: %q has no active window", session)
+}
+
+// ShowOption reads a session option value (the -v form: bare value). A
+// session-only lookup misses options set with `set -g`, so the caller
+// falls back by passing "" — which reads the global table.
+func (c *Ctl) ShowOption(ctx context.Context, session, name string) (string, error) {
+	if session == "" {
+		return tmuxCmd(ctx, "show-options", "-g", "-v", name)
+	}
+	return tmuxCmd(ctx, "show-options", "-t", session, "-v", name)
+}
+
+// SetOption sets a session option.
+func (c *Ctl) SetOption(ctx context.Context, session, name, value string) error {
+	return tmuxRun(ctx, "set-option", "-t", session, name, value)
+}
+
+// SelectWindow focuses a concrete window index.
+func (c *Ctl) SelectWindow(ctx context.Context, session string, idx int) error {
+	return tmuxRun(ctx, "select-window", "-t", windowTarget(session, idx))
+}

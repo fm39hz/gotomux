@@ -38,6 +38,9 @@ type Storer interface {
 	RememberShapeOnly(shapeID, shapeKey, shapeBody string) (outID string, created bool, err error)
 	GetShape(id string) (body string, ok bool)
 	GetShapeByKey(key string) (id, body string, ok bool)
+
+	SaveBaseline(sess *model.Session) error
+	GetBaseline(name string) (*model.Session, error)
 	GetShapeMeta(id string) (ShapeMeta, bool)
 	SetShapeMirror(id, path, sig string) error
 	PutShape(id, key, body string) (outID string, created bool, err error)
@@ -232,11 +235,10 @@ func (s *Store) Ping() error {
 // whole migration behind one PRAGMA read: the CREATE TABLE IF NOT EXISTS
 // statements and pragma_table_info probes are individually cheap but there are
 // fourteen of them, on the cold path of every invocation, to do nothing.
-//
 // The migration itself stays additive-only and idempotent — the fast path is an
 // optimisation, not a replacement, so a DB from a future version or one that
 // somehow lost user_version still gets the full run.
-const schemaVersion = 4
+const schemaVersion = 5
 
 func (s *Store) migrate() error {
 	var have int
@@ -406,6 +408,14 @@ CREATE TABLE IF NOT EXISTS fork (
 	// Schema 4: class-based fork keys (editor,shell) replace hashed keys (2942bbbd…);
 	// old fork data is stale — clear it. Reset mirror metadata so reconcileConfigShapes
 	// re-writes all files with new JSON format (class fields + class-based fork keys).
+	if _, err = s.db.Exec(`
+CREATE TABLE IF NOT EXISTS baseline (
+  name       TEXT PRIMARY KEY,
+  body       TEXT NOT NULL,
+  updated_at INTEGER NOT NULL
+);`); err != nil {
+		return err
+	}
 	_, _ = s.db.Exec(`DELETE FROM fork`)
 	_, _ = s.db.Exec(`UPDATE shape SET mirror_path = '', mirror_sig = ''`)
 	_, err = s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_session_last_used ON session(last_used DESC)`)

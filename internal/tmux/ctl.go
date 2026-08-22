@@ -139,8 +139,10 @@ func tmuxRun(ctx context.Context, args ...string) error {
 	return nil
 }
 
-const ListSessFmt = "S\t#{session_id}\t#{session_name}\t#{session_windows}\t#{session_path}\t#{session_last_attached}\t#{session_activity}\t#{session_created}\t#{session_attached}"
-const ListPanesFmt = "P\t#{session_name}\t#{pane_current_command}\t#{?pane_active,1,0}\t#{?pane_dead,1,0}"
+const (
+	ListSessFmt  = "S\t#{session_id}\t#{session_name}\t#{session_windows}\t#{session_path}\t#{session_last_attached}\t#{session_activity}\t#{session_created}\t#{session_attached}"
+	ListPanesFmt = "P\t#{session_name}\t#{pane_current_command}\t#{?pane_active,1,0}\t#{?pane_dead,1,0}"
+)
 
 type LiveSession struct {
 	// ID is tmux's own session id ("$0"). It is carried so a client can identify
@@ -195,7 +197,8 @@ func FindByID(sessions []LiveSession, id string) (LiveSession, bool) {
 }
 
 func (c *Ctl) ListLive(ctx context.Context) ([]LiveSession, error) {
-	out, err := exec.CommandContext(ctx, "tmux",
+	out, err := exec.CommandContext(
+		ctx, "tmux",
 		"list-sessions", "-F", ListSessFmt,
 		";",
 		"list-panes", "-s", "-F", ListPanesFmt,
@@ -460,9 +463,10 @@ func (c *Ctl) Freeze(ctx context.Context, name string) (*model.Session, error) {
 		}
 		cmd := detectPaneCmd(pCur, pStart, int32(pPid64), procs)
 		w.panes = append(w.panes, model.Pane{
-			Idx: pIdx,
-			Cwd: pPath,
-			Cmd: cmd,
+			Idx:      pIdx,
+			Cwd:      pPath,
+			Cmd:      cmd,
+			StartCmd: pStart,
 		})
 		if w.cwd == "" || pActive {
 			if pPath != "" {
@@ -514,21 +518,7 @@ func (c *Ctl) Load(ctx context.Context, sess *model.Session) error {
 
 	appendWin := func(i int, w model.Window, create []string) {
 		parts = append(parts, create)
-		t := windowTarget(sess.Name, base+i)
-		parts = append(parts, []string{"set-option", "-t", t, "automatic-rename", "off"})
-		if safe := safeWindowName(w.Name, sess.Name); safe != "" {
-			parts = append(parts, []string{"rename-window", "-t", t, safe})
-		}
-		for _, pn := range w.Panes[1:] {
-			sp := []string{"split-window", "-t", t, "-h", "-c", pn.Cwd}
-			if pn.Cmd != "" {
-				sp = append(sp, cmdArgs(pn.Cmd)...)
-			}
-			parts = append(parts, sp)
-		}
-		if w.Layout != "" {
-			parts = append(parts, []string{"select-layout", "-t", t, w.Layout})
-		}
+		parts = append(parts, windowBodyParts(windowTarget(sess.Name, base+i), sess.Name, w)...)
 	}
 
 	w0, p0 := wins[0], wins[0].Panes[0]

@@ -42,6 +42,7 @@ Flags:
   -v, --version  Show version
   -f, --freeze   Freeze current or named session as a preset
   -e, --edit     Edit a named preset (or freeze-then-edit)
+  -r, --reset    Restore current or named session to its baseline layout
   -p, --profile  Profile cold-start performance`)
 }
 
@@ -63,6 +64,16 @@ func main() {
 				name = os.Args[2]
 			}
 			if err := freezeCLI(cfg, name); err != nil && !errors.Is(err, errCancel) {
+				fmt.Fprintln(os.Stderr, err)
+				os.Exit(1)
+			}
+			return
+		case "-r", "--reset":
+			name := ""
+			if len(os.Args) > 2 && !strings.HasPrefix(os.Args[2], "-") {
+				name = os.Args[2]
+			}
+			if err := resetCLI(cfg, name); err != nil && !errors.Is(err, errCancel) {
 				fmt.Fprintln(os.Stderr, err)
 				os.Exit(1)
 			}
@@ -572,6 +583,7 @@ func freezeCLI(cfg *config.Config, name string) error {
 			return errCancel
 		}
 	}
+
 	stop := picker.HoldInterrupt()
 	_, _, err = template.FreezeRemember(ctl, st, name)
 	stop()
@@ -579,6 +591,36 @@ func freezeCLI(cfg *config.Config, name string) error {
 		return err
 	}
 	fmt.Printf("froze %s\n", name)
+	return nil
+}
+
+// resetCLI restores a session to its recorded baseline layout. Deliberately
+// standalone: a restore is a rare, interactive action, not a hot path.
+func resetCLI(cfg *config.Config, name string) error {
+	ctl, err := tmux.New()
+	if err != nil {
+		return fmt.Errorf("tmux: %w", err)
+	}
+	st, err := store.OpenWithConfig(cfg)
+	if err != nil {
+		return fmt.Errorf("store: %w", err)
+	}
+	defer st.Close()
+	if name == "" {
+		name = ctl.CurrentSession(context.Background())
+	}
+	if name == "" {
+		return fmt.Errorf("no active session: run gotomux -r inside tmux or pass a session name")
+	}
+	stop := picker.HoldInterrupt()
+	report, err := template.RestoreSession(context.Background(), ctl, st, name)
+	stop()
+	if err != nil {
+		return err
+	}
+	if report != "" {
+		fmt.Println(report)
+	}
 	return nil
 }
 

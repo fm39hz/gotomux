@@ -15,9 +15,10 @@ type Window struct {
 }
 
 type Pane struct {
-	Idx int
-	Cwd string
-	Cmd string
+	Idx      int
+	Cwd      string
+	Cmd      string // detected command without arguments
+	StartCmd string // the command the pane was started with (keeps args)
 }
 
 type Usage struct {

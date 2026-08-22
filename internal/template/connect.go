@@ -145,6 +145,11 @@ func FreezeSave(st store.Storer, s *model.Session, setSticky bool) (shapeID stri
 	if err != nil {
 		return "", false, fmt.Errorf("freeze save: %w", err)
 	}
+	// A freeze is the user saying "this is the good layout" — it becomes the
+	// restore baseline for this session.
+	if err := st.SaveBaseline(s); err != nil {
+		return "", false, fmt.Errorf("freeze save: baseline: %w", err)
+	}
 	emitShapeEvent(context.Background(), st, shapeID, s)
 	return shapeID, shapeCreated, nil
 }
@@ -195,11 +200,13 @@ func ConnectProject(ctl tmux.Connector, st store.Storer, name, cwd string) error
 		return nil
 	}
 	if st != nil {
-		if p, err := st.Get(name); err == nil {
+		if p, err := st.Get(name); err == nil && p != nil {
 			_ = st.Touch(name)
 			if err := ctl.ConnectPreset(context.Background(), p); err != nil {
 				return fmt.Errorf("load preset %q: %w", name, err)
 			}
+			// Loading a preset defines the session's starting layout.
+			_ = st.SaveBaseline(p)
 			return nil
 		}
 	}
@@ -211,5 +218,7 @@ func ConnectProject(ctl tmux.Connector, st store.Storer, name, cwd string) error
 	if err := ctl.ConnectPreset(context.Background(), baked); err != nil {
 		return fmt.Errorf("bake sticky %q as %q: %w", sid, name, err)
 	}
+	// A baked session is the starting layout; record it for `gotomux -r`.
+	_ = st.SaveBaseline(baked)
 	return nil
 }
