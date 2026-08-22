@@ -1,46 +1,57 @@
 name: Release
 on:
   push:
-    tags: ['v*']
+    branches: [master]
 
 permissions:
   contents: write
 
 jobs:
-  build:
+  release:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
       - uses: actions/setup-go@v5
         with:
-          go-version: stable
+          go-version-file: go.mod
+
+      - name: Test (fast gate)
+        run: go vet ./... && go test ./... -count=1 -short
 
       - name: Build
         run: |
           go build -ldflags="-s -w" -o gotomux .
           go build -ldflags="-s -w" -o gotomuxd ./cmd/gotomuxd/
 
+      - name: Record tag before release
+        run: echo "TAG_BEFORE=$(git tag --list 'v*' --sort=-v:refname | head -1)" >> "$GITHUB_ENV"
+
       - name: Release
-        uses: softprops/action-gh-release@v2
-        with:
-          files: |
-            gotomux
-            gotomuxd
+        uses: cycjimmy/semantic-release-action@v4
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-  aur:
-    if: github.repository == 'fm39hz/gotomux'
-    runs-on: ubuntu-latest
-    needs: build
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Prepare AUR PKGBUILD
+      - name: Detect new release
+        id: newrelease
+        env:
+          TAG_BEFORE: ${{ env.TAG_BEFORE }}
         run: |
-          tagver="${GITHUB_REF_NAME#v}"
-          sed -i "s/^pkgver=.*/pkgver=${tagver}/" PKGBUILD.aur
-          echo "=== PKGBUILD (pkgver=${tagver}) ==="
+          TAG_AFTER="$(git tag --list 'v*' --sort=-v:refname | head -1)"
+          if [ "$TAG_BEFORE" = "$TAG_AFTER" ]; then
+            echo "released=false" >> "$GITHUB_OUTPUT"
+            echo "no new release; skipping AUR"
+            exit 0
+          fi
+          echo "released=true" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG_AFTER#v}" >> "$GITHUB_OUTPUT"
+          sed -i "s/^pkgver=.*/pkgver=${TAG_AFTER#v}/" PKGBUILD.aur
           grep ^pkgver PKGBUILD.aur
+
       - name: Push to AUR
+        if: github.repository == 'fm39hz/gotomux' && steps.newrelease.outputs.released == 'true'
         uses: KSXGitHub/github-actions-deploy-aur@v4.2.0
         with:
           pkgname: gotomux

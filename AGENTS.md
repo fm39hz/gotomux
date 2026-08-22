@@ -17,7 +17,7 @@ make bench          # go test ./internal/picker/ -bench=. -benchmem
 make fmt vet        # gofmt -w . ; go vet ./...
 make install-all    # CLI + daemon + systemd user unit (enables gotomuxd)
 make pkg            # Arch package -> dist/*.pkg.tar.zst
-make publish patch  # scripts/bump-version.sh: tag & push
+# releases are fully automatic (semantic-release in CI); no manual tag step
 make help           # all targets
 ```
 
@@ -37,7 +37,7 @@ Test gating (matters when a test "doesn't run"):
 
 **Store tests must use `isolatedStore` (`internal/store/learn_test.go`), never `store.Open()` without redirecting the data dir.** Three tests used to run against the developer's real `state.db` — one with a comment admitting it — so `go test ./...` mutated live presets.
 
-CI (`.github/workflows/ci.yml`) has two jobs: `unit` (`go vet` + `go test -short`, no external tools) and `integration` (installs tmux, runs the full suite under `-race`, then the transport and daemon packages verbosely). The second exists because running only `-short` meant CI never executed the control-mode transport, the daemon, or the guard against destroying the user's sessions — those tests existed and none of them ran. No linter beyond vet. Tags `v*` trigger release + AUR push.
+No linter beyond vet. Releases are fully automatic: `release.yml` runs semantic-release on every push to master — `feat`→minor, `fix`/`perf`→patch, `BREAKING CHANGE`/`!`→major (at 0.x breaking→minor) — creating the `v*` tag, a GitHub Release with both binaries, then pushing the Arch package to AUR. Never tag by hand.
 
 ## Architecture
 
