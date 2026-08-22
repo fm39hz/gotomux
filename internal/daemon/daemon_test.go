@@ -24,15 +24,15 @@ func newIsolated(t *testing.T, sessions ...string) *Daemon {
 
 	root := tmuxtest.Isolate(t)
 
-	// The socket path is still derived from XDG_DATA_HOME in three separate
-	// places, so both of these are needed to keep the daemon's store, socket and
-	// lock file inside the scratch dir.
+	// XDG_DATA_HOME keeps the daemon's store, socket and lock file inside the
+	// scratch dir; a fresh empty XDG_CONFIG_HOME keeps the developer's real
+	// config.toml out of the daemon's settings.
 	state := filepath.Join(root, "state")
 	if err := os.MkdirAll(state, 0o700); err != nil {
 		t.Fatalf("mkdir %s: %v", state, err)
 	}
 	t.Setenv("XDG_DATA_HOME", state)
-	t.Setenv("GOTOMUX_DATA_DIR", state)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(root, "config"))
 	t.Setenv("XDG_RUNTIME_DIR", state)
 
 	tmuxtest.NewSessions(t, sessions...)
@@ -220,7 +220,7 @@ func TestDaemonDoesNotCreateTmuxServer(t *testing.T) {
 		t.Fatalf("mkdir: %v", err)
 	}
 	t.Setenv("XDG_DATA_HOME", state)
-	t.Setenv("GOTOMUX_DATA_DIR", state)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(root, "config"))
 	t.Setenv("XDG_RUNTIME_DIR", state)
 
 	// Isolate() starts a server so it can prove isolation; kill it so we begin
@@ -261,14 +261,15 @@ func TestDaemonAttachesToAnExistingServer(t *testing.T) {
 		t.Fatalf("mkdir: %v", err)
 	}
 	t.Setenv("XDG_DATA_HOME", state)
-	t.Setenv("GOTOMUX_DATA_DIR", state)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(root, "config"))
 	t.Setenv("XDG_RUNTIME_DIR", state)
-	t.Setenv("GOTOMUX_POLL_INTERVAL", "1s")
 
 	if err := exec.Command("tmux", "kill-server").Run(); err != nil {
 		t.Fatalf("kill-server: %v", err)
 	}
-	d, err := New(config.Load())
+	cfg := config.Load()
+	cfg.PollInterval = time.Second // default 10s would outrun this test's deadline
+	d, err := New(cfg)
 	if err != nil {
 		t.Fatalf("daemon.New: %v", err)
 	}
@@ -298,8 +299,7 @@ func TestDaemonAttachesToAnExistingServer(t *testing.T) {
 // duplicated 9.7 MB binary would double the I/O this is meant to minimise.
 func TestPrewarmPathsAreRealFiles(t *testing.T) {
 	dir := t.TempDir()
-	t.Setenv("GOTOMUX_DATA_DIR", dir)
-	paths := prewarmPaths(config.Load())
+	paths := prewarmPaths(&config.Config{DataDir: dir})
 
 	seen := map[string]bool{}
 	for _, p := range paths {
@@ -319,15 +319,14 @@ func TestPrewarmPathsAreRealFiles(t *testing.T) {
 }
 
 func TestPrewarmRespectsOptOut(t *testing.T) {
-	t.Setenv("GOTOMUX_NO_PREWARM", "1")
 	// Must return promptly without touching anything; the assertion is that it does
 	// not panic or block.
 	done := make(chan struct{})
-	go func() { prewarm(config.Load()); close(done) }()
+	go func() { prewarm(&config.Config{Prewarm: "off"}); close(done) }()
 	select {
 	case <-done:
 	case <-time.After(2 * time.Second):
-		t.Fatal("prewarm ignored GOTOMUX_NO_PREWARM")
+		t.Fatal(`prewarm ignored prewarm = "off"`)
 	}
 }
 

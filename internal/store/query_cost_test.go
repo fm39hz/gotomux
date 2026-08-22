@@ -15,7 +15,7 @@ func TestQueryCost(t *testing.T) {
 		t.Skip("QUERY_COST=1")
 	}
 	t0 := time.Now()
-	s, err := OpenWithConfig(config.Load())
+	s, err := OpenWithConfig(&config.Config{})
 	if err != nil {
 		t.Fatal(err)
 	}

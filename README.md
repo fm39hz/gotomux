@@ -37,7 +37,7 @@ make install-all       # CLI + daemon + systemd unit + enable
 ```
 
 **Requires:** `tmux`, `zoxide` (optional)
-**Optional:** Nerd Font (icons, or `GOTOMUX_ASCII=1`)
+**Optional:** Nerd Font (icons; or `icons = "ascii"` in the config file)
 
 ## Usage
 
@@ -157,6 +157,7 @@ Common patterns accumulate hit counts in the DB and can be composed into new sha
 | `$XDG_CONFIG_HOME/gotomux/shapes/<label>--<id8>.json` | shape backup (auto-reconciled) |
 | `$XDG_DATA_HOME/gotomux/state.db`                     | presets, shapes, usage, forks  |
 | `$XDG_DATA_HOME/gotomux/gotomuxd.sock`                | daemon IPC (if running)        |
+| `$XDG_CONFIG_HOME/gotomux/config.toml`                | settings (env vars override)   |
 
 ## Ranking
 
@@ -176,13 +177,32 @@ Same formula everywhere, environment only changes inputs:
 
 "Just left" surfaces via recency.
 
-## Env
+## Configuration
 
-| Variable            | Effect                        |
-| ------------------- | ----------------------------- |
-| `GOTOMUX_ASCII=1`   | TUI without Nerd Font icons   |
-| `GOTOMUX_NERD=1`    | force nerd icons              |
-| `EDITOR` / `VISUAL` | preset edit (`-e` / `ctrl-e`) |
+Settings live in `$XDG_CONFIG_HOME/gotomux/config.toml`, next to `shapes/`.
+Precedence: defaults < config file.
+
+```toml
+# gotomux configuration
+data_dir        = ""     # base for state.db + socket   ($XDG_DATA_HOME/gotomux)
+config_dir      = ""     # base for shapes/ + this file ($XDG_CONFIG_HOME/gotomux)
+
+poll_interval   = "10s"  # daemon sync cadence
+zoxide_cap      = 40     # zoxide rows when the query is empty
+max_show        = 12     # visible picker rows
+git_concurrency = 4      # git enrich workers
+proc_cache_ttl  = "2s"   # pane process detection cache
+prune_cutoff    = "720h" # stale row prune age
+
+icons           = "auto" # auto | nerd | ascii
+
+[daemon]
+autostart = true         # picker may start gotomuxd
+prewarm   = "auto"       # auto (rotational disks) | on | off
+```
+
+Unknown keys are reported and ignored; a malformed entry degrades to its default instead of failing startup.
+The daemon applies the file at start — `systemctl --user restart gotomuxd` after edits.
 
 ## Roadmap
 

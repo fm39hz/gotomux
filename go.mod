@@ -5,7 +5,7 @@ go 1.26.5
 require (
 	charm.land/bubbles/v2 v2.1.1
 	charm.land/bubbletea/v2 v2.0.8
-	github.com/caarlos0/env/v11 v11.4.1
+	github.com/BurntSushi/toml v1.6.0
 	github.com/charmbracelet/lipgloss v1.1.0
 	github.com/epilande/go-devicons v0.0.0-20250505162540-0661cab71a28
 	github.com/junegunn/fzf v0.74.1

@@ -1,7 +1,6 @@
 package picker
 
 import (
-	"os"
 	"strings"
 
 	"github.com/epilande/go-devicons"
@@ -11,41 +10,37 @@ import (
 // TUI chrome may use Nerd Font glyphs when useful.
 // Filenames / shape labels on disk stay ASCII (template.ShapeLabel).
 //
-// GOTOMUX_ASCII=1 forces plain ASCII.
+// icons = "ascii" in config.toml forces plain ASCII.
 
-func useNerdIcons() bool {
-	if os.Getenv("GOTOMUX_ASCII") == "1" {
-		return false
+func (m model) nerdIcons() bool {
+	if m.cfg == nil {
+		return true // historical default for bare models in tests
 	}
-	if os.Getenv("GOTOMUX_NERD") == "1" {
-		return true
+	return m.cfg.NerdIcons()
+}
+
+func (m model) iconCursor() string {
+	if m.nerdIcons() {
+		return " " // nf-fa-caret_right
 	}
-	// default on for local TUI (user prefers nerd when available)
-	return true
+	return "> "
+}
+
+func (m model) iconSticky() string {
+	if m.nerdIcons() {
+		return " " // nf-fa-thumb_tack
+	}
+	return "sticky:"
 }
 
 func iconPrompt() string {
 	return ": " // simple consistent prefix
 }
 
-func iconCursor() string {
-	if useNerdIcons() {
-		return " " // nf-fa-caret_right
-	}
-	return "> "
-}
-
-func iconSticky() string {
-	if useNerdIcons() {
-		return " " // nf-fa-thumb_tack
-	}
-	return "sticky:"
-}
-
 // iconForTool maps sticky label tokens to nerd icons.
 // Uses toolclass first; files/folder tokens via go-devicons (nvim-web-devicons maps).
-func iconForTool(tok string) string {
-	if !useNerdIcons() {
+func (m model) iconForTool(tok string) string {
+	if !m.nerdIcons() {
 		return tok
 	}
 	// split/count tokens stay ascii (v2, t4, h2, pN)
@@ -81,16 +76,16 @@ func iconForTool(tok string) string {
 }
 
 // formatStickyMeta: " sticky:nvim+v2+yazi" or pin + nerd icons.
-func formatStickyMeta(label string) string {
+func (m model) formatStickyMeta(label string) string {
 	if label == "" || label == "default" {
 		return ""
 	}
-	if !useNerdIcons() {
+	if !m.nerdIcons() {
 		return "  sticky:" + label
 	}
 	parts := strings.Split(label, "+")
 	for i, p := range parts {
-		parts[i] = iconForTool(p)
+		parts[i] = m.iconForTool(p)
 	}
-	return "  " + iconSticky() + strings.Join(parts, " +")
+	return "  " + m.iconSticky() + strings.Join(parts, " +")
 }

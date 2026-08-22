@@ -35,16 +35,19 @@ const prewarmBudget = 30 * time.Second
 // in is only expensive when cold, and pre-reading it is far cheaper than
 // restructuring the CLI to drop SQLite.
 //
-// Set GOTOMUX_NO_PREWARM=1 to skip.
+// prewarm = "off" in config.toml skips; "on" forces even on SSDs; the default
+// "auto" warms only rotational disks.
 func prewarm(cfg *config.Config) {
-	if os.Getenv("GOTOMUX_NO_PREWARM") != "" {
+	switch cfg.Prewarm {
+	case "off":
 		return
-	}
-	// Only worth it on seek-bound storage. On an SSD the cold path is already
-	// milliseconds, so reading ~12 MB would be pure waste — of I/O, of page cache,
-	// and of battery on a laptop.
-	if !onRotationalDisk(cfg) {
-		return
+	case "auto":
+		// Only worth it on seek-bound storage. On an SSD the cold path is already
+		// milliseconds, so reading ~12 MB would be pure waste — of I/O, of page cache,
+		// and of battery on a laptop.
+		if !onRotationalDisk(cfg) {
+			return
+		}
 	}
 	deadline := time.Now().Add(prewarmBudget)
 	var n int64
@@ -136,9 +139,6 @@ func readThrough(path string) int64 {
 // skipping a speculative optimisation is always safe, doing 12 MB of pointless I/O
 // on someone's SSD is not.
 func onRotationalDisk(cfg *config.Config) bool {
-	if v := os.Getenv("GOTOMUX_FORCE_PREWARM"); v != "" {
-		return true
-	}
 	if cfg == nil {
 		return false
 	}

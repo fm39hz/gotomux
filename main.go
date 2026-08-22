@@ -27,8 +27,10 @@ import (
 	"github.com/fm39hz/gotomux/internal/tmux"
 )
 
-var version = "dev"
-var errCancel = picker.ErrCancel
+var (
+	version   = "dev"
+	errCancel = picker.ErrCancel
+)
 
 func init() { algo.Init("default") }
 
@@ -105,7 +107,7 @@ func runPicker(cfg *config.Config) error {
 	// "instant" depended on the user having run `make install-all` to enable the
 	// systemd unit — on any other machine every invocation paid full cold start
 	// forever.
-	spawnDaemon()
+	spawnDaemon(cfg)
 	return runPickerStandalone(cfg)
 }
 
@@ -118,9 +120,9 @@ func runPicker(cfg *config.Config) error {
 // now only the fallback for machines with no user unit.
 //
 // Racing invocations are harmless either way: the loser sees ErrAlreadyRunning and
-// exits zero. Set GOTOMUX_NO_AUTOSTART=1 to opt out entirely.
-func spawnDaemon() {
-	if os.Getenv("GOTOMUX_NO_AUTOSTART") != "" {
+// exits zero. Opt out with [daemon] autostart = false in config.toml.
+func spawnDaemon(cfg *config.Config) {
+	if !cfg.Autostart {
 		return
 	}
 	if startViaSystemd() {

@@ -241,8 +241,8 @@ type Seed struct {
 // struct is populated.
 func assemble(cfg *config.Config, d Deps, createName, createCwd string,
 	cache *sourceCache, srcs []Source, bySrc map[Source][]Item,
-	env Context, stickyLabel string) model {
-
+	env Context, stickyLabel string,
+) model {
 	tmpl := stickyLabel
 	if tmpl == "" && d.Store != nil {
 		tmpl = template.StickyLabel(d.Store)
@@ -792,7 +792,7 @@ func (m model) View() tea.View {
 	if m.ui.helpOpen {
 		meta += "  " + m.ui.helpModel.ShortHelpView(defaultKeyMap.ShortHelp())
 	} else if m.tmpl != "" && m.tmpl != "default" {
-		meta += formatStickyMeta(m.tmpl) + "  enter | esc | ?"
+		meta += m.formatStickyMeta(m.tmpl) + "  enter | esc | ?"
 	} else {
 		meta += "  enter | esc | ?"
 	}
@@ -833,7 +833,7 @@ func (m model) View() tea.View {
 				line = truncateRunes(line, m.ui.width-2)
 			}
 			if i == m.ui.cursor {
-				b.WriteString(styleCursor.Render(iconCursor() + line))
+				b.WriteString(styleCursor.Render(m.iconCursor() + line))
 			} else {
 				b.WriteString(styleFor(it.Kind).Render("  " + line))
 			}

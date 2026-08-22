@@ -11,8 +11,7 @@ import (
 // package, it never touches the developer's real state.db.
 func isolatedStore(t *testing.T) *Store {
 	t.Helper()
-	t.Setenv("GOTOMUX_DATA_DIR", t.TempDir())
-	s, err := OpenWithConfig(config.Load())
+	s, err := OpenWithConfig(&config.Config{DataDir: t.TempDir()})
 	if err != nil {
 		t.Fatalf("OpenWithConfig: %v", err)
 	}
@@ -76,7 +75,8 @@ func TestPruneDropsSupersededPlacements(t *testing.T) {
 	var n int
 	if err := s.db.QueryRow(
 		`SELECT COUNT(*) FROM placement WHERE shape_id = ? AND pattern = ?`,
-		"shape-multi", "R,R").Scan(&n); err != nil {
+		"shape-multi", "R,R",
+	).Scan(&n); err != nil {
 		t.Fatalf("count: %v", err)
 	}
 	if n != 0 {

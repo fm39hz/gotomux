@@ -45,7 +45,7 @@ CI (`.github/workflows/ci.yml`) has two jobs: `unit` (`go vet` + `go test -short
 main.go               CLI entry: flags, daemon probe, freeze/edit/profile paths
 cmd/gotomuxd/         daemon entry (thin; all logic in internal/daemon)
 internal/
-  config/    env-driven Config + XDG dir resolution (every path goes through this)
+  config/    config.toml + env-driven Config, XDG dir resolution (every path goes through this)
   model/     shared Session/Window/Pane/Usage types — the lingua franca
   daemon/    poll loop, tmux control-socket cache, Unix-socket IPC
   event/     tiny in-process pub/sub (freeze.done, shape.saved)
@@ -170,22 +170,27 @@ Inside tmux (`$TMUX` set): `SwitchClient`. Outside: `Attach`. `Load` is a no-op 
 
 ## Config
 
-All tunables are env vars parsed by `caarlos0/env` into `config.Config` (`internal/config/config.go`) — add new ones there, not as scattered `os.Getenv` calls, and thread `*config.Config` through rather than reading the environment deep in a package.
+Settings resolve in two layers: **defaults < `$XDG_CONFIG_HOME/gotomux/config.toml`** (`internal/config/config.go`). There is deliberately no environment layer: the file is the single inspectable source, so a stray exported variable can never half-override an edit. The XDG_* base-dir variables locate the installation but are not gotomux configuration. Add new tunables to `Config`, never as scattered `os.Getenv` calls, and thread `*config.Config` through rather than reading the environment deep in a package.
 
-| Var | Default | Effect |
+File keys (TOML, mirror the struct; unknown keys are reported and ignored, malformed entries degrade to defaults):
+
+| Key | Default | Effect |
 | --- | --- | --- |
-| `GOTOMUX_DATA_DIR` / `GOTOMUX_CONFIG_DIR` | XDG | override base dirs |
-| `GOTOMUX_POLL_INTERVAL` | `10s` | daemon poll |
-| `GOTOMUX_ZOXIDE_CAP` | `40` | zoxide items when query empty |
-| `GOTOMUX_MAX_SHOW` | `12` | visible rows |
-| `GOTOMUX_GIT_CONCURRENCY` | `4` | git enrich workers |
-| `GOTOMUX_PROC_CACHE_TTL` | `2s` | pane process detection cache |
-| `GOTOMUX_PRUNE_CUTOFF` | `720h` | stale row prune |
+| `data_dir` / `config_dir` | XDG | override base dirs (the file cannot relocate its own directory — that comes from `XDG_CONFIG_HOME` only) |
+| `poll_interval` | `"10s"` | daemon poll |
+| `zoxide_cap` | `40` | zoxide items when query empty |
+| `max_show` | `12` | visible rows |
+| `git_concurrency` | `4` | git enrich workers |
+| `proc_cache_ttl` | `"2s"` | pane process detection cache |
+| `prune_cutoff` | `"720h"` | stale row prune |
+| `icons` | `"auto"` | `auto` \| `nerd` \| `ascii` TUI glyphs |
+| `[daemon] autostart` | `true` | picker may start gotomuxd |
+| `[daemon] prewarm` | `"auto"` | `auto` (rotational disks) \| `on` \| `off` page-cache warm |
 
-Read directly (not in `Config`): `GOTOMUX_ASCII=1` / `GOTOMUX_NERD=1` (icons), `EDITOR`/`VISUAL`.
+There are no `GOTOMUX_*` settings variables anymore. Genuinely env-only: `XDG_DATA_HOME` / `XDG_CONFIG_HOME` (locate directories), `EDITOR`/`VISUAL`, diagnostics and test gates (`GOTMUX_TRACE`, `STARTUP_BENCH`, …).
 
 ## External deps
 
-`charm.land/bubbletea/v2` + `bubbles/v2` + `lipgloss` (TUI), `junegunn/fzf/src/algo` (fuzzy core, needs `algo.Init` in `main`), `modernc.org/sqlite`, `shirou/gopsutil/v4` + `/proc` (freeze cmd detection, Linux), `richardwooding/projectdetect`, `epilande/go-devicons`, `caarlos0/env/v11`. Runtime: `tmux` required, `zoxide` optional.
+`charm.land/bubbletea/v2` + `bubbles/v2` + `lipgloss` (TUI), `junegunn/fzf/src/algo` (fuzzy core, needs `algo.Init` in `main`), `modernc.org/sqlite`, `shirou/gopsutil/v4` + `/proc` (freeze cmd detection, Linux), `richardwooding/projectdetect`, `epilande/go-devicons`, `BurntSushi/toml` (config file). Runtime: `tmux` required, `zoxide` optional.
 
 Session listing/attach is done with hand-built tmux commands in `internal/tmux` (both `exec` and the control socket) — there is no tmux client library in the tree.

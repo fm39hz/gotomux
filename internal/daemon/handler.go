@@ -127,7 +127,7 @@ func acquireLock(sockPath string) (func(), error) {
 //
 // The path comes from the Daemon, which got it from Config — so the socket
 // ensureSocket watches and the socket bound here are the same value by
-// construction, and GOTOMUX_DATA_DIR relocates both.
+// construction, and data_dir in config.toml relocates both.
 func ServeIPC(d *Daemon) error {
 	sock := d.sockPath
 	if err := os.MkdirAll(filepath.Dir(sock), 0o755); err != nil {
@@ -300,10 +300,12 @@ func (d *Daemon) buildListResponse(sessID string) Response {
 		pairs = allPairs[cur.Name]
 	}
 
-	return Response{OK: true,
+	return Response{
+		OK:    true,
 		Ready: d.ready.Load(), SyncedAt: d.syncedAt.Load(),
 		Version:  d.stateVersion.Load(),
 		Sessions: sessions, Presets: presets,
 		Pairs: pairs, Usage: usage, StickyLabel: sticky,
-		GitBranches: gitBranches, Zoxide: zoxide}
+		GitBranches: gitBranches, Zoxide: zoxide,
+	}
 }
