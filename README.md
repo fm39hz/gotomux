@@ -49,7 +49,7 @@ Flags:
   -v, --version  Show version
   -f, --freeze   Freeze current or named session as a preset
   -e, --edit     Edit a named preset (or freeze-then-edit)
-  -p, --profile  Profile cold-start
+  -r, --reset    Restore current or named session to its baseline layout
 ```
 
 The picker opens instantly. Type to filter, Enter to connect.
@@ -149,6 +149,16 @@ Sticky shapes are used for new projects via Create/Zoxide.
 
 The `fork` string is a window essence fingerprint (`panes|split|tools`).
 Common patterns accumulate hit counts in the DB and can be composed into new shapes automatically.
+
+### Reset
+
+`gotomux -r` restores a session to its recorded baseline layout — run it inside tmux for the current session, or pass a name (`gotomux -r my-session`).
+
+- **Baseline**: the preset written when the session was created (bake) or frozen. Hand-built sessions get one on the first `-r`, so a second run actually restores.
+- **Dead windows** (the pane exited, tmux closed the window, renumbering shifted the rest) are recreated at their baseline index with their original command; surviving windows are moved back to their baseline position.
+- **Nothing is killed**: windows you added beyond the baseline stay, processes intact.
+
+No output and no changes when the session already matches the baseline.
 
 ### Data
 
