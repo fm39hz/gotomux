@@ -33,7 +33,10 @@ func (m model) iconSticky() string {
 	return "sticky:"
 }
 
-func iconPrompt() string {
+func (m model) iconPrompt() string {
+	if m.nerdIcons() {
+		return toolclass.GlyphSearch + " "
+	}
 	return ": " // simple consistent prefix
 }
 
@@ -75,17 +78,17 @@ func (m model) iconForTool(tok string) string {
 	return tok
 }
 
-// formatStickyMeta: " sticky:nvim+v2+yazi" or pin + nerd icons.
+// formatStickyMeta: "sticky:nvim+v2+yazi" (ascii) or pin + bracketed nerd icons.
 func (m model) formatStickyMeta(label string) string {
 	if label == "" || label == "default" {
 		return ""
 	}
 	if !m.nerdIcons() {
-		return "  sticky:" + label
+		return "sticky:" + label
 	}
 	parts := strings.Split(label, "+")
 	for i, p := range parts {
 		parts[i] = m.iconForTool(p)
 	}
-	return "  " + m.iconSticky() + strings.Join(parts, " +")
+	return m.iconSticky() + "[" + strings.Join(parts, " | ") + "]"
 }

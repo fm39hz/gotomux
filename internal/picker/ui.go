@@ -470,7 +470,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.ui.maxShow = 12
 		}
 		m.ui.helpModel.SetWidth(msg.Width)
-		m.ui.queryInput.SetWidth(max(1, msg.Width-lipgloss.Width(iconPrompt())))
+		m.ui.queryInput.SetWidth(max(1, msg.Width-lipgloss.Width(m.iconPrompt())))
 		m.ui.syncViewport()
 
 	case tea.KeyPressMsg:
@@ -784,17 +784,17 @@ func (m model) View() tea.View {
 
 	var b strings.Builder
 
-	b.WriteString(styleDim.Render(iconPrompt()))
+	b.WriteString(styleDim.Render(m.iconPrompt()))
 	b.WriteString(m.ui.queryInput.View())
 	b.WriteByte('\n')
 
-	meta := fmt.Sprintf("  %d/%d", len(m.ui.items), m.totalCount())
+	meta := fmt.Sprintf("[%d/%d]", len(m.ui.items), m.totalCount())
 	if m.ui.helpOpen {
 		meta += "  " + m.ui.helpModel.ShortHelpView(defaultKeyMap.ShortHelp())
 	} else if m.tmpl != "" && m.tmpl != "default" {
-		meta += m.formatStickyMeta(m.tmpl) + "  enter | esc | ?"
+		meta += " " + m.formatStickyMeta(m.tmpl) + " ?"
 	} else {
-		meta += "  enter | esc | ?"
+		meta += " ?"
 	}
 	b.WriteString(styleHeader.Render(meta))
 	b.WriteByte('\n')
@@ -859,7 +859,7 @@ func (m model) View() tea.View {
 	view.AltScreen = m.altScreen
 	view.Cursor = m.ui.queryInput.Cursor()
 	if view.Cursor != nil {
-		view.Cursor.Position.X += lipgloss.Width(iconPrompt())
+		view.Cursor.Position.X += lipgloss.Width(m.iconPrompt())
 	}
 	return view
 }

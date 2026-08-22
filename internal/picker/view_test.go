@@ -6,6 +6,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 
 	"github.com/fm39hz/gotomux/internal/config"
+	"github.com/fm39hz/gotomux/internal/toolclass"
 )
 
 func TestViewKeepsBlankAnchorAfterDone(t *testing.T) {
@@ -128,6 +129,31 @@ func TestCursorPrefixMatchesRowIndent(t *testing.T) {
 	} {
 		if got := lipgloss.Width(tc.model.iconCursor()); got != 2 {
 			t.Errorf("%s: iconCursor width = %d, want 2", tc.name, got)
+		}
+	}
+}
+
+// TestPromptWidthMatchesInBothIconModes pins the input-prompt contract: the
+// fa-search glyph (nerd) and ": " (ascii) both occupy exactly 2 cells, so
+// query-input width and the hardware-cursor offset stay mode-independent.
+func TestPromptWidthMatchesInBothIconModes(t *testing.T) {
+	nerd := model{}
+	ascii := model{cfg: &config.Config{Icons: "ascii"}}
+	if got, want := nerd.iconPrompt(), toolclass.GlyphSearch+" "; got != want {
+		t.Errorf("nerd prompt = %q, want %q (fa-search + space)", got, want)
+	}
+	if got := ascii.iconPrompt(); got != ": " {
+		t.Errorf("ascii prompt = %q, want %q", got, ": ")
+	}
+	for _, tc := range []struct {
+		name string
+		m    model
+	}{
+		{"nerd", nerd},
+		{"ascii", ascii},
+	} {
+		if got := lipgloss.Width(tc.m.iconPrompt()); got != 2 {
+			t.Errorf("%s: iconPrompt width = %d, want 2", tc.name, got)
 		}
 	}
 }

@@ -8,20 +8,14 @@
 package toolclass
 
 const (
-	// nf-fa-caret_right — picker cursor marker.
-	GlyphCaretRight = "\uF0DA"
-	// nf-md-pin — sticky-shape marker.
-	GlyphPin = "\U000F0403"
-	// nf-dev-vim — editor role.
-	GlyphEditor = "\uE7C5"
-	// nf-fa-folder — files role.
-	GlyphFolder = "\uF07B"
-	// nf-fa-terminal — shell role.
-	GlyphShell = "\uF120"
-	// nf-fa-robot — agent role. (The old \uF544 is not in the NF table.)
-	GlyphAgent = "\uEE0D"
-	// nf-dev-git_branch — git role.
-	GlyphGit = "\uE725"
+	GlyphSearch = ""
+	GlyphCaretRight = ""
+	GlyphPin = "󰐃"
+	GlyphEditor = ""
+	GlyphFolder = ""
+	GlyphShell = ""
+	GlyphAgent = ""
+	GlyphGit = ""
 )
 
 // NerdIcon returns a nerd-font glyph for a tool or role token; empty if unknown.
