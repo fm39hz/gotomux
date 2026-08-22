@@ -136,42 +136,6 @@ func ChromeRole(tool string) string {
 	}
 }
 
-// NerdIcon returns a nerd-font glyph for a tool or role token; empty if unknown.
-// Callers decide ASCII fallback.
-func NerdIcon(tok string) string {
-	tok = Base(tok)
-	if tok == "" {
-		return ""
-	}
-	// role aliases
-	switch tok {
-	case "editor":
-		return "" // nf-dev-vim
-	case "files", "file":
-		return "" // folder
-	case "shell", "sh", "term", "terminal":
-		return "" // terminal
-	case "agent":
-		return "" // robot
-	case "git":
-		return "" // git branch
-	}
-	switch Classify(tok) {
-	case KindEditor:
-		return ""
-	case KindFiles:
-		return ""
-	case KindGit:
-		return ""
-	case KindAgent:
-		return ""
-	case KindShell:
-		return ""
-	default:
-		return ""
-	}
-}
-
 // Base: first field basename, lower, strip leading '-'.
 func Base(cmd string) string {
 	cmd = strings.TrimSpace(cmd)
