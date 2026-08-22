@@ -12,8 +12,9 @@ Forget about tmux and just jump into work: live sessions, saved presets, with [z
 **Arch Linux:**
 
 ```bash
-paru -S gotomux                           # or yay
-systemctl --user enable --now gotomuxd    # daemon for instant cold start
+paru -S gotomux
+# optional, for instant cold start
+systemctl --user enable --now gotomuxd
 ```
 
 **Go (any platform):**
@@ -82,10 +83,11 @@ Gotomux auto-detects the daemon on startup. If absent, it will falls back to sta
 
 ### Shell
 
-This is the setup i use for myself, adapt into your own shell config if needed
+This is the setup I use for myself, adapt into your own shell config if needed
 
-```bash
-# nushell
+#### Nushell
+
+```nu
 $env.config.keybindings ++= [{
   name: launch_gotomux
   modifier: control
@@ -95,12 +97,23 @@ $env.config.keybindings ++= [{
 }]
 ```
 
+#### Fish
+
+```fish
+function fish_user_key_bindings
+    for mode in insert default visual
+        bind -M $mode \cb 'gotomux; commandline -f repaint'
+    end
+end
+
+```
+
 ### Tmux popup
 
 ```tmux
-bind-key C-b display-popup -T " Go to mux " -w 80% -h 70% -x C -y C -E "$HOME/go/bin/gotomux"
-bind-key C-e run-shell "$HOME/go/bin/gotomux -e"
-bind-key -n C-f run-shell "tmux display-message \"$($HOME/go/bin/gotomux -f)\""
+bind-key C-b display-popup -T " Go to mux " -w 80% -h 70% -x C -y C -E "gotomux"
+bind-key C-e run-shell "gotomux -e"
+bind-key -n C-f run-shell "tmux display-message \"$(gotomux -f)\""
 ```
 
 ## Behaviour
@@ -174,8 +187,7 @@ Same formula everywhere, environment only changes inputs:
 ## Roadmap
 
 Local first.
-⚠️ WARNING: gotomux is still in early development stages. Some unintended behavior might occur.
-If you encounter any issue, please report it so I may fix it.
+> **WARNING!**: gotomux is still in early development stages. Some unintended behavior might occur.
 
 - [x] Sources: create / tmux / preset / zoxide
 - [x] Freeze / load, sticky shapes, placement + fork learning
