@@ -788,7 +788,7 @@ func (m model) View() tea.View {
 	b.WriteString(m.ui.queryInput.View())
 	b.WriteByte('\n')
 
-	meta := fmt.Sprintf("[%d/%d]", len(m.ui.items), m.totalCount())
+	meta := fmt.Sprintf("  [%d/%d]", len(m.ui.items), m.totalCount())
 	if m.ui.helpOpen {
 		meta += "  " + m.ui.helpModel.ShortHelpView(defaultKeyMap.ShortHelp())
 	} else if m.tmpl != "" && m.tmpl != "default" {
