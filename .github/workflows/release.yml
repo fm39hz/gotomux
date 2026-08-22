@@ -45,6 +45,8 @@ jobs:
         with:
           pkgname: gotomux
           pkgbuild: PKGBUILD.aur
+          assets: |
+            dist/gotomux.install
           test: true
           test_flags: --clean --cleanbuild --syncdeps --noconfirm --needed
           commit_username: ${{ secrets.AUR_USERNAME }}
