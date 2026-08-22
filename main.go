@@ -227,7 +227,11 @@ func runPickerIPC(cfg *config.Config, conn net.Conn) error {
 		StickyLabel: resp.StickyLabel,
 		Env:         &env,
 	}
-	deps := picker.Deps{Ctl: ctl, OpenStore: st.get}
+	deps := picker.Deps{
+		Ctl:       ctl,
+		OpenStore: st.get,
+		SessionID: tmux.CurrentSessionID(),
+	}
 
 	m := picker.NewModelFromDaemon(cfg, deps, name, root, seed)
 	trace("model built (ipc)")

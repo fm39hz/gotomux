@@ -117,6 +117,7 @@ type model struct {
 	createName string
 	createCwd  string
 	sessID     string
+	altScreen  bool
 	ui         viewModel
 }
 
@@ -259,6 +260,7 @@ func assemble(cfg *config.Config, d Deps, createName, createCwd string,
 		createName: createName,
 		createCwd:  createCwd,
 		sessID:     d.SessionID,
+		altScreen:  d.SessionID != "",
 		ui: viewModel{
 			queryInput: initInput(),
 			helpModel:  help.New(),
@@ -849,6 +851,12 @@ func (m model) View() tea.View {
 	}
 	b.WriteByte('\n')
 	view := tea.NewView(b.String())
+	// Inside tmux the picker normally runs in a popup, which is already an
+	// isolated viewport. Give Bubble Tea the whole popup instead of making its
+	// inline renderer maintain a cursor anchor relative to the popup's shell.
+	// Direct invocations stay inline so they continue to coexist with the host
+	// shell prompt and scrollback.
+	view.AltScreen = m.altScreen
 	view.Cursor = m.ui.queryInput.Cursor()
 	if view.Cursor != nil {
 		view.Cursor.Position.X += lipgloss.Width(iconPrompt())
