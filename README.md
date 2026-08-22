@@ -12,7 +12,7 @@ Forget about tmux and just jump into work: live sessions, saved presets, with [z
 **Arch Linux:**
 
 ```bash
-yay -S gotomux                            # or paru, pamac,...
+paru -S gotomux                           # or yay
 systemctl --user enable --now gotomuxd    # daemon for instant cold start
 ```
 
