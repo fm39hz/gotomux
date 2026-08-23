@@ -189,20 +189,24 @@ func TestTransitionScoresDecay(t *testing.T) {
 	if err := s.RecordTransition("zz-a", "zz-b"); err != nil {
 		t.Fatalf("RecordTransition: %v", err)
 	}
-	old := time.Now().Add(-7 * 24 * time.Hour).Unix()
+	// Age the row to exactly 96h so the day-bucket math is exact: floor(96/24)=4.
+	old := time.Now().Add(-96 * time.Hour).Unix()
 	if _, err := s.db.Exec(`UPDATE transition SET last = ?`, old); err != nil {
 		t.Fatalf("age transition: %v", err)
 	}
-	stale, err := s.TransitionScores("zz-a", time.Now().Unix())
+	aged, err := s.TransitionScores("zz-a", old+96*3600) // age 4d  -> 1000/5
 	if err != nil {
 		t.Fatalf("TransitionScores: %v", err)
 	}
-	fresh, err := s.TransitionScores("zz-a", old)
+	fresh, err := s.TransitionScores("zz-a", old) // age 0d -> 1000/1
 	if err != nil {
 		t.Fatalf("TransitionScores: %v", err)
 	}
-	if fresh["zz-b"] <= stale["zz-b"] {
-		t.Errorf("decay failed: fresh=%d stale=%d", fresh["zz-b"], stale["zz-b"])
+	if aged["zz-b"] != 200 {
+		t.Errorf("aged score = %d, want 200", aged["zz-b"])
+	}
+	if fresh["zz-b"] != 1000 {
+		t.Errorf("fresh score = %d, want 1000", fresh["zz-b"])
 	}
 }
 
