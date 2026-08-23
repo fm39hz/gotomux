@@ -309,6 +309,7 @@ func newModelCore(cfg *config.Config, d Deps, createName, createCwd string, seed
 	// main — could apply pair scores with no session context at all.
 	if env.Session == "" {
 		env.Pairs = nil
+		env.Transitions = nil
 	}
 	if env.Now == 0 {
 		env.Now = time.Now().Unix()

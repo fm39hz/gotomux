@@ -39,6 +39,8 @@ type Item struct {
 	Recency int64
 	// Cooccur: decayed pair score with current session.
 	Cooccur int64
+	// Transition: directed "switched into from the current session" score.
+	Transition int64
 	// GitBranch: current branch if Path is a git repo; "" otherwise.
 	GitBranch string
 }
@@ -113,6 +115,17 @@ func applyCooccur(items []Item, scores map[string]int64) {
 	for i := range items {
 		if s, ok := scores[items[i].Name]; ok {
 			items[i].Cooccur = s
+		}
+	}
+}
+
+func applyTransitions(items []Item, scores map[string]int64) {
+	if len(scores) == 0 {
+		return
+	}
+	for i := range items {
+		if s, ok := scores[items[i].Name]; ok {
+			items[i].Transition = s
 		}
 	}
 }

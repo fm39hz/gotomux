@@ -285,5 +285,52 @@ ON CONFLICT(a, b) DO UPDATE SET
 			return err
 		}
 	}
+
+	// transition: directed prev->next; rewrite both endpoints, drop self-loops
+	trows, err := tx.Query(`SELECT prev, next, n, last FROM transition WHERE prev = ? OR next = ?`, old, old)
+	if err != nil {
+		return err
+	}
+	type tr struct {
+		prev, next string
+		n, last    int64
+	}
+	var tfound []tr
+	for trows.Next() {
+		var r tr
+		if err := trows.Scan(&r.prev, &r.next, &r.n, &r.last); err != nil {
+			trows.Close()
+			return err
+		}
+		tfound = append(tfound, r)
+	}
+	trows.Close()
+	if err := trows.Err(); err != nil {
+		return err
+	}
+	for _, r := range tfound {
+		if _, err := tx.Exec(`DELETE FROM transition WHERE prev = ? AND next = ?`, r.prev, r.next); err != nil {
+			return err
+		}
+		prev, next := r.prev, r.next
+		if prev == old {
+			prev = newName
+		}
+		if next == old {
+			next = newName
+		}
+		if prev == next {
+			continue // self-transition after rename - drop
+		}
+		_, err = tx.Exec(`
+INSERT INTO transition(prev, next, n, last) VALUES(?, ?, ?, ?)
+ON CONFLICT(prev, next) DO UPDATE SET
+  n = n + excluded.n,
+  last = MAX(last, excluded.last)
+`, prev, next, r.n, r.last)
+		if err != nil {
+			return err
+		}
+	}
 	return tx.Commit()
 }

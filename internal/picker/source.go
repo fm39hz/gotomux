@@ -106,7 +106,6 @@ func (s *createSource) Snapshot() []Item {
 		}
 	}
 	return []Item{{
-
 		Kind:    KindCreate,
 		Title:   fmt.Sprintf("[Create] %s", s.name),
 		Desc:    s.cwd,
@@ -340,6 +339,7 @@ func applyRankMeta(bySrc map[Source][]Item, st store.Storer, ctx Context) {
 			applyUsage(items, us, ctx.Now)
 		}
 		applyCooccur(items, ctx.Pairs)
+		applyTransitions(items, ctx.Transitions)
 		if ctx.HasSession() {
 			n := 0
 			for _, it := range items {

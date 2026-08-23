@@ -32,6 +32,8 @@ type Storer interface {
 	RecordPair(a, b string) error
 	RecordPairsWithLive(name string, live []string)
 	PairScores(ctx string, now int64) (map[string]int64, error)
+	RecordTransition(from, to string) error
+	TransitionScores(ctx string, now int64) (map[string]int64, error)
 
 	SaveFreeze(s *model.Session, shapeID, shapeKey, shapeBody string, setSticky bool) (outShapeID string, shapeCreated bool, err error)
 	StickShape(shapeID, shapeKey, shapeBody string) (outID string, created bool, err error)
@@ -305,6 +307,16 @@ CREATE TABLE IF NOT EXISTS pair (
   n        INTEGER NOT NULL DEFAULT 0,
   last     INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (a, b)
+);`); err != nil {
+		return err
+	}
+	if _, err = s.db.Exec(`
+CREATE TABLE IF NOT EXISTS transition (
+  prev TEXT NOT NULL,
+  next TEXT NOT NULL,
+  n    INTEGER NOT NULL DEFAULT 0,
+  last INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (prev, next)
 );`); err != nil {
 		return err
 	}

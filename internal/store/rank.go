@@ -131,3 +131,58 @@ SELECT a, b, n, last FROM pair WHERE a = ? OR b = ?
 	}
 	return out, rows.Err()
 }
+
+// RecordTransition bumps directed prev->next frequency. Unlike pair (undirected
+// co-presence), transition learns ordered switches: "from prev I usually go to
+// next". Learned from actual attach diffs, never from picker intent.
+func (s *Store) RecordTransition(from, to string) error {
+	from, to = strings.TrimSpace(from), strings.TrimSpace(to)
+	if from == "" || to == "" || from == to {
+		return nil
+	}
+	now := time.Now().Unix()
+	_, err := s.db.Exec(`
+INSERT INTO transition(prev, next, n, last) VALUES(?, ?, 1, ?)
+ON CONFLICT(prev, next) DO UPDATE SET
+  n = n + 1,
+  last = excluded.last
+`, from, to, now)
+	return err
+}
+
+// TransitionScores returns map[nextName]decayedScore for switches INTO next
+// from the given prev session. Directed: only rows with prev = ctx count.
+// Score = n*1000/(1+ageDays); 0 if no rows.
+func (s *Store) TransitionScores(ctx string, now int64) (map[string]int64, error) {
+	ctx = strings.TrimSpace(ctx)
+	if ctx == "" {
+		return nil, nil
+	}
+	if now <= 0 {
+		now = time.Now().Unix()
+	}
+	rows, err := s.db.Query(`
+SELECT next, n, last FROM transition WHERE prev = ?
+`, ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]int64{}
+	for rows.Next() {
+		var next string
+		var n, last int64
+		if err := rows.Scan(&next, &n, &last); err != nil {
+			return nil, err
+		}
+		age := int64(0)
+		if last > 0 && now >= last {
+			age = (now - last) / 86400
+		}
+		if n > 10_000 {
+			n = 10_000
+		}
+		out[next] = n * 1000 / (1 + age)
+	}
+	return out, rows.Err()
+}

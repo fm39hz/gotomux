@@ -179,11 +179,11 @@ Sources is form into a space × time matrix ranking
 | Present | —          | **Active** |
 | Past    | —          | **Preset** |
 
-Sort: `tier > recency > cooccur > kind > detail > busy > pathQ > idx`.
+Sort: `tier > recency > cooccur > trans > kind > detail > busy > pathQ > idx`.
 Same formula everywhere, environment only changes inputs:
 
-- **Inside tmux** (`ctxSession` set): items matching the current session name or path are excluded; co-occurrence overlay active.
-- **Outside tmux**: all items visible; co-occurrence = 0.
+- **Inside tmux** (`ctxSession` set): items matching the current session name or path are excluded; co-occurrence and directed switch (prev→next, learned by the daemon from real attach diffs) overlays active.
+- **Outside tmux**: all items visible; co-occurrence/switch = 0.
 
 "Just left" surfaces via recency.
 

@@ -47,6 +47,9 @@ type Response struct {
 	Presets  []store.PresetMeta `json:"presets,omitempty"`
 	// Pairs holds co-occurrence scores for the session named by Request.SessID.
 	Pairs map[string]int64 `json:"pairs,omitempty"`
+	// Transitions holds directed prev->next switch scores for the session named
+	// by Request.SessID: "which sessions I usually jump to from here".
+	Transitions map[string]int64 `json:"transitions,omitempty"`
 	// StickyLabel is the sticky shape's display label, served so the client needs
 	// no store open just to render the header.
 	StickyLabel string                 `json:"sticky_label,omitempty"`
@@ -289,6 +292,7 @@ func (d *Daemon) buildListResponse(sessID string) Response {
 	presets := d.cachedPresets
 	zoxide := d.cachedZoxide
 	allPairs := d.cachedPairs
+	allTransitions := d.cachedTransitions
 	usage := d.cachedUsage
 	gitBranches := d.cachedGitBranches
 	sticky := d.cachedSticky
@@ -296,8 +300,10 @@ func (d *Daemon) buildListResponse(sessID string) Response {
 
 	// Look up, never compute: the maps are built per live session during sync.
 	var pairs map[string]int64
+	var transitions map[string]int64
 	if cur, ok := tmux.FindByID(sessions, sessID); ok {
 		pairs = allPairs[cur.Name]
+		transitions = allTransitions[cur.Name]
 	}
 
 	return Response{
@@ -305,7 +311,7 @@ func (d *Daemon) buildListResponse(sessID string) Response {
 		Ready: d.ready.Load(), SyncedAt: d.syncedAt.Load(),
 		Version:  d.stateVersion.Load(),
 		Sessions: sessions, Presets: presets,
-		Pairs: pairs, Usage: usage, StickyLabel: sticky,
+		Pairs: pairs, Transitions: transitions, Usage: usage, StickyLabel: sticky,
 		GitBranches: gitBranches, Zoxide: zoxide,
 	}
 }

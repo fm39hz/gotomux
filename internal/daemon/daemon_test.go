@@ -362,3 +362,96 @@ func TestAlreadyRunningIsNotAFailure(t *testing.T) {
 		t.Errorf("listenWithGuard against a live socket = %v; must wrap ErrAlreadyRunning", err)
 	}
 }
+
+func TestAttachTransition(t *testing.T) {
+	cases := []struct {
+		name     string
+		prev     map[string]int
+		cur      map[string]int
+		wantFrom string
+		wantTo   string
+		wantOK   bool
+	}{
+		{name: "classic switch", prev: map[string]int{"a": 1}, cur: map[string]int{"b": 1}, wantFrom: "a", wantTo: "b", wantOK: true},
+		{name: "first poll baseline", prev: map[string]int{}, cur: map[string]int{"a": 1}},
+		{name: "detach to outside", prev: map[string]int{"a": 1}, cur: map[string]int{}},
+		{name: "attach from outside", prev: map[string]int{}, cur: map[string]int{"a": 1}},
+		{name: "two leave one joins", prev: map[string]int{"a": 1, "b": 1}, cur: map[string]int{"c": 1}},
+		{name: "one leaves two join", prev: map[string]int{"a": 1}, cur: map[string]int{"b": 1, "c": 1}},
+		{name: "attach creates no switch", prev: map[string]int{"a": 1}, cur: map[string]int{"a": 1, "b": 1}},
+		{name: "same set", prev: map[string]int{"a": 1}, cur: map[string]int{"a": 1}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			from, to, ok := attachTransition(tc.prev, tc.cur)
+			if ok != tc.wantOK || from != tc.wantFrom || to != tc.wantTo {
+				t.Errorf("attachTransition = %q -> %q ok=%v; want %q -> %q ok=%v",
+					from, to, ok, tc.wantFrom, tc.wantTo, tc.wantOK)
+			}
+		})
+	}
+}
+
+// TestDaemonDiffTelemetryRecordsTransitions drives diffTelemetry with synthetic
+// session lists and asserts the directed switch lands in the store exactly once,
+// never involving the daemon's own hidden control session.
+func TestDaemonDiffTelemetryRecordsTransitions(t *testing.T) {
+	d := newIsolated(t, "dt-trx")
+	hidden := tmux.HiddenControlSession
+
+	sess := func(name string, attached int) tmux.LiveSession {
+		return tmux.LiveSession{ID: "$x", Name: name, LastAttached: 1, Attached: attached}
+	}
+
+	// Baseline: no prior attached set, so the first poll must not invent a
+	// transition into whatever happens to be attached.
+	d.diffTelemetry([]tmux.LiveSession{sess("dt-a", 1), sess("dt-b", 0), sess(hidden, 1)})
+
+	// Switch dt-a -> dt-b; hidden stays attached the whole time.
+	d.diffTelemetry([]tmux.LiveSession{sess("dt-a", 0), sess("dt-b", 1), sess(hidden, 1)})
+
+	// Detach-only: the client left tmux altogether, nothing to learn.
+	d.diffTelemetry([]tmux.LiveSession{sess("dt-a", 0), sess("dt-b", 0), sess(hidden, 1)})
+
+	// Attach-only: came from outside tmux, no prev session exists.
+	d.diffTelemetry([]tmux.LiveSession{sess("dt-c", 1), sess(hidden, 1)})
+
+	d.stMu.Lock()
+	st := d.st
+	d.stMu.Unlock()
+	if st == nil {
+		t.Fatal("no store")
+	}
+	now := time.Now().Unix()
+	fromA, err := st.TransitionScores("dt-a", now)
+	if err != nil {
+		t.Fatalf("TransitionScores: %v", err)
+	}
+	if fromA["dt-b"] <= 0 {
+		t.Errorf("dt-a->dt-b not recorded: %+v", fromA)
+	}
+	if len(fromA) != 1 {
+		t.Errorf("dt-a transitions = %+v, want exactly dt-b", fromA)
+	}
+	// No transition from or to the hidden control session.
+	fromHidden, err := st.TransitionScores(hidden, now)
+	if err != nil {
+		t.Fatalf("TransitionScores: %v", err)
+	}
+	if len(fromHidden) != 0 {
+		t.Errorf("transitions from hidden session: %+v", fromHidden)
+	}
+	// Detach-only and attach-only steps must not have produced rows: dt-b was
+	// never a prev, and dt-c never had a prev.
+	fromB, err := st.TransitionScores("dt-b", now)
+	if err != nil {
+		t.Fatalf("TransitionScores: %v", err)
+	}
+	fromC, err := st.TransitionScores("dt-c", now)
+	if err != nil {
+		t.Fatalf("TransitionScores: %v", err)
+	}
+	if len(fromB) != 0 || len(fromC) != 0 {
+		t.Errorf("unexpected transitions: fromB=%+v fromC=%+v", fromB, fromC)
+	}
+}

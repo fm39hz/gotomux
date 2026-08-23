@@ -391,6 +391,37 @@ func TestPairCanonical(t *testing.T) {
 	}
 }
 
+func TestRankTransitionBreaksKindTie(t *testing.T) {
+	// same tier/recency/cooccur/kind-tie candidates: higher trans wins
+	q := "svc"
+	a := Item{Kind: KindZoxide, Name: "svc-a", Path: "/z/svc-a", Recency: 10, Transition: 5}
+	b := Item{Kind: KindZoxide, Name: "svc-b", Path: "/z/svc-b", Recency: 10, Transition: 50}
+	got := rankItems(q, []Item{a, b})
+	if got[0].Name != "svc-b" {
+		t.Fatalf("want svc-b (transition) first, got %s", got[0].Name)
+	}
+}
+
+func TestRankTransitionBelowCooccur(t *testing.T) {
+	// same tier/recency: cooccur must beat transition (existing habit wins)
+	q := "svcxx"
+	paired := Item{Kind: KindZoxide, Name: "svcxx-a", Path: "/z/svcxx-a", Recency: 10, Cooccur: 99, Transition: 0}
+	switched := Item{Kind: KindZoxide, Name: "svcxx-b", Path: "/z/svcxx-b", Recency: 10, Cooccur: 0, Transition: 999}
+	got := rankItems(q, []Item{switched, paired})
+	if got[0].Name != "svcxx-a" {
+		t.Fatalf("cooccur should beat transition: got %s keys paired=%+v switched=%+v",
+			got[0].Name, mustKey(q, paired), mustKey(q, switched))
+	}
+}
+
+func TestApplyTransitionsMapsNames(t *testing.T) {
+	items := []Item{{Name: "b"}, {Name: "c"}}
+	applyTransitions(items, map[string]int64{"b": 7, "x": 1})
+	if items[0].Transition != 7 || items[1].Transition != 0 {
+		t.Fatalf("applyTransitions: %+v", items)
+	}
+}
+
 func TestIdleMRUAndFilterCurrent(t *testing.T) {
 	// empty query: higher Recency among Active wins.
 	// Inside tmux, the current session is filtered out (you're already there).

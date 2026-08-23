@@ -228,7 +228,7 @@ func runPickerIPC(cfg *config.Config, conn net.Conn) error {
 	// CtxSess/CtxPath fields the daemon sent were ignored, which was just as well:
 	// they describe the daemon's process, which has no $TMUX and so always reported
 	// nothing.
-	env := picker.Context{Pairs: resp.Pairs, Usage: resp.Usage, Now: time.Now().Unix()}
+	env := picker.Context{Pairs: resp.Pairs, Transitions: resp.Transitions, Usage: resp.Usage, Now: time.Now().Unix()}
 	if cur, ok := tmux.FindByID(resp.Sessions, tmux.CurrentSessionID()); ok {
 		env.Session, env.Path = cur.Name, cur.Path
 	}

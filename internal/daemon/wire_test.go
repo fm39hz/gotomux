@@ -17,11 +17,14 @@ func TestResponseRoundTrip(t *testing.T) {
 	want := Response{
 		OK: true, Ready: true, SyncedAt: 1785069096, Version: 7,
 		Sessions: []tmux.LiveSession{
-			{ID: "$0", Name: "alpha", Windows: 3, Path: "/w/a",
-				LastAttached: 11, Activity: 12, Created: 10, Attached: 1, ActiveCmd: "nvim"},
+			{
+				ID: "$0", Name: "alpha", Windows: 3, Path: "/w/a",
+				LastAttached: 11, Activity: 12, Created: 10, Attached: 1, ActiveCmd: "nvim",
+			},
 		},
 		Presets:     []store.PresetMeta{{Name: "p1", Cwd: "/w/p1", LastUsed: 99}},
 		Pairs:       map[string]int64{"beta": 500},
+		Transitions: map[string]int64{"beta": 700},
 		Usage:       map[string]store.Usage{"beta": {Name: "beta", Opens: 3, Kills: 1, LastOpen: 5, LastKill: 2}},
 		StickyLabel: "nvim+v2",
 		GitBranches: map[string]string{"/w/a": "master | worktree"},

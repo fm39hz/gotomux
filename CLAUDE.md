@@ -51,7 +51,7 @@ internal/
   event/     tiny in-process pub/sub (freeze.done, shape.saved)
   picker/    Bubble Tea UI, Source registry, ranking, zoxide, git enrich
   project/   project root walk, session-name sanitize, children, git
-  store/     SQLite: presets, usage, pairs, shapes, placement, forks, zox cache
+  store/     SQLite: presets, usage, pairs, transitions, shapes, placement, forks, zox cache
   template/  shape derive/bake/label, JSON format, config-dir mirror, freeze glue
   tmux/      Ctl (exec) + ControlConn (direct socket), freeze, load, pane detect
   toolclass/ hardcoded vocabulary: shell/editor/files/git/agent + chrome roles + icons
@@ -61,7 +61,7 @@ internal/
 
 `runPicker` dials `$XDG_DATA_HOME/gotomux/gotomux.sock` with a 50ms timeout.
 
-- **Daemon present** → `runPickerIPC`: one `list` request returns sessions, presets, zoxide rows, pair scores, usage, and git branches already computed. The picker paints from that payload (`picker.NewModelFromDaemon`, `picker.PreloadCache`) with no filesystem or tmux I/O on the hot path. Connecting also sends a `connect` request so the daemon records telemetry.
+- **Daemon present** → `runPickerIPC`: one `list` request returns sessions, presets, zoxide rows, pair scores, transition scores, usage, and git branches already computed. The picker paints from that payload (`picker.NewModelFromDaemon`, `picker.PreloadCache`) with no filesystem or tmux I/O on the hot path. Connecting also sends a `connect` request so the daemon records telemetry.
 - **No daemon** → `runPickerStandalone`: three goroutines in parallel (tmux ctl, store open, project root walk), then `picker.RunPicker`.
 
 **Both paths must stay behaviorally identical.** Any new picker input needs a standalone source *and* a daemon cache field + `daemon.Response` field. IPC failures (bad response, 2s decode timeout) silently fall back to standalone — never make IPC a hard dependency.
@@ -72,7 +72,7 @@ Note: README documents the socket as `gotomuxd.sock`; the code uses `gotomux.soc
 
 `daemon.New` starts the tmux server (`start-server`, `exit-empty off`), dials tmux's own control socket directly via `tmux.StartControl` (no `tmux -C` subprocess), opens the store, then polls every `PollInterval` (10s). Each poll re-runs `ensureServer` / `ensureDB` (store `Ping` + reopen on failure) / `syncNow`.
 
-- `syncNow` lists sessions in **one** control-socket round trip (`list-sessions` + `list-panes` combined, parsed by `tmux.ParseLiveOutput`), diffs against `lastSeen` to record open/pair telemetry, and refreshes the caches.
+- `syncNow` lists sessions in **one** control-socket round trip (`list-sessions` + `list-panes` combined, parsed by `tmux.ParseLiveOutput`), diffs against `lastSeen` to record open/pair telemetry, and refreshes the caches. Directed transitions (`transition` table) are learned the same way: when the attached-set diff shows exactly one session lost a client and exactly one gained one (past the hidden control session), that prev→next switch is recorded. Ambiguous multi-client churn is dropped.
 - `stateVersion` is an atomic counter; `list` requests carrying a matching `Version` get an empty 304-style response.
 - Git branches are computed lazily on the first `list` (`ensureGitBranches`), not in `New` — cold disk I/O must not block startup.
 - Single-instance is enforced twice: `flock` on `$XDG_RUNTIME_DIR/gotomux-<hash>.lock` plus stale-socket detection in `listenWithGuard`.
@@ -148,15 +148,15 @@ Measured with `hyperfine` on ~300 zoxide entries. `gotomux -p` profiles the **st
 
 Current numbers: standalone ~13ms warm, ~16ms after an idle gap; startup alone (`-v`) ~5ms; IPC round trip ~1.2ms for a 45 KB payload; building the model from a payload ~150µs.
 
-Ranking (`internal/picker/score.go`) is a **tiered tuple sort**, not a score sum: `tier > recency > cooccur > kind > detail > pathQ > idx`. Frecency comes from the `usage` table (day-decayed opens minus kill penalty, pure integer math). Multi-token queries AND together: tier = worst token's tier, detail = sum. Matching folds diacritics (Vietnamese `đ`→`d`) and splits labels on delimiters plus CamelCase/acronym boundaries.
+Ranking (`internal/picker/score.go`) is a **tiered tuple sort**, not a score sum: `tier > recency > cooccur > trans > kind > detail > pathQ > idx`. Frecency comes from the `usage` table (day-decayed opens minus kill penalty, pure integer math). Multi-token queries AND together: tier = worst token's tier, detail = sum. Matching folds diacritics (Vietnamese `đ`→`d`) and splits labels on delimiters plus CamelCase/acronym boundaries.
 
-Inside tmux (`Context.Session` set), items matching the current session name or path are dropped and co-occurrence scores from the `pair` table apply. Outside tmux, everything is visible and cooccur is 0. Same algorithm either way — only the inputs change.
+Inside tmux (`Context.Session` set), items matching the current session name or path are dropped and co-occurrence scores from the `pair` table plus directed switch scores from the `transition` table apply. Outside tmux, everything is visible and cooccur/trans are 0. Same algorithm either way — only the inputs change.
 
 To add a source: implement `Source`, register in `defaultSources`, and give it a `Kind` in `kindRank`. Remote-tmux is the deferred plan (`docs/todo.md`); it would connect by `Item.Src`/`Host`.
 
 ### Store
 
-`$XDG_DATA_HOME/gotomux/state.db`, pure-Go `modernc.org/sqlite`, WAL + `synchronous=NORMAL` + 1s busy timeout. Tables: `session`/`window`/`pane` (presets, cascade delete), `usage`, `pair`, `zox_meta`/`zox_item`, `shape`, `sticky`, `placement`, `fork`.
+`$XDG_DATA_HOME/gotomux/state.db`, pure-Go `modernc.org/sqlite`, WAL + `synchronous=NORMAL` + 1s busy timeout. Tables: `session`/`window`/`pane` (presets, cascade delete), `usage`, `pair`, `transition`, `zox_meta`/`zox_item`, `shape`, `sticky`, `placement`, `fork`.
 
 Migration is additive-only and idempotent: `CREATE TABLE IF NOT EXISTS` plus `pragma_table_info` probes for columns added later (`window.cwd`, `shape.updated_at`). Follow that pattern — never drop or rewrite a table.
 

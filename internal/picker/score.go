@@ -18,17 +18,18 @@ var fzfSlab = util.MakeSlab(128*1024, 64*1024)
 //	tier    - match quality band (lower = better). Nothing outranks tier.
 //	recency - app frecency (opens/kills/time) or fallback preset/zoxide (higher = better).
 //	cooccur - pair score with current session (higher = better); 0 if no context.
-//	kind    - domain preference (higher = better). Tiebreaker within same recency+cooccur.
+//	trans   - directed switch score from current session (higher = better).
+//	kind    - domain preference (higher = better). Tiebreaker within same recency+cooccur+trans.
 //	detail  - within-tier match quality (higher = better).
 //	busy    - 1 if session has a non-shell tool active (higher = better).
 //	pathQ   - shallower path (higher = better): -depth.
 //	idx     - stable input order.
 //
-// Idle (empty q): recency > cooccur > kind > detail > busy > pathQ > idx.
+// Idle (empty q): recency > cooccur > trans > kind > detail > busy > pathQ > idx.
 // When ctxSession is set (inside tmux), any item whose Name matches the
 // current session is excluded (you're already there). Remaining items sort
 // naturally — "just left" surfaces first via recency. Same algorithm
-// regardless of environment; ctxSession only adds filter + cooccur signals.
+// regardless of environment; ctxSession only adds filter + cooccur/trans signals.
 //
 // Frecency (usage table): opens with day-decay minus kill penalty - see frecencyScore.
 //
@@ -65,6 +66,7 @@ type rankKey struct {
 	tier    int8
 	recency int64
 	cooccur int64
+	trans   int64
 	kind    int8
 	detail  int32
 	pathQ   int8
@@ -80,6 +82,9 @@ func (a rankKey) less(b rankKey) bool {
 	}
 	if a.cooccur != b.cooccur {
 		return a.cooccur > b.cooccur
+	}
+	if a.trans != b.trans {
+		return a.trans > b.trans
 	}
 	if a.kind != b.kind {
 		return a.kind > b.kind
@@ -436,12 +441,12 @@ func rankOf(q string, it Item, idx int) (rankKey, bool) {
 	q = strings.TrimSpace(q)
 
 	if q == "" {
-		return rankKey{tier: 0, kind: kr, detail: 0, recency: it.Recency, cooccur: it.Cooccur, pathQ: pq, idx: idx}, true
+		return rankKey{tier: 0, kind: kr, detail: 0, recency: it.Recency, cooccur: it.Cooccur, trans: it.Transition, pathQ: pq, idx: idx}, true
 	}
 
 	tokens := strings.Fields(foldDiacritic(q))
 	if len(tokens) == 0 {
-		return rankKey{tier: 0, kind: kr, detail: 0, recency: it.Recency, cooccur: it.Cooccur, pathQ: pq, idx: idx}, true
+		return rankKey{tier: 0, kind: kr, detail: 0, recency: it.Recency, cooccur: it.Cooccur, trans: it.Transition, pathQ: pq, idx: idx}, true
 	}
 
 	// Multi-token AND: every token must match; tier = worst; detail = sum.
@@ -468,6 +473,7 @@ func rankOf(q string, it Item, idx int) (rankKey, bool) {
 		detail:  detail,
 		recency: it.Recency,
 		cooccur: it.Cooccur,
+		trans:   it.Transition,
 		pathQ:   pq,
 		idx:     idx,
 	}, true

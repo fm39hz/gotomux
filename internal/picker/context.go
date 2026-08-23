@@ -12,11 +12,12 @@ import (
 // Built once per picker open, threaded through the pipeline instead of
 // scattering individual parameters across function signatures.
 type Context struct {
-	Session string           // current tmux session name, "" outside tmux
-	Path    string           // session path (project root), "" outside tmux
-	Pairs   map[string]int64 // co-occurrence scores with current session
-	Usage   map[string]store.Usage
-	Now     int64
+	Session     string           // current tmux session name, "" outside tmux
+	Path        string           // session path (project root), "" outside tmux
+	Pairs       map[string]int64 // co-occurrence scores with current session
+	Transitions map[string]int64 // directed switch scores from current session
+	Usage       map[string]store.Usage
+	Now         int64
 }
 
 // newContext derives the ranking context.
@@ -53,11 +54,13 @@ func newContext(ctl tmux.Connector, st store.Storer, live []tmux.LiveSession, se
 		ctx.Usage, _ = st.AllUsage()
 		if ctx.Session != "" {
 			ctx.Pairs, _ = st.PairScores(ctx.Session, ctx.Now)
+			ctx.Transitions, _ = st.TransitionScores(ctx.Session, ctx.Now)
 		}
 	}
-	// Co-occurrence is meaningless without a current session.
+	// Co-occurrence and transitions are meaningless without a current session.
 	if ctx.Session == "" {
 		ctx.Pairs = nil
+		ctx.Transitions = nil
 	}
 	return ctx
 }

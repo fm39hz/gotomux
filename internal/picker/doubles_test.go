@@ -11,25 +11,27 @@ import (
 // countingStore implements just enough of store.Storer for picker tests and
 // counts every call, so a test can assert that a path performs no store I/O.
 //
-// store.Storer has 32 methods. Embedding it as a nil interface means any method
+// store.Storer has 34 methods. Embedding it as a nil interface means any method
 // this double does not implement panics instead of silently returning a zero
 // value — which is what a "this path must not touch the store" test wants: a
 // loud failure, not a passing test over an unnoticed call.
 type countingStore struct {
 	store.Storer
 
-	mu      sync.Mutex
-	presets []store.PresetMeta
-	usage   map[string]store.Usage
-	pairs   map[string]int64
-	zox     []store.ZoxRow
-	zoxSig  string
+	mu          sync.Mutex
+	presets     []store.PresetMeta
+	usage       map[string]store.Usage
+	pairs       map[string]int64
+	transitions map[string]int64
+	zox         []store.ZoxRow
+	zoxSig      string
 
-	listMeta   int
-	allUsage   int
-	pairScores int
-	loadZox    int
-	stickyID   int
+	listMeta         int
+	allUsage         int
+	pairScores       int
+	transitionScores int
+	loadZox          int
+	stickyID         int
 }
 
 func (s *countingStore) ListMeta() ([]store.PresetMeta, error) {
@@ -51,6 +53,13 @@ func (s *countingStore) PairScores(session string, now int64) (map[string]int64,
 	defer s.mu.Unlock()
 	s.pairScores++
 	return s.pairs, nil
+}
+
+func (s *countingStore) TransitionScores(session string, now int64) (map[string]int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.transitionScores++
+	return s.transitions, nil
 }
 
 func (s *countingStore) LoadZox() ([]store.ZoxRow, int64, string, bool) {

@@ -50,6 +50,7 @@ type Daemon struct {
 	cfg          *config.Config
 	lastSeen     map[string]int64
 	lastSeenMu   sync.Mutex
+	lastAttached map[string]int
 	stateVersion atomic.Int64
 
 	cachedSessions []tmux.LiveSession
@@ -60,7 +61,10 @@ type Daemon struct {
 	// compute a single map from its own context, which has no $TMUX and so always
 	// resolved to "", silently disabling co-occurrence for every served request.
 	// Precomputing per live session keeps SQLite off the response path.
-	cachedPairs       map[string]map[string]int64
+	cachedPairs map[string]map[string]int64
+	// cachedTransitions mirrors cachedPairs for directed prev->next switches,
+	// keyed by the prev session name.
+	cachedTransitions map[string]map[string]int64
 	cachedUsage       map[string]store.Usage
 	cachedGitBranches map[string]string
 	cachedSticky      string
@@ -119,7 +123,7 @@ func New(cfg *config.Config) (*Daemon, error) {
 		// Not attached yet: the daemon must not create the tmux server. See
 		// ensureControl.
 		cc: tmux.NewControl(), ctl: ctl, st: st, stPath: stPath, cfg: cfg,
-		lastSeen: map[string]int64{}, sockPath: cfg.SocketPath(),
+		lastSeen: map[string]int64{}, lastAttached: map[string]int{}, sockPath: cfg.SocketPath(),
 		stopCh: make(chan struct{}), startedAt: time.Now(),
 	}
 	d.ensureControl()
@@ -327,19 +331,24 @@ func (d *Daemon) syncNow() {
 	d.stMu.Unlock()
 
 	var (
-		pairs   map[string]map[string]int64
-		usage   map[string]store.Usage
-		presets []store.PresetMeta
-		sticky  string
+		pairs       map[string]map[string]int64
+		transitions map[string]map[string]int64
+		usage       map[string]store.Usage
+		presets     []store.PresetMeta
+		sticky      string
 	)
 	if st != nil {
 		now := time.Now().Unix()
 		// One map per live session, so a client can look up the scores for its own
 		// session without the daemon running a query on the response path.
 		pairs = make(map[string]map[string]int64, len(sessions))
+		transitions = make(map[string]map[string]int64, len(sessions))
 		for _, s := range sessions {
 			if p, err := st.PairScores(s.Name, now); err == nil && len(p) > 0 {
 				pairs[s.Name] = p
+			}
+			if t, err := st.TransitionScores(s.Name, now); err == nil && len(t) > 0 {
+				transitions[s.Name] = t
 			}
 		}
 		usage, _ = st.AllUsage()
@@ -363,7 +372,7 @@ func (d *Daemon) syncNow() {
 		d.cachedSessions = sessions
 	}
 	if st != nil {
-		d.cachedPairs, d.cachedUsage, d.cachedPresets = pairs, usage, presets
+		d.cachedPairs, d.cachedTransitions, d.cachedUsage, d.cachedPresets = pairs, transitions, usage, presets
 		d.cachedSticky = sticky
 	}
 	d.cachedGitBranches = branches
@@ -382,7 +391,8 @@ func (d *Daemon) syncNow() {
 }
 
 // diffTelemetry records opens/pairs for sessions that are new or newly
-// re-attached since the last sync, and forgets sessions that vanished.
+// re-attached since the last sync, directed switches for transitions, and
+// forgets sessions that vanished.
 func (d *Daemon) diffTelemetry(sessions []tmux.LiveSession) {
 	d.lastSeenMu.Lock()
 	defer d.lastSeenMu.Unlock()
@@ -391,6 +401,35 @@ func (d *Daemon) diffTelemetry(sessions []tmux.LiveSession) {
 			d.recordTelemetry(s.Name, sessions)
 		}
 		d.lastSeen[s.Name] = s.LastAttached
+	}
+
+	// Directed switches: exactly one session lost a client and exactly one
+	// gained one; anything else (multi-client churn, plain attach/detach) is
+	// not a transition. Hidden sessions never reach here (withoutHidden), but
+	// skip defensively anyway: the daemon's own control client keeps the
+	// hidden session attached forever, so it would otherwise be a permanent
+	// ghost member of the attached set.
+	curAttached := make(map[string]int, len(sessions))
+	for _, s := range sessions {
+		if s.Attached > 0 && !tmux.IsHiddenSession(s.Name) {
+			curAttached[s.Name] = s.Attached
+		}
+	}
+	if from, to, ok := attachTransition(d.lastAttached, curAttached); ok {
+		d.recordTransition(from, to)
+	}
+	d.lastAttached = curAttached
+	for name := range d.lastAttached {
+		keep := false
+		for _, s := range sessions {
+			if s.Name == name {
+				keep = true
+				break
+			}
+		}
+		if !keep {
+			delete(d.lastAttached, name)
+		}
 	}
 	for name := range d.lastSeen {
 		keep := false
@@ -403,6 +442,42 @@ func (d *Daemon) diffTelemetry(sessions []tmux.LiveSession) {
 		if !keep {
 			delete(d.lastSeen, name)
 		}
+	}
+}
+
+// attachTransition reduces an attach-set diff to one directed switch. The
+// poll only sees aggregate attached counts, so it cannot prove which client
+// moved; a single removed plus a single added is the closest unambiguous
+// evidence and what a one-user workstation produces. Ambiguous diffs are
+// dropped — a wrong bigram pollutes ranking longer than a missing one.
+func attachTransition(prev, cur map[string]int) (from, to string, ok bool) {
+	var left, joined []string
+	for name := range prev {
+		if cur[name] == 0 {
+			left = append(left, name)
+		}
+	}
+	for name := range cur {
+		if prev[name] == 0 {
+			joined = append(joined, name)
+		}
+	}
+	if len(left) == 1 && len(joined) == 1 {
+		return left[0], joined[0], true
+	}
+	return "", "", false
+}
+
+func (d *Daemon) recordTransition(from, to string) {
+	d.stMu.Lock()
+	st := d.st
+	d.stMu.Unlock()
+	if st == nil {
+		return
+	}
+	log.Printf("[store] [INFO] transition: %s -> %s", from, to)
+	if err := st.RecordTransition(from, to); err != nil {
+		log.Printf("record transition: %v", err)
 	}
 }
 
