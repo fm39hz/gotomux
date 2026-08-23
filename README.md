@@ -26,7 +26,7 @@ One static binary per platform. No accounts, no telemetry out, the only "cloud" 
 | Presets (frozen sessions) | ✗                  | ✓ (`gotomux -f`)           |
 | Rebuild from shapes     | ✗                    | ✓ (sticky + learning)      |
 | Zoxide as source        | ✗                    | ✓                          |
-| Cold start              |-                    | ~5 ms (daemon: ~13 ms warm) |
+| Cold start              | —                    | ~5 ms (daemon: ~13 ms warm) |
 
 ## Quick start
 
@@ -88,7 +88,7 @@ Flags:
   -p, --profile  Profile cold-start performance
 ```
 
-The picker opens instantly. Type to filter (diacritics are folded, `got` finds `gôtomux`), Enter to connect.
+The picker opens instantly. Type to filter, Enter to connect.
 
 ### Daemon (`gotomuxd`)
 
@@ -141,16 +141,15 @@ bind-key -n C-f run-shell "tmux display-message \"$(gotomux -f)\""
 
 | Key                                | Action                            |
 | ---------------------------------- | --------------------------------- |
-| <kbd>type</kbd>                    | filter (diacritics folded)        |
-| <kbd>Enter</kbd>                   | connect                           |
-| <kbd>Ctrl</kbd> + <kbd>N</kbd> / <kbd>Ctrl</kbd> + <kbd>P</kbd> | next / prev         |
-| <kbd>Ctrl</kbd> + <kbd>U</kbd> / <kbd>Ctrl</kbd> + <kbd>W</kbd> | clear query / delete word |
-| <kbd>Ctrl</kbd> + <kbd>X</kbd>     | kill active session               |
-| <kbd>Ctrl</kbd> + <kbd>F</kbd>     | freeze into preset + shape        |
-| <kbd>Ctrl</kbd> + <kbd>T</kbd>     | set sticky shape for new projects |
-| <kbd>Ctrl</kbd> + <kbd>E</kbd> / <kbd>Ctrl</kbd> + <kbd>D</kbd> | edit / delete preset |
-| <kbd>Esc</kbd> / <kbd>Ctrl</kbd> + <kbd>C</kbd> | cancel                     |
-| <kbd>?</kbd>                       | toggle help                       |
+| Enter                   | connect                           |
+| Ctrl + N / Ctrl + P | next / prev         |
+| Ctrl + U / Ctrl + W | clear query / delete word |
+| Ctrl + X     | kill active session               |
+| Ctrl + F     | freeze into preset + shape        |
+| Ctrl + T     | set sticky shape for new projects |
+| Ctrl + E / Ctrl + D | edit / delete preset |
+| Esc / Ctrl + C | cancel                     |
+| ?                       | toggle help                       |
 
 ## Behaviour
 
@@ -204,8 +203,8 @@ Sources form a space × time matrix:
 |         | Here       | Anywhere   |
 | ------- | ---------- | ---------- |
 | Future  | **Create** | **Zoxide** |
-| Present |,          | **Active** |
-| Past    |,          | **Preset** |
+| Present | —          | **Active** |
+| Past    | —          | **Preset** |
 
 Sort: `tier > recency > cooccur > trans > kind > detail > busy > pathQ > idx`.
 Same formula everywhere, environment only changes inputs:
