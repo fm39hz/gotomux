@@ -10,11 +10,11 @@
 
 Forget about tmux plumbing and just jump into work. One keystroke opens a fuzzy list of everything you could want to attach to:
 
-- **Live sessions**, ranked by real usage, not just mru
-- **Saved presets**, frozen snapshots of whole sessions (paths + commands)
-- **Sticky shapes**, the topology of your cockpit (windows / panes / tools), re-baked into new projects via Create / Zoxide
-- **Zoxide paths**, create a fresh session anywhere you've `z`'d before
-- **Self-ranking**, the daemon learns co-occurrence *and* directed transitions from real attach diffs, so the item you want surfaces first
+- **Live sessions**: ranked by real usage, not just mru
+- **Saved presets**: frozen snapshots of whole sessions (paths + commands)
+- **Sticky shapes**: the topology of your cockpit (windows / panes / tools), re-baked into new projects via Create / Zoxide
+- **Zoxide paths**: create a fresh session anywhere you've `z`'d before
+- **Self-ranking**: the daemon learns co-occurrence *and* directed transitions from real attach diffs, so the item you want surfaces first
 
 One static binary per platform. No accounts, no telemetry out, the only "cloud" is a local SQLite store.
 
