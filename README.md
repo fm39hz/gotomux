@@ -127,12 +127,13 @@ end
 ```
 
 > [!TIP]
-> **Tmux popup**, gotomux is a normal TUI, so it composes perfectly with `display-popup`. `Ctrl-b` opens it as a floating pane instead of clobbering the screen:
+> **Tmux popup**: gotomux is a normal TUI, so it composes perfectly with `display-popup`.
 
 ```tmux
-bind-key C-b display-popup -T " Go to mux " -w 80% -h 70% -x C -y C -E "gotomux"
-bind-key C-e run-shell "gotomux -e"
-bind-key -n C-f run-shell "tmux display-message \"$(gotomux -f)\""
+bind-key C-b display-popup -T " Go to mux " -w 80% -h 70% -x C -y C -E "$HOME/go/bin/gotomux"
+bind-key C-e display-popup  -T " Edit config " -w 80% -h 90% -x C -y C -E "$HOME/go/bin/gotomux -e"
+bind-key C-r run-shell "tmux display-message \"$($HOME/go/bin/gotomux -r)\""
+bind-key -n C-f run-shell "tmux display-message \"$($HOME/go/bin/gotomux -f)\""
 ```
 
 ## Keybindings
