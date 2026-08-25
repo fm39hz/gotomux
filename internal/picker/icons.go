@@ -35,7 +35,7 @@ func (m model) iconSticky() string {
 
 func (m model) iconPrompt() string {
 	if m.nerdIcons() {
-		return toolclass.GlyphSearch + " "
+		return toolclass.GlyphSearch + " : "
 	}
 	return ": " // simple consistent prefix
 }
