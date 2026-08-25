@@ -277,15 +277,25 @@ Local first.
 > [!WARNING]
 > gotomux is still in early development. Some unintended behavior might occur.
 
+## Built With
+
+- [Bubble Tea](https://github.com/charmbracelet/bubbletea) & [Lip Gloss](https://github.com/charmbracelet/lipgloss): TUI framework and styling
+- [fzf](https://github.com/junegunn/fzf): Fuzzy matching core algorithm
+- [modernc.org/sqlite](https://gitlab.com/cznic/sqlite): Pure Go SQLite engine
+- [projectdetect](https://github.com/richardwooding/projectdetect): Project root marker detection
+- [go-devicons](https://github.com/epilande/go-devicons): Nerd font devicons
+- [gopsutil](https://github.com/shirou/gopsutil): Process detection for freezing sessions
+
 ## Acknowledgements
 
-- [tmux](https://github.com/tmux/tmux): Obviously, what do you expect?
-- [zoxide](https://github.com/ajeetdsouza/zoxide): Smart directory jump
-- [Bubble Tea](https://github.com/charmbracelet/bubbletea): TUI library
-- [fzf](https://github.com/junegunn/fzf): Fuzzy match core engine
-- [modernc sqlite](https://gitlab.com/cznic/sqlite): Go version of SQLite
-- [projectdetect](https://github.com/richardwooding/projectdetect): Detect project type
-- [go-devicons](https://github.com/epilande/go-devicons): Nerd font icon
+Gotomux started as a bash script gluing together several CLI tools before being rewritten into a standalone Go tool. Special thanks to the projects and tools that inspired and powered that original workflow:
+
+- [sesh](https://github.com/joshmedeski/sesh): Smart tmux session manager inspiration
+- [fzf](https://github.com/junegunn/fzf): Interactive fuzzy search & keybindings
+- [tmuxp](https://github.com/tmux-python/tmuxp): Session freezing & layout persistence inspiration
+- [zoxide](https://github.com/ajeetdsouza/zoxide): Smarter directory jumping as a session source
+- [fd](https://github.com/sharkdp/fd): Fast filesystem traversal for preset discovery
+- [tmux](https://github.com/tmux/tmux): The terminal multiplexer itself
 
 ## License
 
