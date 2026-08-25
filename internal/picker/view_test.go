@@ -110,8 +110,13 @@ func TestViewUsesRealTextCursorWithPromptOffset(t *testing.T) {
 	if view.Cursor == nil {
 		t.Fatal("view has no hardware cursor")
 	}
-	if view.Cursor.Position.X != 4 || view.Cursor.Position.Y != 0 {
-		t.Fatalf("cursor = (%d,%d), want (4,0)", view.Cursor.Position.X, view.Cursor.Position.Y)
+	// The contract is positional, not stylistic: the hardware cursor must sit
+	// immediately after the typed query. Derive the offset from the prompt's
+	// cell width instead of pinning a constant that every glyph restyle would
+	// invalidate.
+	wantX := lipgloss.Width(m.iconPrompt()) + 2
+	if view.Cursor.Position.X != wantX || view.Cursor.Position.Y != 0 {
+		t.Fatalf("cursor = (%d,%d), want (%d,0)", view.Cursor.Position.X, view.Cursor.Position.Y, wantX)
 	}
 }
 
@@ -133,27 +138,24 @@ func TestCursorPrefixMatchesRowIndent(t *testing.T) {
 	}
 }
 
-// TestPromptWidthMatchesInBothIconModes pins the input-prompt contract: the
-// fa-search glyph (nerd) and ": " (ascii) both occupy exactly 2 cells, so
-// query-input width and the hardware-cursor offset stay mode-independent.
-func TestPromptWidthMatchesInBothIconModes(t *testing.T) {
+// TestPromptShapePerIconMode pins the input-prompt contract as of ab32bf3:
+// both modes end in ": " for readability, and nerd mode prepends the fa-search
+// glyph — so the two prompts differ in width BY DESIGN (4 vs 2 cells) and no
+// code may assume they match. What must stay mode-independent for row
+// alignment is iconCursor (pinned by TestCursorPrefixMatchesRowIndent).
+func TestPromptShapePerIconMode(t *testing.T) {
 	nerd := model{}
 	ascii := model{cfg: &config.Config{Icons: "ascii"}}
-	if got, want := nerd.iconPrompt(), toolclass.GlyphSearch+" "; got != want {
-		t.Errorf("nerd prompt = %q, want %q (fa-search + space)", got, want)
+	if got, want := nerd.iconPrompt(), toolclass.GlyphSearch+" : "; got != want {
+		t.Errorf("nerd prompt = %q, want %q", got, want)
 	}
 	if got := ascii.iconPrompt(); got != ": " {
 		t.Errorf("ascii prompt = %q, want %q", got, ": ")
 	}
-	for _, tc := range []struct {
-		name string
-		m    model
-	}{
-		{"nerd", nerd},
-		{"ascii", ascii},
-	} {
-		if got := lipgloss.Width(tc.m.iconPrompt()); got != 2 {
-			t.Errorf("%s: iconPrompt width = %d, want 2", tc.name, got)
-		}
+	if w := lipgloss.Width(nerd.iconPrompt()); w != 4 {
+		t.Errorf("nerd prompt width = %d, want 4", w)
+	}
+	if w := lipgloss.Width(ascii.iconPrompt()); w != 2 {
+		t.Errorf("ascii prompt width = %d, want 2", w)
 	}
 }
