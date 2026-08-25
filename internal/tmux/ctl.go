@@ -196,6 +196,9 @@ func FindByID(sessions []LiveSession, id string) (LiveSession, bool) {
 	return LiveSession{}, false
 }
 
+// ListLive returns the user-visible sessions with their panes attached; the
+// daemon's own control session is dropped here so every exec-path consumer
+// (picker sources, freeze pick list) inherits the filtering.
 func (c *Ctl) ListLive(ctx context.Context) ([]LiveSession, error) {
 	out, err := exec.CommandContext(
 		ctx, "tmux",
@@ -209,7 +212,7 @@ func (c *Ctl) ListLive(ctx context.Context) ([]LiveSession, error) {
 		}
 		return nil, fmt.Errorf("tmux list: %w", err)
 	}
-	return ParseLiveOutput(string(out)), nil
+	return DropHidden(ParseLiveOutput(string(out))), nil
 }
 
 func ParseLiveOutput(out string) []LiveSession {

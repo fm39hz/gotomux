@@ -10,7 +10,7 @@
 
 - **A control client must own a session, and attaching to a user session corrupts the data we serve.** `-C attach-session -t X` sets `session_attached=1` and bumps `session_last_attached` + `session_activity` on X. `-r` (read-only) does **not** help — it blocks input, not the attach. Since `LiveSession.Recency` is `max(LastAttached, Activity, Created)`, a daemon that attaches is falsifying its own ranking input.
 
-- **The only non-perturbing invocation is a dedicated hidden session**: `tmux -C new-session -A -s __gotomuxd -- cat`. User sessions stay byte-identical (`attached=0`, `last_attached` still empty on never-attached sessions). `-- cat` avoids spawning a shell — with a real shell the stream floods with `%output` of the prompt. `-A` makes daemon restart reuse the session. The hidden session **is** visible to `list-sessions`, so every consumer must filter it.
+- **The only non-perturbing invocation is a dedicated hidden session**: `tmux -C new-session -A -s __gotomuxd -- cat`. User sessions stay byte-identical (`attached=0`, `last_attached` still empty on never-attached sessions). `-- cat` avoids spawning a shell — with a real shell the stream floods with `%output` of the prompt. `-A` makes daemon restart reuse the session. The hidden session **is** visible to raw `list-sessions`, so both list producers drop it centrally through `tmux.DropHidden` (`Ctl.ListLive` for the exec path, the daemon's control-socket parse); anything parsing raw output itself must filter it by hand.
 
 - **`refresh-client -f no-output` suppresses `%output` entirely** (client gains the `no-output` flag; measured `%output` count drops to 0). Send it as the first command after connecting.
 

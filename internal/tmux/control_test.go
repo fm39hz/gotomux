@@ -50,6 +50,17 @@ func TestBuildCommandQuotesFormat(t *testing.T) {
 	}
 }
 
+func TestDropHiddenKeepsOrderAndNotNil(t *testing.T) {
+	in := []LiveSession{{Name: "a"}, {Name: HiddenControlSession}, {Name: "b"}}
+	got := DropHidden(in)
+	if len(got) != 2 || got[0].Name != "a" || got[1].Name != "b" {
+		t.Errorf("DropHidden = %v, want [a b]", got)
+	}
+	if empty := DropHidden([]LiveSession{{Name: HiddenControlSession}}); empty == nil || len(empty) != 0 {
+		t.Errorf("DropHidden(all-hidden) = %v, want non-nil empty", empty)
+	}
+}
+
 func TestClientBlockUsesBeginFlag(t *testing.T) {
 	// Flag 0 is the unsolicited block emitted for the connection's own
 	// new-session; handing it to the first Send would mispair every reply after.
@@ -109,7 +120,8 @@ func TestControlConnListsAndDoesNotPerturb(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	raw, err := cc.SendLines(ctx,
+	raw, err := cc.SendLines(
+		ctx,
 		[]string{"list-sessions", "-F", ListSessFmt},
 		[]string{"list-panes", "-s", "-F", ListPanesFmt},
 	)
@@ -182,6 +194,38 @@ func TestControlConnEmitsMembershipEvents(t *testing.T) {
 		case <-deadline:
 			t.Fatal("no sessions-changed notification within 5s of creating a session")
 		}
+	}
+}
+
+// ListLive feeds every exec-path consumer: the picker sources after any
+// mutating action (kill/freeze/delete clear the seeded cache and reload
+// through here) and the freeze pick list. A leak of the reserved name on this
+// path is how __gotomuxd got painted as a regular session right after a kill,
+// even though the daemon's IPC payload was filtered correctly.
+func TestListLiveDropsHiddenControlSession(t *testing.T) {
+	isolatedServer(t)
+	tmuxtest.NewSessions(t, "zt-vis")
+	if out, err := exec.Command("tmux", "new-session", "-d", "-s", HiddenControlSession).CombinedOutput(); err != nil {
+		t.Fatalf("new-session %s: %v: %s", HiddenControlSession, err, strings.TrimSpace(string(out)))
+	}
+
+	c, err := New()
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	live, err := c.ListLive(context.Background())
+	if err != nil {
+		t.Fatalf("ListLive: %v", err)
+	}
+	seen := map[string]bool{}
+	for _, s := range live {
+		if IsHiddenSession(s.Name) {
+			t.Errorf("hidden control session leaked past ListLive: %+v", live)
+		}
+		seen[s.Name] = true
+	}
+	if !seen["zt-vis"] {
+		t.Errorf("visible session zt-vis missing from ListLive output: %+v", live)
 	}
 }
 

@@ -344,22 +344,7 @@ func (d *Daemon) listLiveViaControl() []tmux.LiveSession {
 		}
 	}
 	d.ccOK.Store(true)
-	return withoutHidden(tmux.ParseLiveOutput(raw))
-}
-
-// withoutHidden drops the daemon's own control session, which is a real session
-// as far as tmux is concerned and would otherwise appear in the picker.
-// Always returns non-nil so "only the hidden session exists" stays distinct from
-// "tmux unreadable".
-func withoutHidden(in []tmux.LiveSession) []tmux.LiveSession {
-	out := make([]tmux.LiveSession, 0, len(in))
-	for _, s := range in {
-		if tmux.IsHiddenSession(s.Name) {
-			continue
-		}
-		out = append(out, s)
-	}
-	return out
+	return tmux.DropHidden(tmux.ParseLiveOutput(raw))
 }
 
 // syncNow refreshes every cache the IPC layer serves, single-flighted.
@@ -481,7 +466,7 @@ func (d *Daemon) diffTelemetry(sessions []tmux.LiveSession) {
 
 	// Directed switches: exactly one session lost a client and exactly one
 	// gained one; anything else (multi-client churn, plain attach/detach) is
-	// not a transition. Hidden sessions never reach here (withoutHidden), but
+	// not a transition. Hidden sessions never reach here (tmux.DropHidden), but
 	// skip defensively anyway: the daemon's own control client keeps the
 	// hidden session attached forever, so it would otherwise be a permanent
 	// ghost member of the attached set.

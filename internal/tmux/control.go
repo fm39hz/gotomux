@@ -24,12 +24,32 @@ import (
 // daemon that attached to a user session would be falsifying the exact data it
 // exists to serve. Owning a throwaway session leaves user sessions untouched.
 //
-// The session IS visible to list-sessions, so every consumer must filter it —
-// that is the price of not perturbing anything.
+// The session IS visible to list-sessions. Both producers of finished session
+// lists — Ctl.ListLive (exec) and the daemon's control-socket parse — drop it
+// via DropHidden, so consumers never have to remember to filter. That is the
+// price of not perturbing anything, paid in exactly one place.
 const HiddenControlSession = "__gotomuxd"
 
 // IsHiddenSession reports whether name is the daemon's own control session.
 func IsHiddenSession(name string) bool { return name == HiddenControlSession }
+
+// DropHidden removes HiddenControlSession from a parsed session list.
+//
+// Raw tmux listings always contain the daemon's own control session; letting a
+// consumer forget to filter it meant the picker painted __gotomuxd as a regular
+// session after any action that forced a re-read (kill/freeze/delete clear the
+// seeded cache and go back to ListLive). Always returns non-nil so "only the
+// hidden session exists" stays distinct from "tmux unreadable".
+func DropHidden(in []LiveSession) []LiveSession {
+	out := make([]LiveSession, 0, len(in))
+	for _, s := range in {
+		if IsHiddenSession(s.Name) {
+			continue
+		}
+		out = append(out, s)
+	}
+	return out
+}
 
 var (
 	// ErrControlClosed means Close was called; the connection will not come back.
