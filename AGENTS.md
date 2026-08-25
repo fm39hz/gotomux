@@ -37,7 +37,7 @@ Test gating (matters when a test "doesn't run"):
 
 **Store tests must use `isolatedStore` (`internal/store/learn_test.go`), never `store.Open()` without redirecting the data dir.** Three tests used to run against the developer's real `state.db` — one with a comment admitting it — so `go test ./...` mutated live presets.
 
-No linter beyond vet. Releases are fully automatic: `release.yml` runs semantic-release on every push to master — `feat`→minor, `fix`/`perf`→patch, `BREAKING CHANGE`/`!`→major (at 0.x breaking→minor) — creating the `v*` tag, a GitHub Release with both binaries, then pushing the Arch package to AUR. Never tag by hand.
+No linter beyond vet. Releases are fully automatic: `release.yml` runs semantic-release on every push to master. While the latest tag is 0.x, every ordinary commit (`feat`/`fix`/`perf`/`revert`) bumps **patch** and only `BREAKING CHANGE`/`!` bumps minor — semantic-release has no built-in 0.x handling (its defaults would turn a breaking change into v1.0.0), so the band-specific rules live explicitly in `.releaserc.cjs`, and crossing into standard semver (`feat`→minor, breaking→major) is a deliberate flip of `preOne` there. Each release creates the `v*` tag, rebuilds both binaries inside the prepare hook with the version injected into `main.version`, attaches them to the GitHub Release, then pushes the Arch package to AUR. Never tag by hand.
 
 ## Architecture
 

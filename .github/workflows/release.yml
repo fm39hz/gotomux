@@ -6,6 +6,10 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   release:
     runs-on: ubuntu-latest
@@ -21,16 +25,16 @@ jobs:
       - name: Test (fast gate)
         run: go vet ./... && go test ./... -count=1 -short
 
-      - name: Build
-        run: |
-          go build -ldflags="-s -w" -o gotomux .
-          go build -ldflags="-s -w" -o gotomuxd ./cmd/gotomuxd/
-
       - name: Record tag before release
         run: echo "TAG_BEFORE=$(git tag --list 'v*' --sort=-v:refname | head -1)" >> "$GITHUB_ENV"
 
       - name: Release
         uses: cycjimmy/semantic-release-action@v4
+        with:
+          # exec is not in the action's default plugin set; without this the
+          # prepare hook fails with "Cannot find module".
+          extra_plugins: |
+            @semantic-release/exec
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -60,6 +64,7 @@ jobs:
             dist/gotomux.install
           test: true
           test_flags: --clean --cleanbuild --syncdeps --noconfirm --needed
+          updpkgsums: true
           post_process: rm -f -- *.pkg.tar.* gotomux-*.tar.gz
           commit_username: ${{ secrets.AUR_USERNAME }}
           commit_email: ${{ secrets.AUR_EMAIL }}

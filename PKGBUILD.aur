@@ -1,6 +1,6 @@
 # Maintainer: fm39hz <fm39hz@gmail.com>
 # AUR package — upstream PKGBUILD in repo root.
-# CI replaces source + sha256sums on tag.
+# CI bumps pkgver and regenerates sha256sums (updpkgsums) on each release.
 
 pkgname=gotomux
 pkgver=0.1.4       # replaced by CI on tag push
