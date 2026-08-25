@@ -1,0 +1,122 @@
+name: bench
+
+# P1.4 — benchmark regression gate for internal/picker.
+#
+# Deliberately INFORMATIONAL: nothing here can fail the PR yet. Shared CI
+# runners have a noise floor nobody has calibrated on this repo; until that is
+# measured and stays under ~10% across runs, a hard-fail threshold would be
+# indistinguishable from runner jitter. The plan (docs/_improvements.md P1.4,
+# following sesh's benchstat-per-PR discipline): collect reports on every PR
+# now, watch the spread, then flip to a real gate (informational 125% first)
+# once the noise floor is known.
+on: [pull_request]
+
+permissions:
+  contents: read
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history so the merge-base against the target branch exists.
+          fetch-depth: 0
+
+      # Version pinned by go.mod, same as ci.yml.
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      # Several benchmarks fork tmux (and tolerate missing sessions); without
+      # the binary they die instead of skipping. zoxide is optional runtime —
+      # installed best-effort so zoxide-backed paths are exercised.
+      - name: install tmux, zoxide, benchstat
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y tmux
+          sudo apt-get install -y zoxide || echo "zoxide unavailable; those paths no-op"
+          go install golang.org/x/perf/cmd/benchstat@latest
+
+      - name: resolve merge-base
+        id: base
+        run: |
+          git fetch --no-tags origin "+refs/heads/${{ github.base_ref }}:refs/remotes/origin/${{ github.base_ref }}"
+          sha="$(git merge-base HEAD "origin/${{ github.base_ref }}")"
+          echo "merging ${{ github.base_ref }} at $sha" >&2
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
+      - name: benchmark head
+        run: >
+          go test ./internal/picker/ -bench=. -benchmem -run='^$'
+          -count=6 -benchtime=100ms > head.txt
+
+      # Base runs in a worktree pinned to the merge-base so both sides measure
+      # the same commit GitHub would merge into.
+      - name: benchmark base (merge-base)
+        run: |
+          git worktree add "$RUNNER_TEMP/base" "${{ steps.base.outputs.sha }}"
+          cd "$RUNNER_TEMP/base"
+          go test ./internal/picker/ -bench=. -benchmem -run='^$' -count=6 -benchtime=100ms > "$GITHUB_WORKSPACE/base.txt"
+
+      - name: compare (informational)
+        run: |
+          benchstat base.txt head.txt | tee bench-report.txt
+          {
+            echo '## Benchmark comparison (merge-base vs head)'
+            echo ''
+            echo '```'
+            cat bench-report.txt
+            echo '```'
+            echo ''
+            echo '_Informational only — no regression gate yet (noise floor unmeasured)._'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Best effort: fork PRs carry a read-only token, so commenting may fail;
+      # the job summary above always holds the result either way.
+      - name: comment on PR
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          {
+            echo '### Bench comparison (informational)'
+            echo ''
+            echo '```'
+            cat bench-report.txt
+            echo '```'
+          } > pr-comment.md
+          gh pr comment "${{ github.event.number }}" --body-file pr-comment.md
+
+  # Env-gated startup breakdown (STARTUP_BENCH is off by default); published to
+  # the summary, never compared — it is a profiling aid, not a comparable score.
+  bench-startup:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: install tmux (+zoxide best-effort)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y tmux
+          sudo apt-get install -y zoxide || echo "zoxide unavailable; those paths no-op"
+
+      - name: startup breakdown
+        env:
+          STARTUP_BENCH: '1'
+        run: |
+          go test ./internal/picker/ -run TestStartupBreakdown -v -count=1 | tee startup.txt
+          {
+            echo '## Startup breakdown'
+            echo ''
+            echo '```'
+            cat startup.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

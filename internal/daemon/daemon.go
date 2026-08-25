@@ -2,10 +2,13 @@ package daemon
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"net"
 	"os"
 	"path/filepath"
+	"runtime"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -41,13 +44,41 @@ func servedPaths(sessions []tmux.LiveSession, presets []store.PresetMeta, zox []
 	return out
 }
 
+// controlClient is the slice of *tmux.ControlConn the daemon actually uses.
+//
+// The narrow seam exists for tests: a stub pins Alive=true, so no test can ever
+// attach to — and perturb — the developer's real tmux server, while production
+// keeps handing over tmux.NewControl() unchanged.
+type controlClient interface {
+	Alive() bool
+	Reconnect() error
+	SendLines(ctx context.Context, cmds ...[]string) (string, error)
+	Events() <-chan string
+	Timeouts() int64
+	Close()
+}
+
+// Compile-time guarantee that the production type still satisfies the seam.
+var _ controlClient = (*tmux.ControlConn)(nil)
+
+// panicHook is a package-level test seam invoked at the top of syncNowInner;
+// production leaves it nil. Atomic so tests can arm and disarm it while the
+// poll loop ticks without racing that read.
+var panicHook atomic.Pointer[func()]
+
 type Daemon struct {
-	cc           *tmux.ControlConn
-	ctl          *tmux.Ctl
-	st           *store.Store
-	stPath       string
-	stMu         sync.Mutex
-	cfg          *config.Config
+	cc     controlClient
+	ctl    *tmux.Ctl
+	st     *store.Store
+	stPath string
+	stMu   sync.Mutex
+	// syncing single-flights syncNow across its two independent triggers; see
+	// syncNow for why dropping the loser is correct rather than a loss.
+	syncing atomic.Bool
+	// cfgPtr holds the active configuration. Every reader goes through conf()
+	// at the moment of use — caching a *config.Config into a long-lived local
+	// is exactly what would make a SIGHUP reload invisible.
+	cfgPtr       atomic.Pointer[config.Config]
 	lastSeen     map[string]int64
 	lastSeenMu   sync.Mutex
 	lastAttached map[string]int
@@ -122,10 +153,11 @@ func New(cfg *config.Config) (*Daemon, error) {
 	d := &Daemon{
 		// Not attached yet: the daemon must not create the tmux server. See
 		// ensureControl.
-		cc: tmux.NewControl(), ctl: ctl, st: st, stPath: stPath, cfg: cfg,
-		lastSeen: map[string]int64{}, lastAttached: map[string]int{}, sockPath: cfg.SocketPath(),
-		stopCh: make(chan struct{}), startedAt: time.Now(),
+		cc: tmux.NewControl(), ctl: ctl, st: st, stPath: stPath,
+		lastSeen: map[string]int64{}, lastAttached: map[string]int{},
+		sockPath: cfg.SocketPath(), stopCh: make(chan struct{}), startedAt: time.Now(),
 	}
+	d.cfgPtr.Store(cfg)
 	d.ensureControl()
 	d.syncZoxide()
 	d.syncNow()
@@ -136,6 +168,29 @@ func New(cfg *config.Config) (*Daemon, error) {
 	// before the user's first picker open, not before the socket is bound.
 	go prewarm(cfg)
 	return d, nil
+}
+
+// conf returns the active configuration generation. Reload swaps the pointer
+// atomically, so a reader sees either the whole old or the whole new config,
+// never a torn mix.
+func (d *Daemon) conf() *config.Config {
+	return d.cfgPtr.Load()
+}
+
+// ReloadConfig swaps in a freshly loaded configuration atomically. Readers
+// pick it up at their next natural boundary: pollLoop at its next tick, ensureDB
+// if it ever has to reopen the store.
+//
+// A reload deliberately cannot relocate the socket, replace the open store or
+// touch the control session: those bind once at startup, and relocating them
+// under live traffic is a different problem entirely. A nil config is ignored —
+// a failed Load upstream must not blank out the running settings.
+func (d *Daemon) ReloadConfig(cfg *config.Config) {
+	if cfg == nil {
+		return
+	}
+	d.cfgPtr.Store(cfg)
+	log.Println("config reloaded")
 }
 
 // Shutdown unblocks ServeIPC by closing the listener, so a signal handler can
@@ -215,7 +270,7 @@ func (d *Daemon) ensureDB() {
 		d.storeErrs.Add(1)
 		log.Printf("[store] [ERROR] ping: %v — reopening", err)
 		d.st.Close()
-		if st, err := store.OpenWithConfig(d.cfg); err == nil {
+		if st, err := store.OpenWithConfig(d.conf()); err == nil {
 			d.st = st
 			log.Printf("[store] [INFO] reopened")
 		} else {
@@ -307,13 +362,34 @@ func withoutHidden(in []tmux.LiveSession) []tmux.LiveSession {
 	return out
 }
 
-// syncNow refreshes every cache the IPC layer serves.
+// syncNow refreshes every cache the IPC layer serves, single-flighted.
+//
+// Its two triggers run on separate goroutines — the pollLoop tick and the
+// watchEvents debounce — and nothing else stopped them overlapping. That
+// mattered: diffTelemetry reads-and-writes lastSeen/lastAttached, so two
+// concurrent syncs both look at the same old snapshot and record the same
+// open/transition twice, or record an ambiguous attach diff in the wrong
+// direction. Dropping the event-triggered loser is the intended semantics, not
+// lost freshness: the winner's result serves both triggers, and the next poll
+// is at most one interval away anyway.
+func (d *Daemon) syncNow() {
+	if !d.syncing.CompareAndSwap(false, true) {
+		return
+	}
+	defer d.syncing.Store(false)
+	d.syncNowInner()
+}
+
+// syncNowInner is the sync body and must only run through syncNow.
 //
 // The tmux half and the SQLite half are independent: presets, usage and pairs
 // have no tmux dependency, so a broken control connection must not skip them.
 // Previously one nil from tmux returned early and left every SQLite-backed
 // cache permanently empty.
-func (d *Daemon) syncNow() {
+func (d *Daemon) syncNowInner() {
+	if f := panicHook.Load(); f != nil {
+		(*f)()
+	}
 	d.ensureDB()
 
 	sessions := d.listLiveViaControl()
@@ -536,7 +612,11 @@ func (d *Daemon) syncZoxide() {
 		}
 	}
 
-	rows := zoxide.Rows(paths)
+	var neg zoxide.RootNegativeCache
+	if st != nil {
+		neg = zoxide.NegFromStore(st)
+	}
+	rows := zoxide.RowsChecked(paths, neg)
 	if len(rows) == 0 {
 		return
 	}
@@ -581,12 +661,60 @@ func (d *Daemon) checkpoint() {
 	}
 }
 
+// crashGuard turns a panic in a long-lived goroutine into a persisted crash
+// log instead of a dead process. A daemon killed mid-tick leaves the WAL
+// uncheckpointed, the socket stale and telemetry lost — the exact cascade the
+// signal-path Close exists to prevent — while a recovered panic only costs the
+// work of one tick, one event or one request.
+//
+// It must be deferred directly by the guarded body for recover() to see it.
+func (d *Daemon) crashGuard(scope string) {
+	if r := recover(); r != nil {
+		d.crashLog(scope, r)
+	}
+}
+
+// crashLog persists panic evidence to <DataDir>/crash_<unix>.log: the panic
+// value plus a full stack, tagged with time and platform. Best-effort twice
+// over — resolution and write failures degrade to a log line, because panicking
+// inside the crash handler helps nobody.
+//
+// No binary version is recorded because gotomuxd carries none today; adding
+// ldflags plumbing just for this file was judged not worth it.
+func (d *Daemon) crashLog(scope string, r any) {
+	body := fmt.Sprintf(
+		"time: %s\nscope: %s\npanic: %v\ngoos: %s\ngoarch: %s\nstack:\n%s",
+		time.Now().Format(time.RFC3339Nano), scope, r,
+		runtime.GOOS, runtime.GOARCH, debug.Stack(),
+	)
+	dir := ""
+	if cfg := d.conf(); cfg != nil {
+		dir = cfg.ResolveDataDir()
+	}
+	if dir == "" {
+		log.Printf("[daemon] [ERROR] panic in %s recovered: %v — no data dir to write the crash log", scope, r)
+		return
+	}
+	path := filepath.Join(dir, fmt.Sprintf("crash_%d.log", time.Now().Unix()))
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		log.Printf("[daemon] [ERROR] panic in %s recovered: %v — crash log write failed: %v", scope, r, err)
+		return
+	}
+	log.Printf("[daemon] [ERROR] panic in %s recovered: %v — %s", scope, r, path)
+}
+
+// pollInterval resolves the current cadence from the live config. Read per
+// tick, never captured at startup, so a reload takes effect without a restart.
+func pollInterval(cfg *config.Config) time.Duration {
+	if cfg != nil && cfg.PollInterval > 0 {
+		return cfg.PollInterval
+	}
+	return 10 * time.Second
+}
+
 func (d *Daemon) pollLoop() {
 	defer d.wg.Done()
-	interval := 10 * time.Second
-	if d.cfg != nil && d.cfg.PollInterval > 0 {
-		interval = d.cfg.PollInterval
-	}
+	interval := pollInterval(d.conf())
 	tick := time.NewTicker(interval)
 	defer tick.Stop()
 	lastZox := time.Now()
@@ -597,20 +725,32 @@ func (d *Daemon) pollLoop() {
 		case <-d.stopCh:
 			return
 		case <-tick.C:
-			// Re-attach if a server has appeared (or ours went away). Never starts
-			// a server.
-			d.ensureControl()
-			d.ensureSocket()
-			d.syncNow() // ensureDB runs inside syncNow
-			if time.Since(lastZox) >= zoxideRefresh {
-				lastZox = time.Now()
-				d.syncZoxide()
-				d.checkpoint()
+			// Re-read every tick so a SIGHUP reload lands on the next cadence.
+			// Reset may still deliver one already-queued tick on the old
+			// interval; the body is idempotent, so that is harmless.
+			if cur := pollInterval(d.conf()); cur != interval {
+				interval = cur
+				tick.Reset(cur)
 			}
-			if time.Since(lastPrune) >= pruneEvery {
-				lastPrune = time.Now()
-				d.prune()
-			}
+			// A panic kills the tick, not the loop: the next tick retries from
+			// scratch. Panic is per-tick damage, never per-process.
+			func() {
+				defer d.crashGuard("poll")
+				// Re-attach if a server has appeared (or ours went away). Never starts
+				// a server.
+				d.ensureControl()
+				d.ensureSocket()
+				d.syncNow() // ensureDB runs inside syncNow
+				if time.Since(lastZox) >= zoxideRefresh {
+					lastZox = time.Now()
+					d.syncZoxide()
+					d.checkpoint()
+				}
+				if time.Since(lastPrune) >= pruneEvery {
+					lastPrune = time.Now()
+					d.prune()
+				}
+			}()
 		}
 	}
 }
@@ -651,7 +791,12 @@ func (d *Daemon) watchEvents() {
 					break coalesce
 				}
 			}
-			d.syncNow()
+			// Same containment contract as the poll tick: one poisoned event
+			// costs one resync, not the watcher goroutine.
+			func() {
+				defer d.crashGuard("events")
+				d.syncNow()
+			}()
 		}
 	}
 }

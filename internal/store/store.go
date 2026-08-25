@@ -58,6 +58,10 @@ type Storer interface {
 
 	LoadZox() (rows []ZoxRow, updated int64, sig string, ok bool)
 	SaveZox(rows []ZoxRow, sig string) error
+
+	LoadRootNeg(path string) (checked int64, ok bool)
+	SaveRootNeg(path string) error
+	ForgetRootNeg(path string) error
 }
 
 type Store struct {
@@ -236,11 +240,11 @@ func (s *Store) Ping() error {
 // schemaVersion is bumped whenever migrate() gains a statement. It gates the
 // whole migration behind one PRAGMA read: the CREATE TABLE IF NOT EXISTS
 // statements and pragma_table_info probes are individually cheap but there are
-// fourteen of them, on the cold path of every invocation, to do nothing.
+// fifteen of them, on the cold path of every invocation, to do nothing.
 // The migration itself stays additive-only and idempotent — the fast path is an
 // optimisation, not a replacement, so a DB from a future version or one that
 // somehow lost user_version still gets the full run.
-const schemaVersion = 5
+const schemaVersion = 6
 
 func (s *Store) migrate() error {
 	var have int
@@ -333,6 +337,16 @@ CREATE TABLE IF NOT EXISTS zox_item (
   title   TEXT NOT NULL DEFAULT '',
   desc    TEXT NOT NULL DEFAULT '',
   recency INTEGER NOT NULL DEFAULT 0
+);`); err != nil {
+		return err
+	}
+	// root_neg remembers which paths a FindProjectRoot walk already proved
+	// markerless, so the next derive within RootNegTTL skips those walks
+	// entirely (see root_neg.go).
+	if _, err = s.db.Exec(`
+CREATE TABLE IF NOT EXISTS root_neg (
+  path    TEXT PRIMARY KEY,
+  checked INTEGER NOT NULL
 );`); err != nil {
 		return err
 	}

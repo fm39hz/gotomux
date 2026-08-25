@@ -4,7 +4,7 @@ LDFLAGS := -s -w
 REMOTE  := origin
 BRANCH  := master
 
-.PHONY: help build build-all run test test-v bench install install-all clean fmt vet pkg pkg-install
+.PHONY: help build build-all run test test-v bench schema install install-all clean fmt vet pkg pkg-install
 
 help: ## list targets
 	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN{FS=":.*?## "}; {printf "  %-12s %s\n", $$1, $$2}'
@@ -27,6 +27,9 @@ test-v: ## tests verbose
 bench: ## microbenchmarks
 	go test ./internal/picker/ -bench=. -benchmem -run=^$$
 
+schema: ## regenerate schema/config.json
+	GOTOMUX_UPDATE_SCHEMA=1 go test ./internal/config/ -run TestConfigSchemaGolden
+
 install: ## go install CLI
 	go install -ldflags='$(LDFLAGS)' .
 
@@ -43,8 +46,10 @@ clean: ## remove local binaries
 fmt: ## gofmt
 	gofmt -w .
 
-vet: ## go vet
+vet: ## go vet + tree guards (no exit/fatal in internal/, algo.Init only in main.go)
 	go vet ./...
+	./scripts/check_no_exit.sh
+	./scripts/check_algo_init.sh
 
 pkg: ## build Arch package (artifacts to dist/)
 	mkdir -p dist

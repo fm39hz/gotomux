@@ -183,10 +183,25 @@ func (d *Daemon) handleConn(conn net.Conn) {
 			return
 		}
 		_ = conn.SetReadDeadline(time.Time{})
-		if err := d.serveRequest(enc, req); err != nil {
+		if err := d.safeServe(enc, req); err != nil {
 			return
 		}
 	}
+}
+
+// safeServe runs one request behind a recover. A panic anywhere in the
+// per-command handling becomes an error Response on the wire instead of a dead
+// connection handler — and because handleConn keeps looping, one poisoned
+// request from a broken or hostile client cannot take down the accept loop or
+// any other client's connection.
+func (d *Daemon) safeServe(enc *json.Encoder, req Request) error {
+	defer func() {
+		if r := recover(); r != nil {
+			d.crashLog("ipc", r)
+			_ = enc.Encode(Response{OK: false, Error: fmt.Sprintf("internal error: %v", r)})
+		}
+	}()
+	return d.serveRequest(enc, req)
 }
 
 // serveRequest writes exactly one Response per request. Every branch responds,

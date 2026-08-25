@@ -26,15 +26,27 @@ func main() {
 	// reaped, and the socket file was always left behind — which made the
 	// stale-socket recovery path in listenWithGuard the normal startup path
 	// rather than an exceptional one.
+	//
+	// SIGHUP reloads the config instead. The daemon runs all day and losing the
+	// in-memory caches plus a few telemetry cycles to restart for a single
+	// number is not a fair trade; config.Load normalizes and degrades to
+	// defaults on a malformed file, so a broken edit can never kill a healthy
+	// daemon. A reload deliberately cannot touch the socket path, the store
+	// handle or the control session — those bind once at startup.
 	sig := make(chan os.Signal, 1)
-	signal.Notify(sig, syscall.SIGTERM, syscall.SIGINT)
+	signal.Notify(sig, syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP)
 
 	stopped := make(chan struct{})
 	go func() {
-		s := <-sig
-		log.Printf("received %v — shutting down", s)
-		d.Shutdown()
-		close(stopped)
+		for s := range sig {
+			if s != syscall.SIGHUP {
+				log.Printf("received %v — shutting down", s)
+				d.Shutdown()
+				close(stopped)
+				return
+			}
+			d.ReloadConfig(config.Load())
+		}
 	}()
 
 	log.Println("listening")

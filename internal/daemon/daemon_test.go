@@ -1,17 +1,22 @@
 package daemon
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/fm39hz/gotomux/internal/config"
+	"github.com/fm39hz/gotomux/internal/store"
 	"github.com/fm39hz/gotomux/internal/tmux"
 	"github.com/fm39hz/gotomux/internal/tmuxtest"
 )
@@ -453,5 +458,328 @@ func TestDaemonDiffTelemetryRecordsTransitions(t *testing.T) {
 	}
 	if len(fromB) != 0 || len(fromC) != 0 {
 		t.Errorf("unexpected transitions: fromB=%+v fromC=%+v", fromB, fromC)
+	}
+}
+
+// ---- tmux-free harness for the P1.1/P2.3/P2.4 unit tests ----
+//
+// newIsolated exercises the full daemon against a real (isolated) tmux server,
+// which is why those tests skip under -short. The features added here are
+// unit-level, so they run against newBare instead: a stubbed control client
+// whose Alive is pinned true, meaning no code path under test can ever probe —
+// let alone attach to — the developer's real tmux server.
+
+// stubCC satisfies controlClient without spawning tmux. Alive pinned true keeps
+// ensureControl and listLiveViaControl off the real environment; send lets a
+// test inject behavior (canned output, a panic) per control-mode exchange.
+type stubCC struct {
+	events chan string
+	send   func(ctx context.Context, cmds ...[]string) (string, error)
+}
+
+func newStubCC() *stubCC { return &stubCC{events: make(chan string, 8)} }
+
+func (s *stubCC) Alive() bool           { return true }
+func (s *stubCC) Reconnect() error      { return nil }
+func (s *stubCC) Events() <-chan string { return s.events }
+func (s *stubCC) Timeouts() int64       { return 0 }
+func (s *stubCC) Close()                {}
+
+func (s *stubCC) SendLines(ctx context.Context, cmds ...[]string) (string, error) {
+	if s.send != nil {
+		return s.send(ctx, cmds...)
+	}
+	return "", nil
+}
+
+// newBare builds a minimal daemon against a private temp data dir: stubbed
+// control client, a real store inside the temp dir, and no background
+// goroutines — each test starts exactly the loops it exercises.
+func newBare(t *testing.T, tune func(*config.Config)) *Daemon {
+	t.Helper()
+	root := t.TempDir()
+	cfg := &config.Config{DataDir: root, PollInterval: 10 * time.Second}
+	if tune != nil {
+		tune(cfg)
+	}
+	dir := cfg.ResolveDataDir()
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatalf("mkdir %s: %v", dir, err)
+	}
+	st, err := store.OpenWithConfig(cfg)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	// acquireLock keys off XDG_RUNTIME_DIR; point it at the scratch tree so
+	// ServeIPC never touches the developer's real lock file.
+	t.Setenv("XDG_RUNTIME_DIR", root)
+
+	d := &Daemon{
+		cc: newStubCC(), st: st,
+		stPath:   filepath.Join(dir, "state.db"),
+		lastSeen: map[string]int64{}, lastAttached: map[string]int{},
+		sockPath: filepath.Join(dir, "test.sock"),
+		stopCh:   make(chan struct{}), startedAt: time.Now(),
+	}
+	d.cfgPtr.Store(cfg)
+	t.Cleanup(func() { d.Close() })
+	return d
+}
+
+// armPanicHook arms the syncNowInner seam and returns an explicit disarm.
+//
+// Disarm MUST be called in the test body after every loop that ticks has been
+// joined (d.Close()), because disarming while a loop is mid-tick is a data race
+// the detector will flag. There is deliberately no automatic cleanup: cleanup
+// functions run in LIFO order, which would put the disarm before newBare's
+// d.Close and reintroduce exactly that race whenever a test forgot to join.
+func armPanicHook(t *testing.T, f func()) func() {
+	t.Helper()
+	panicHook.Store(&f)
+	called := false
+	return func() {
+		if !called {
+			called = true
+			panicHook.Store(nil)
+		}
+	}
+}
+
+// TestSyncNowIsSingleFlight pins the actual invariant: however many goroutines
+// fire syncNow simultaneously, at most ONE body of syncNowInner is executing at
+// any moment. diffTelemetry's read-modify-write over lastSeen/lastAttached is
+// only correct under that property; the mutex alone cannot give it, because two
+// serialized-by-mutex-but-both-started-from-the-same-snapshot runs would still
+// double-record.
+func TestSyncNowIsSingleFlight(t *testing.T) {
+	d := newBare(t, nil)
+	var active, maxActive atomic.Int64
+	disarm := armPanicHook(t, func() {
+		cur := active.Add(1)
+		for {
+			m := maxActive.Load()
+			if cur <= m || maxActive.CompareAndSwap(m, cur) {
+				break
+			}
+		}
+		// Widen the overlap window so any guard breach is virtually certain to
+		// be observed rather than squeezed between two instructions.
+		time.Sleep(50 * time.Microsecond)
+		active.Add(-1)
+	})
+	defer disarm()
+
+	const workers, loops = 8, 250
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < loops; j++ {
+				d.syncNow()
+			}
+		}()
+	}
+	wg.Wait()
+
+	if n := maxActive.Load(); n != 1 {
+		t.Errorf("%d syncNow bodies ran concurrently; the single-flight guard is broken", n)
+	}
+}
+
+// TestSyncNowDropsWhileInFlight shows the drop is immediate: callers arriving
+// while a sync holds the flag RETURN, they are neither queued nor blocked.
+func TestSyncNowDropsWhileInFlight(t *testing.T) {
+	d := newBare(t, nil)
+
+	release := make(chan struct{})
+	firstIn := make(chan struct{})
+	armPanicHook(t, func() {
+		select {
+		case firstIn <- struct{}{}:
+		default:
+		}
+		<-release
+	})
+
+	holderDone := make(chan struct{})
+	go func() { d.syncNow(); close(holderDone) }()
+	select {
+	case <-firstIn:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first syncNow never reached the body")
+	}
+
+	const drops = 16
+	dropped := make(chan struct{}, drops)
+	for i := 0; i < drops; i++ {
+		go func() {
+			d.syncNow()
+			dropped <- struct{}{}
+		}()
+	}
+	for i := 0; i < drops; i++ {
+		select {
+		case <-dropped:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("only %d/%d concurrent callers returned while a sync was in flight; they are waiting instead of dropping", i, drops)
+		}
+	}
+	select {
+	case <-holderDone:
+		t.Fatal("holder finished while release was still closed; the hook did not hold it")
+	default:
+	}
+
+	close(release)
+	<-holderDone
+}
+
+// TestPollLoopSurvivesPanicAndKeepsServing drives the whole containment story:
+// every tick panics via the injected hook, yet the loop keeps ticking (the tick
+// counter advances past multiple recovered panics), evidence lands in
+// <DataDir>/crash_<unix>.log, and the IPC surface keeps answering throughout.
+func TestPollLoopSurvivesPanicAndKeepsServing(t *testing.T) {
+	d := newBare(t, func(c *config.Config) { c.PollInterval = 20 * time.Millisecond })
+
+	var ticks atomic.Int64
+	disarm := armPanicHook(t, func() {
+		ticks.Add(1)
+		panic("boom-test-panic")
+	})
+
+	go func() { _ = ServeIPC(d) }()
+	d.wg.Add(1) // mirror New: pollLoop owns one wg slot
+	go d.pollLoop()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) && ticks.Load() < 3 {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if ticks.Load() < 3 {
+		disarm()
+		d.Close()
+		t.Fatalf("tick body entered %d times; the poll loop did not survive repeated panics", ticks.Load())
+	}
+
+	// While the panic storm is ongoing, a client must still get answers.
+	conn := dialDaemon(t, d)
+	defer conn.Close()
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	enc, dec := json.NewEncoder(conn), json.NewDecoder(conn)
+	if err := enc.Encode(Request{Cmd: "ping"}); err != nil {
+		t.Fatalf("encode ping: %v", err)
+	}
+	var pong Response
+	if err := dec.Decode(&pong); err != nil {
+		t.Fatalf("decode ping response: %v", err)
+	}
+	if !pong.OK {
+		t.Errorf("ping not OK while the poll loop is recovering panics: %+v", pong)
+	}
+
+	// Join the loops BEFORE disarming (see armPanicHook) and before reading the
+	// crash log, so the file is final rather than mid-overwrite.
+	disarm()
+	d.Close()
+
+	logs, err := filepath.Glob(filepath.Join(d.conf().ResolveDataDir(), "crash_*.log"))
+	if err != nil || len(logs) == 0 {
+		t.Fatalf("no crash log written (err=%v logs=%v)", err, logs)
+	}
+	body, err := os.ReadFile(logs[0])
+	if err != nil {
+		t.Fatalf("read crash log: %v", err)
+	}
+	for _, want := range []string{"boom-test-panic", "goroutine ", runtime.GOOS, runtime.GOARCH} {
+		if !strings.Contains(string(body), want) {
+			t.Errorf("crash log missing %q\n---\n%s\n---", want, body)
+		}
+	}
+}
+
+// TestReloadConfigChangesPollInterval: a reload must reach a RUNNING loop
+// without restarting anything — the very next tick picks up the new cadence.
+func TestReloadConfigChangesPollInterval(t *testing.T) {
+	d := newBare(t, func(c *config.Config) { c.PollInterval = 20 * time.Millisecond })
+
+	var ticks atomic.Int64
+	disarm := armPanicHook(t, func() { ticks.Add(1) })
+	defer disarm()
+
+	d.wg.Add(1) // mirror New: pollLoop owns one wg slot
+	go d.pollLoop()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) && ticks.Load() < 5 {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if ticks.Load() < 5 {
+		d.Close()
+		t.Fatalf("loop never reached the initial fast cadence (ticks=%d)", ticks.Load())
+	}
+
+	slow := &config.Config{DataDir: d.conf().DataDir, PollInterval: time.Hour}
+	d.ReloadConfig(slow)
+	if got := d.conf(); got != slow {
+		d.Close()
+		t.Fatal("active config pointer was not swapped by ReloadConfig")
+	}
+
+	before := ticks.Load()
+	time.Sleep(500 * time.Millisecond)
+	// One already-queued tick may fire right after Reset; five would mean the
+	// ticker kept the old cadence (~25 ticks would have landed in 500ms).
+	if growth := ticks.Load() - before; growth > 5 {
+		d.Close()
+		t.Errorf("%d ticks fired in 500ms after reloading to a 1h interval; pollLoop is not re-reading the config", growth)
+	}
+
+	// A nil config (failed load upstream) must not blank out running settings.
+	d.ReloadConfig(nil)
+	if d.conf() != slow {
+		t.Error("ReloadConfig(nil) replaced the active config")
+	}
+
+	d.Close()
+}
+
+// TestHandleConnRecoversPanicsPerRequest: a request whose handling panics must
+// come back to THAT client as an error Response and leave the connection (and
+// the accept loop) fully serviceable for the next request.
+func TestHandleConnRecoversPanicsPerRequest(t *testing.T) {
+	d := newBare(t, nil)
+	d.cc.(*stubCC).send = func(ctx context.Context, cmds ...[]string) (string, error) {
+		panic("list exploded")
+	}
+
+	go func() { _ = ServeIPC(d) }()
+
+	conn := dialDaemon(t, d)
+	defer conn.Close()
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	enc, dec := json.NewEncoder(conn), json.NewDecoder(conn)
+
+	// connect walks into the (stubbed) control client, whose send now panics.
+	if err := enc.Encode(Request{Cmd: "connect", Name: "dt-poison"}); err != nil {
+		t.Fatalf("encode poisoned request: %v", err)
+	}
+	var resp Response
+	if err := dec.Decode(&resp); err != nil {
+		t.Fatalf("poisoned request got no response: %v", err)
+	}
+	if resp.OK || !strings.Contains(resp.Error, "internal error") {
+		t.Errorf("panicked request answered %+v, want OK=false with an internal error", resp)
+	}
+
+	// The SAME connection must keep serving: containment is per-request.
+	if err := enc.Encode(Request{Cmd: "ping"}); err != nil {
+		t.Fatalf("encode ping after panic: %v", err)
+	}
+	var pong Response
+	if err := dec.Decode(&pong); err != nil {
+		t.Fatalf("connection died after a recovered request panic: %v", err)
+	}
+	if !pong.OK {
+		t.Errorf("ping after recovered panic not OK: %+v", pong)
 	}
 }

@@ -7,28 +7,48 @@ import (
 	"sync"
 )
 
-var projectRootMemo sync.Map
+type rootStatus struct {
+	root  string
+	found bool
+}
+
+var projectRootMemo sync.Map // cleaned start -> rootStatus
 
 // FindProjectRoot walks up from start to nearest project-looking directory.
 func FindProjectRoot(start string) string {
+	return findRoot(start).root
+}
+
+// FindRootStatus is FindProjectRoot plus whether a marker-bearing directory was
+// actually found. When the walk exhausts the hierarchy, root echoes start and
+// found is false — a distinction the negative root cache needs: only exhaustion
+// proves "no root anywhere", while start carrying its own marker (also root ==
+// start) is an immediate hit whose answer must not be recorded as a miss.
+func FindRootStatus(start string) (root string, found bool) {
+	st := findRoot(start)
+	return st.root, st.found
+}
+
+func findRoot(start string) rootStatus {
 	start = filepath.Clean(start)
 	if start == "" {
 		if cwd, err := os.Getwd(); err == nil {
 			start = cwd
 		} else {
-			return start
+			return rootStatus{root: start}
 		}
 	}
 	if v, ok := projectRootMemo.Load(start); ok {
-		return v.(string)
+		return v.(rootStatus)
 	}
 	path := start
 	var chain []string
-	root := start
+	st := rootStatus{root: start}
 	for path != "/" && path != "." && path != "" {
 		chain = append(chain, path)
 		if isProjectRoot(path) {
-			root = path
+			st.root = path
+			st.found = true
 			break
 		}
 		parent := filepath.Dir(path)
@@ -38,10 +58,9 @@ func FindProjectRoot(start string) string {
 		path = parent
 	}
 	for _, p := range chain {
-		projectRootMemo.Store(p, root)
+		projectRootMemo.Store(p, st)
 	}
-	projectRootMemo.Store(start, root)
-	return root
+	return st
 }
 
 func isProjectRoot(dir string) bool {

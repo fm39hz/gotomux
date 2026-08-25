@@ -70,7 +70,7 @@ func rebuildZoxItems(cache *sourceCache) []Item {
 		return nil
 	}
 	sig := zoxide.Signature(paths)
-	items := ZoxRowsToItems(zoxide.Rows(paths))
+	items := ZoxRowsToItems(zoxide.RowsChecked(paths, zoxide.NegFromStore(cache.zoxSt)))
 	if len(items) > 0 {
 		saveZoxItems(items, sig, cache)
 	}
@@ -96,7 +96,7 @@ func validateZoxItems(cache *sourceCache, knownSig string, paths []string) []Ite
 		cache.zoxMu.Unlock()
 		return nil
 	}
-	items := ZoxRowsToItems(zoxide.Rows(paths))
+	items := ZoxRowsToItems(zoxide.RowsChecked(paths, zoxide.NegFromStore(cache.zoxSt)))
 	if len(items) == 0 {
 		return nil
 	}

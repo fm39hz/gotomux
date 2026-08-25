@@ -31,6 +31,11 @@ type Source interface {
 type sourceMsg struct {
 	src   Source
 	items []Item
+	// gen is the sourceCache generation the producing Refresh() captured at
+	// dispatch time. Update drops the message when it no longer matches, so a
+	// result computed before a kill/delete/freeze can never merge rows back
+	// into the model after invalidate() removed them.
+	gen uint64
 }
 
 type sourceCache struct {
@@ -53,12 +58,24 @@ type sourceCache struct {
 	zoxMu      *sync.Mutex
 	zoxSt      store.Storer
 	zoxCap     int
+	// gen counts invalidations. Every Refresh() stamps the value it saw at
+	// dispatch; Update drops deliveries whose stamp no longer matches. One
+	// field plus one compare — deliberately nothing else on any hot path.
+	//
+	// Single-writer discipline: only the UI goroutine writes gen (Update
+	// handling a mutating action) and reads it (cmd creation also runs there).
+	// Command closures carry the value away instead of re-reading it.
+	gen uint64
 }
 
 // invalidate drops everything derived from an earlier read. Called after a
 // mutating action (kill/delete/freeze), which also invalidates the daemon's
 // payload — so seeded is cleared too and the next read goes to the source.
 func (c *sourceCache) invalidate() {
+	// Gen bumps before anything clears: a Refresh dispatched nanoseconds earlier
+	// captured the pre-increment value, and it is the increment — not the
+	// clearing below — that condemns that delivery when it finally arrives.
+	c.gen++
 	c.seeded = false
 	c.tmuxDone.Store(false)
 	c.presetDone.Store(false)
@@ -250,6 +267,10 @@ func (s *zoxideSource) Refresh() tea.Cmd {
 		return nil
 	}
 	src := Source(s)
+	// Captured NOW, not inside the closure: invalidate() may run while this
+	// command sits in flight, and the stamp must reflect the world the query
+	// was launched from, not the world it lands in.
+	gen := s.cache.gen
 	return func() tea.Msg {
 		s.cache.zoxMu.Lock()
 		fresh := len(s.cache.zoxMem) > 0 && time.Since(s.cache.zoxAt) < zoxRevalidate
@@ -258,7 +279,7 @@ func (s *zoxideSource) Refresh() tea.Cmd {
 		if fresh {
 			return nil
 		}
-		return sourceMsg{src: src, items: validateZoxItems(s.cache, sig, zoxide.Query())}
+		return sourceMsg{src: src, items: validateZoxItems(s.cache, sig, zoxide.Query()), gen: gen}
 	}
 }
 

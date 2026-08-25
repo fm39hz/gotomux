@@ -350,8 +350,12 @@ func (m *model) enrichVisible() {
 	}
 }
 
-// gitDoneMsg reports that background git enrichment finished.
-type gitDoneMsg struct{}
+// gitDoneMsg reports that background git enrichment finished. gen carries the
+// same staleness contract as sourceMsg: enrichment dispatched before a
+// mutating action must not relabel the rows that survived it.
+type gitDoneMsg struct {
+	gen uint64
+}
 
 // enrichRestCmd reads the git labels that enrichVisible did not cover.
 // Returns nil when the daemon already supplied them.
@@ -364,9 +368,10 @@ func (m model) enrichRestCmd() tea.Cmd {
 		return nil
 	}
 	conc := gitConc(m.cfg)
+	gen := m.cache.gen
 	return func() tea.Msg {
 		enrichPaths(paths, conc)
-		return gitDoneMsg{}
+		return gitDoneMsg{gen: gen}
 	}
 }
 
@@ -449,7 +454,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, tea.Quit
 
 	case sourceMsg:
-		if len(msg.items) == 0 {
+		// A generation mismatch means the payload was computed before a
+		// kill/delete/freeze invalidated the cache: merging it would resurrect
+		// exactly the dead rows reload() just removed. A nil cache delivered
+		// this message, so nothing about it can be current either.
+		if m.cache == nil || msg.gen != m.cache.gen || len(msg.items) == 0 {
 			return m, nil
 		}
 		m.mergeSource(msg.src, msg.items)
@@ -457,6 +466,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case gitDoneMsg:
+		// Same guard as sourceMsg: labels read before invalidate() describe rows
+		// that may no longer exist; dropping is cheaper than resurrecting them.
+		if m.cache == nil || msg.gen != m.cache.gen {
+			return m, nil
+		}
 		// Re-apply labels only. Deliberately not a refilter: GitBranch does not
 		// participate in ranking, so re-ranking here could only risk a visible jump
 		// for no benefit.

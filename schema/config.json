@@ -1,0 +1,58 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "gotomux config.toml",
+  "type": "object",
+  "properties": {
+    "data_dir": {
+      "description": "Override the base data directory (default: $XDG_DATA_HOME); cannot relocate its own config directory.",
+      "type": "string"
+    },
+    "config_dir": {
+      "description": "Override the base configuration directory (default: $XDG_CONFIG_HOME).",
+      "type": "string"
+    },
+    "poll_interval": {
+      "description": "Daemon poll interval as a Go duration string (default \"10s\").",
+      "type": "string"
+    },
+    "zoxide_cap": {
+      "description": "Maximum zoxide rows while the query is empty (default 40).",
+      "type": "integer"
+    },
+    "max_show": {
+      "description": "Visible picker rows (default 12).",
+      "type": "integer"
+    },
+    "git_concurrency": {
+      "description": "Git enrichment workers (default 4).",
+      "type": "integer"
+    },
+    "proc_cache_ttl": {
+      "description": "Pane process-detection cache TTL as a duration string (default \"2s\").",
+      "type": "string"
+    },
+    "prune_cutoff": {
+      "description": "Age cutoff for pruning stale rows as a duration string (default \"720h\").",
+      "type": "string"
+    },
+    "icons": {
+      "description": "TUI glyphs: auto | nerd | ascii (default \"auto\").",
+      "type": "string"
+    },
+    "daemon": {
+      "type": "object",
+      "properties": {
+        "autostart": {
+          "description": "Let the picker start gotomuxd when it is not running (default true).",
+          "type": "boolean"
+        },
+        "prewarm": {
+          "description": "Page-cache warm on daemon start: auto (rotational disks) | on | off (default \"auto\").",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}
