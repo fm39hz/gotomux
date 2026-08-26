@@ -14,6 +14,7 @@ import (
 type procIndex struct {
 	children map[int32][]int32
 	comm     map[int32]string
+	exe      map[int32]string // absolute executable, "" when unreadable
 }
 
 var (
@@ -31,10 +32,10 @@ func loadProcIndex() *procIndex {
 	if procIdxCache != nil && time.Since(procIdxCachedAt) < 2*time.Second {
 		return procIdxCache
 	}
-
 	idx := &procIndex{
 		children: map[int32][]int32{},
 		comm:     map[int32]string{},
+		exe:      map[int32]string{},
 	}
 	procs, err := process.Processes()
 	if err != nil {
@@ -55,8 +56,10 @@ func loadProcIndex() *procIndex {
 			}
 		}
 		name = strings.ToLower(filepath.Base(name))
-		name = strings.TrimPrefix(name, "-")
 		idx.comm[pid] = name
+		if exe, e2 := p.Exe(); e2 == nil && exe != "" {
+			idx.exe[pid] = exe
+		}
 		idx.children[ppid] = append(idx.children[ppid], pid)
 	}
 	procIdxCache = idx
@@ -84,6 +87,43 @@ func detectPaneCmd(currentCmd, startCmd string, pid int32, procs *procIndex) str
 		return ""
 	}
 	return procs.findTool(pid, 4)
+}
+
+// resolvePaneCmdPath: absolute executable behind the detected tool name, for
+// replay in environments where the bare name may not resolve. Searches the
+// pane leader first, then the process tree — the same order findTool uses.
+// Returns "" when nothing matches or no snapshot is available.
+func resolvePaneCmdPath(name string, panePid int32, procs *procIndex) string {
+	if name == "" || panePid <= 0 || procs == nil {
+		return ""
+	}
+	want := strings.ToLower(name)
+	type node struct {
+		pid   int32
+		depth int
+	}
+	q := []node{{panePid, 0}}
+	seen := map[int32]bool{panePid: true}
+	for len(q) > 0 {
+		n := q[0]
+		q = q[1:]
+		if procs.comm[n.pid] == want {
+			if exe := procs.exe[n.pid]; exe != "" {
+				return exe
+			}
+		}
+		if n.depth >= 4 {
+			continue
+		}
+		for _, child := range procs.children[n.pid] {
+			if seen[child] {
+				continue
+			}
+			seen[child] = true
+			q = append(q, node{child, n.depth + 1})
+		}
+	}
+	return ""
 }
 
 // ToolIntent: pane role tool (nvim, yazi, ...). Empty = default shell.

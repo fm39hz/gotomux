@@ -89,7 +89,7 @@ func (s *Store) Get(name string) (*model.Session, error) {
 	for _, wr := range wins {
 		w := model.Window{Idx: wr.idx, Name: wr.name, Cwd: wr.cwd, Layout: wr.layout}
 		prows, err := s.db.Query(
-			`SELECT idx, COALESCE(cwd,''), COALESCE(cmd,'') FROM pane WHERE window_id = ? ORDER BY idx`,
+			`SELECT idx, COALESCE(cwd,''), COALESCE(cmd,''), COALESCE(cmd_path,'') FROM pane WHERE window_id = ? ORDER BY idx`,
 			wr.id,
 		)
 		if err != nil {
@@ -97,7 +97,7 @@ func (s *Store) Get(name string) (*model.Session, error) {
 		}
 		for prows.Next() {
 			var pn model.Pane
-			if err := prows.Scan(&pn.Idx, &pn.Cwd, &pn.Cmd); err != nil {
+			if err := prows.Scan(&pn.Idx, &pn.Cwd, &pn.Cmd, &pn.CmdPath); err != nil {
 				prows.Close()
 				return nil, err
 			}

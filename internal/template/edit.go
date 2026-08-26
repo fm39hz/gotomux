@@ -62,6 +62,9 @@ type paneJSON struct {
 	Class string `json:"class,omitempty"`
 	Cwd   string `json:"cwd,omitempty"`
 	Cmd   string `json:"cmd,omitempty"`
+	// CmdPath keeps the frozen absolute executable so replay does not depend
+	// on the spawning environment's PATH.
+	CmdPath string `json:"cmd_path,omitempty"`
 }
 
 func (w windowJSON) splitValue() string {
@@ -106,7 +109,7 @@ func Format(p *model.Session) string {
 			panes = []model.Pane{{}}
 		}
 		for _, pn := range panes {
-			pj := paneJSON{Cmd: pn.Cmd}
+			pj := paneJSON{Cmd: pn.Cmd, CmdPath: pn.CmdPath}
 			cwd := pn.Cwd
 			if cwd == "" {
 				cwd = w.Cwd
@@ -184,7 +187,7 @@ func Parse(text string) (*model.Session, error) {
 				if cwd == "" {
 					cwd = p.Cwd
 				}
-				pw.Panes = append(pw.Panes, model.Pane{Idx: k, Cwd: cwd, Cmd: pn.Cmd})
+				pw.Panes = append(pw.Panes, model.Pane{Idx: k, Cwd: cwd, Cmd: pn.Cmd, CmdPath: pn.CmdPath})
 			}
 		}
 		if pw.Cwd == "" && len(pw.Panes) > 0 {

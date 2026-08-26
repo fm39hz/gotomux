@@ -2,13 +2,16 @@ package tmux
 
 import (
 	"context"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/fm39hz/gotomux/internal/model"
+	"github.com/fm39hz/gotomux/internal/tmuxtest"
 )
 
 // mirrors tmuxp/dotnet-grimoire-net.json:
@@ -244,5 +247,67 @@ func TestLoadWindowNamedLikeSession(t *testing.T) {
 	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
 	if len(lines) != 3 {
 		t.Fatalf("want 3 windows, got %q", string(out))
+	}
+}
+
+// Replay contract: rebuilding a frozen session must not depend on the launch
+// environment. Production spawns panes from the tmux server's environment
+// (systemd-minimal when gotomuxd owns the server), where a bare tool name the
+// user's interactive shell resolves fine (config-added PATH entries) is NOT
+// found: the pane dies within milliseconds, remain-on-exit closes the window,
+// and the rebuilt session silently loses it — reported as "rerun shows the old
+// layout". Freeze therefore records the resolved executable path and Load
+// replays that.
+func TestFreezeReplaySurvivesLaunchEnv(t *testing.T) {
+	root := tmuxtest.Isolate(t)
+	_ = root
+	ctl, err := New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	name := "tp-pathreplay"
+	defer func() { _ = ctl.Kill(ctx, name) }()
+
+	// A tool installed OUTSIDE every PATH dir — replaying its bare name fails
+	// no matter what the server PATH is; only the absolute path works.
+	toolDir := t.TempDir()
+	absTool := filepath.Join(toolDir, "faketool")
+	if err := os.WriteFile(absTool, []byte("#!/bin/sh\nsleep 300\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	orig := &model.Session{
+		Name: name,
+		Windows: []model.Window{
+			{Name: "editor", Cwd: "/tmp", Panes: []model.Pane{{Cmd: "/bin/cat"}}},
+			{Name: "agent", Cwd: "/tmp", Panes: []model.Pane{{Cmd: absTool}}},
+		},
+	}
+	if err := ctl.Load(ctx, orig); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(400 * time.Millisecond)
+
+	frozen, err := ctl.Freeze(ctx, name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ctl.Kill(ctx, name); err != nil {
+		t.Fatal(err)
+	}
+	// Rebuild from the frozen preset — ConnectPreset's Load half.
+	if err := ctl.Load(ctx, frozen); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(400 * time.Millisecond)
+
+	out, err := exec.Command("tmux", "list-windows", "-t", name, "-F", "#{window_name}").Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := strings.TrimSpace(string(out))
+	if got != "editor\nagent" {
+		t.Fatalf("rebuilt session lost a window: windows = %q, want editor\\nagent (tool replayed)", got)
 	}
 }

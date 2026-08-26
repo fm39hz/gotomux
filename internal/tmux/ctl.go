@@ -465,10 +465,12 @@ func (c *Ctl) Freeze(ctx context.Context, name string) (*model.Session, error) {
 			order = append(order, wIdx)
 		}
 		cmd := detectPaneCmd(pCur, pStart, int32(pPid64), procs)
+		cmdPath := resolvePaneCmdPath(cmd, int32(pPid64), procs)
 		w.panes = append(w.panes, model.Pane{
 			Idx:      pIdx,
 			Cwd:      pPath,
 			Cmd:      cmd,
+			CmdPath:  cmdPath,
 			StartCmd: pStart,
 		})
 		if w.cwd == "" || pActive {
@@ -529,8 +531,8 @@ func (c *Ctl) Load(ctx context.Context, sess *model.Session) error {
 	if safe := safeWindowName(w0.Name, sess.Name); safe != "" {
 		ns = append(ns, "-n", safe)
 	}
-	if p0.Cmd != "" {
-		ns = append(ns, cmdArgs(p0.Cmd)...)
+	if cmd := paneCmd(p0); cmd != "" {
+		ns = append(ns, cmdArgs(cmd)...)
 	}
 	appendWin(0, w0, ns)
 
@@ -540,8 +542,8 @@ func (c *Ctl) Load(ctx context.Context, sess *model.Session) error {
 		if safe := safeWindowName(w.Name, sess.Name); safe != "" {
 			nw = append(nw, "-n", safe)
 		}
-		if pn.Cmd != "" {
-			nw = append(nw, cmdArgs(pn.Cmd)...)
+		if cmd := paneCmd(pn); cmd != "" {
+			nw = append(nw, cmdArgs(cmd)...)
 		}
 		appendWin(i+1, w, nw)
 	}

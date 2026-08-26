@@ -14,10 +14,26 @@ import (
 // in it) is untouched. new-window at a concrete index rebuilds a missing
 // window exactly like Load does.
 
-// paneCmd: the full command to recreate a pane — StartCmd when the freeze
-// captured one (keeps arguments like "sleep 300" instead of the detected
-// bare "sleep"), Cmd otherwise (pre-save presets have no StartCmd).
+// paneCmd: the full command to recreate a pane.
+//
+// Prefer the frozen absolute executable (CmdPath): panes are spawned by the
+// tmux server under the creating client's environment, where a bare name the
+// user's interactive shell resolves via config-added PATH entries may not
+// exist — the pane dies instantly and the window silently disappears from
+// rebuilt sessions. Arguments from StartCmd are kept verbatim; without a
+// StartCmd, fall back to the detected bare Cmd.
 func paneCmd(p model.Pane) string {
+	if p.CmdPath != "" {
+		if p.StartCmd == "" {
+			return p.CmdPath
+		}
+		start := strings.TrimSpace(p.StartCmd)
+		rest := ""
+		if i := strings.IndexAny(start, " \t"); i >= 0 {
+			rest = start[i:]
+		}
+		return strings.TrimSpace(p.CmdPath + rest)
+	}
 	if p.StartCmd != "" {
 		return p.StartCmd
 	}

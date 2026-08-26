@@ -173,8 +173,8 @@ func savePresetTx(tx *sql.Tx, sess *model.Session) error {
 				pidx = j
 			}
 			if _, err := tx.Exec(
-				`INSERT INTO pane(window_id, idx, cwd, cmd) VALUES(?,?,?,?)`,
-				wid, pidx, pn.Cwd, pn.Cmd,
+				`INSERT INTO pane(window_id, idx, cwd, cmd, cmd_path) VALUES(?,?,?,?,?)`,
+				wid, pidx, pn.Cwd, pn.Cmd, pn.CmdPath,
 			); err != nil {
 				return err
 			}

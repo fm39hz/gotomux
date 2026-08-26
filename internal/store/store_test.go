@@ -1,8 +1,12 @@
 package store
 
 import (
+	"database/sql"
+	"path/filepath"
+	"strconv"
 	"testing"
 
+	"github.com/fm39hz/gotomux/internal/config"
 	"github.com/fm39hz/gotomux/internal/model"
 )
 
@@ -139,5 +143,66 @@ func TestRebindNameMergesUsageAndPairs(t *testing.T) {
 	scoresOld, _ := st.PairScores("old-sess", 0)
 	if len(scoresOld) != 0 {
 		t.Fatalf("old pair scores should be empty: %+v", scoresOld)
+	}
+}
+
+// Regression for the 2026-08-26 freeze failure ("table pane has no column
+// named cmd_path"): migrate() short-circuits on user_version == schemaVersion,
+// so EVERY new statement in migrateAll requires a schemaVersion bump — a fresh
+// test DB always runs the full migration and can never catch a forgotten bump.
+// This stamps a legacy DB at the CURRENT version, reopens it, and demands the
+// latest column: if you added a statement without bumping schemaVersion, this
+// fails exactly like production did.
+func TestMigrateRunsOnCurrentVersionStamp(t *testing.T) {
+	dir := t.TempDir()
+	db, err := sql.Open("sqlite", filepath.Join(dir, "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Pre-cmd_path pane schema (window.cwd present — that ship sailed long ago).
+	if _, err := db.Exec(`
+CREATE TABLE session (
+  name       TEXT PRIMARY KEY,
+  cwd        TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  last_used  INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE window (
+  id      INTEGER PRIMARY KEY,
+  session TEXT NOT NULL REFERENCES session(name) ON DELETE CASCADE,
+  idx     INTEGER NOT NULL,
+  name    TEXT NOT NULL DEFAULT '',
+  cwd     TEXT NOT NULL DEFAULT '',
+  layout  TEXT,
+  UNIQUE(session, idx)
+);
+CREATE TABLE pane (
+  id        INTEGER PRIMARY KEY,
+  window_id INTEGER NOT NULL REFERENCES window(id) ON DELETE CASCADE,
+  idx       INTEGER NOT NULL,
+  cwd       TEXT,
+  cmd       TEXT,
+  UNIQUE(window_id, idx)
+);
+PRAGMA user_version = ` + strconv.Itoa(schemaVersion) + `;`); err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+
+	st, err := OpenWithConfig(&config.Config{DataDir: dir}) // must migrate, not skip
+	if err != nil {
+		t.Fatal(err)
+	}
+	var uv int
+	_ = st.db.QueryRow(`PRAGMA user_version`).Scan(&uv)
+	t.Logf("DEBUG user_version=%d", uv)
+	defer st.Close()
+
+	var n int
+	if err := st.db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('pane') WHERE name='cmd_path'`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n == 0 {
+		t.Fatal("pane.cmd_path missing after reopen: a migrateAll statement was added without bumping schemaVersion")
 	}
 }

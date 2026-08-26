@@ -244,7 +244,7 @@ func (s *Store) Ping() error {
 // The migration itself stays additive-only and idempotent — the fast path is an
 // optimisation, not a replacement, so a DB from a future version or one that
 // somehow lost user_version still gets the full run.
-const schemaVersion = 6
+const schemaVersion = 7
 
 func (s *Store) migrate() error {
 	var have int
@@ -293,6 +293,11 @@ CREATE TABLE IF NOT EXISTS pane (
 	_ = s.db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('window') WHERE name='cwd'`).Scan(&n)
 	if n == 0 {
 		_, _ = s.db.Exec(`ALTER TABLE window ADD COLUMN cwd TEXT NOT NULL DEFAULT ''`)
+	}
+	// soft-migrate older DBs missing pane.cmd_path
+	_ = s.db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('pane') WHERE name='cmd_path'`).Scan(&n)
+	if n == 0 {
+		_, _ = s.db.Exec(`ALTER TABLE pane ADD COLUMN cmd_path TEXT NOT NULL DEFAULT ''`)
 	}
 	if _, err = s.db.Exec(`
 CREATE TABLE IF NOT EXISTS usage (
