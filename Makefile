@@ -38,7 +38,13 @@ install-all: install ## install CLI + daemon + systemd unit
 	mkdir -p ~/.config/systemd/user
 	cp dist/gotomuxd.service ~/.config/systemd/user/gotomuxd.service
 	systemctl --user daemon-reload
-	systemctl --user enable --now gotomuxd 2>/dev/null || systemctl --user start gotomuxd
+	systemctl --user enable gotomuxd 2>/dev/null || true
+	# Restart, not just enable --now: a running unit ignores --now, so the new
+	# daemon binary would stay unused until the next reboot. The CLI and the
+	# daemon silently diverging across versions is how "freeze worked but the
+	# preset is stale" confusion happens (seen 2026-08-25: CLI rebuilt mid-day,
+	# old daemon process served freezes until evening).
+	systemctl --user restart gotomuxd
 
 clean: ## remove local binaries
 	rm -f $(BIN) $(DAEMON)
