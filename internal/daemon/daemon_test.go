@@ -593,7 +593,10 @@ func TestSyncNowDropsWhileInFlight(t *testing.T) {
 	d := newBare(t, nil)
 
 	release := make(chan struct{})
-	firstIn := make(chan struct{})
+	// Buffered: the holder goroutine may reach the hook before main reaches
+	// its receive — an unbuffered send-with-default drops the signal there and
+	// the test times out claiming the body was never reached (seen on CI).
+	firstIn := make(chan struct{}, 1)
 	armPanicHook(t, func() {
 		select {
 		case firstIn <- struct{}{}:
