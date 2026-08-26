@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -115,22 +116,74 @@ func readFileConfig(path string) *fileConfig {
 		}
 		return nil
 	}
-	var fc fileConfig
-	md, err := toml.Decode(string(b), &fc)
+
+	// First pass into Primitives: this fails only on broken syntax, which
+	// discards the whole file. Bad *values* are isolated per key below,
+	// because a plain toml.Decode into fileConfig unifies the file's keys in
+	// Go map order and aborts at the first bad entry — which settings
+	// survived a mistake would depend on dice.
+	var raw map[string]toml.Primitive
+	md, err := toml.Decode(string(b), &raw)
 	if err != nil {
-		// Decode fills everything that parsed before the error; normalize
-		// repairs whatever stayed zero.
-		fmt.Fprintf(os.Stderr, "gotomux: config: %s: %v (bad entries ignored)\n", path, err)
+		fmt.Fprintf(os.Stderr, "gotomux: config: %s: %v (file ignored)\n", path, err)
+		return &fileConfig{}
 	}
-	if undecoded := md.Undecoded(); len(undecoded) > 0 {
-		names := make([]string, 0, len(undecoded))
-		for _, k := range undecoded {
-			names = append(names, k.String())
+
+	fc := &fileConfig{}
+	for _, e := range []struct {
+		name string
+		set  func(toml.Primitive) error
+	}{
+		{"data_dir", func(p toml.Primitive) error { return decodePrim(md, p, &fc.DataDir) }},
+		{"config_dir", func(p toml.Primitive) error { return decodePrim(md, p, &fc.ConfigDir) }},
+		{"poll_interval", func(p toml.Primitive) error { return decodePrim(md, p, &fc.PollInterval) }},
+		{"zoxide_cap", func(p toml.Primitive) error { return decodePrim(md, p, &fc.ZoxideCap) }},
+		{"max_show", func(p toml.Primitive) error { return decodePrim(md, p, &fc.MaxShow) }},
+		{"git_concurrency", func(p toml.Primitive) error { return decodePrim(md, p, &fc.GitConcurrency) }},
+		{"proc_cache_ttl", func(p toml.Primitive) error { return decodePrim(md, p, &fc.ProcCacheTTL) }},
+		{"prune_cutoff", func(p toml.Primitive) error { return decodePrim(md, p, &fc.PruneCutoff) }},
+		{"icons", func(p toml.Primitive) error { return decodePrim(md, p, &fc.Icons) }},
+		{"daemon", func(p toml.Primitive) error {
+			fc.Daemon = new(daemonConfig)
+			return md.PrimitiveDecode(p, fc.Daemon)
+		}},
+	} {
+		p, ok := raw[e.name]
+		if !ok {
+			continue
 		}
+		delete(raw, e.name)
+		if err := e.set(p); err != nil {
+			fmt.Fprintf(os.Stderr, "gotomux: config: %s: %v (bad entries ignored)\n", path, err)
+		}
+	}
+
+	// Whatever is left in raw was never a known key; md.Undecoded() adds
+	// unknown sub-keys inside [daemon], surfaced by its PrimitiveDecode.
+	names := make([]string, 0, len(raw))
+	for name := range raw {
+		names = append(names, name)
+	}
+	for _, k := range md.Undecoded() {
+		names = append(names, k.String())
+	}
+	if len(names) > 0 {
+		slices.Sort(names)
 		fmt.Fprintf(os.Stderr, "gotomux: config: %s: unknown keys ignored: %s\n",
 			path, strings.Join(names, ", "))
 	}
-	return &fc
+	return fc
+}
+
+// decodePrim unifies one TOML entry into a freshly allocated *T so a bad
+// value can poison only its own key.
+func decodePrim[T any](md toml.MetaData, p toml.Primitive, dst **T) error {
+	v := new(T)
+	if err := md.PrimitiveDecode(p, v); err != nil {
+		return err
+	}
+	*dst = v
+	return nil
 }
 
 // apply copies one file override when its key is present.
