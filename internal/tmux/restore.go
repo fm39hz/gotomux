@@ -3,6 +3,7 @@ package tmux
 import (
 	"context"
 	"fmt"
+	"os"
 	"strconv"
 	"strings"
 
@@ -22,8 +23,12 @@ import (
 // exist — the pane dies instantly and the window silently disappears from
 // rebuilt sessions. Arguments from StartCmd are kept verbatim; without a
 // StartCmd, fall back to the detected bare Cmd.
+//
+// A frozen path can dangle (tool upgraded, version-manager shim rotated), so
+// it is honoured only while it still exists; a dangling path falls back to
+// StartCmd/Cmd — the pre-CmdPath behaviour — instead of failing the spawn.
 func paneCmd(p model.Pane) string {
-	if p.CmdPath != "" {
+	if p.CmdPath != "" && fileExists(p.CmdPath) {
 		if p.StartCmd == "" {
 			return p.CmdPath
 		}
@@ -38,6 +43,11 @@ func paneCmd(p model.Pane) string {
 		return p.StartCmd
 	}
 	return p.Cmd
+}
+
+func fileExists(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && !info.IsDir()
 }
 
 // windowBodyParts: post-creation sequence shared by Load and NewWindowAt —
