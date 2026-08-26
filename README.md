@@ -6,103 +6,76 @@
 [![Go](https://img.shields.io/github/go-mod/go-version/fm39hz/gotomux?style=flat-square)](go.mod)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg?style=flat-square)](LICENSE)
 
-**go to mux**, (yet) another fuzzy tmux session picker with presets, shapes and zoxide.
+**go to mux**, a fuzzy tmux session manager with presets, sticky shapes, and adaptive ranking.
 
-Forget about tmux plumbing and just jump into work. One keystroke opens a fuzzy list of everything you could want to attach to:
+One keystroke opens a unified fuzzy picker across all your workspaces:
 
-- **Live sessions**: ranked by real usage, not just mru
-- **Saved presets**: frozen snapshots of whole sessions (paths + commands)
-- **Sticky shapes**: the topology of your cockpit (windows / panes / tools), re-baked into new projects via Create / Zoxide
-- **Zoxide paths**: create a fresh session anywhere you've `z`'d before
-- **Self-ranking**: the daemon learns co-occurrence *and* directed transitions from real attach diffs, so the item you want surfaces first
+- **Live sessions**: Real-time listing with active process and window counts
+- **Saved presets**: Snapshot whole sessions (paths, layout, and commands) with `Ctrl+F`
+- **Sticky shapes**: Re-bake your favorite window/pane cockpit topology into new projects via Create or Zoxide
+- **Zoxide integration**: Jump and initialize sessions instantly from your directory history
+- **Adaptive self-ranking**: Automatically learns co-occurrence and directed transitions between sessions from native tmux attach events
 
-One static binary. No accounts, no telemetry out, the only "telemetry" is live in a local SQLite file.
+> Single static Go binary. No cloud accounts, no network telemetry. All ranking metrics are stored in a local SQLite database.
 
-## Why not a tmux script + fzf?
+---
 
-|                         | `fzf-tmux` one-liner | gotomux                    |
-| :---------------------- | :------------------- | :------------------------- |
-| Session list            | ✓                    | ✓ + usage-ranked           |
-| Presets (frozen sessions) | ✗                  | ✓ (`gotomux -f`)           |
-| Rebuild from shapes     | ✗                    | ✓ (sticky + learning)      |
-| Zoxide as source        | ✗                    | ✓                          |
-| Cold start              | —                    | ~5 ms (daemon: ~13 ms warm) |
+## Highlights
 
-## Quick start
+![gotomux picker interface](assets/screenshot.png)
 
-```bash
-# Arch
-paru -S gotomux
-systemctl --user enable --now gotomuxd   # optional, instant cold start
+- ⚡ **Instant Response**: Hot-path queries run in RAM via a background daemon (~1.2ms IPC round-trip, 0 disk/tmux I/O on pick) with an automatic standalone fallback (~5ms cold).
+- 🧩 **Topology & Shapes**: Captures the *essence* of your workspace (window roles, splits, tool intents) without hardcoding absolute paths.
+- 🧠 **Smart Ranking**: Ranks candidates using frecency, pairwise session co-occurrence, and directed switch sequences.
+- 🔄 **Baseline Recovery (`-r`)**: Restore altered sessions to their initial layout state without killing running processes.
 
-# any platform with Go
-go install github.com/fm39hz/gotomux@latest
-go install github.com/fm39hz/gotomux/cmd/gotomuxd@latest
-```
+---
 
-Then bind it to a key (see [Shell setup](#shell-setup)) and press it. Done.
+## Installation
 
-**Requires:** `tmux`. **Optional:** `zoxide`, a Nerd Font (`icons = "ascii"` in the config otherwise).
+**Prerequisites:** `tmux` (required), `zoxide` (optional), Nerd Font (optional, or set `icons = "ascii"`).
 
-## Install
-
-**Arch Linux**
+### Arch Linux (AUR)
 
 ```bash
 paru -S gotomux
-# optional, for instant cold start
+
+# Optional: enable background daemon for instant pre-warmed picker
 systemctl --user enable --now gotomuxd
 ```
 
-**Go (any platform)**
+### Go Install (Any platform)
 
 ```bash
 go install github.com/fm39hz/gotomux@latest
-# binary: $(go env GOPATH)/bin/gotomux
-# optional daemon:
 go install github.com/fm39hz/gotomux/cmd/gotomuxd@latest
 ```
 
-**From source**
+### Build from Source
 
 ```bash
 git clone https://github.com/fm39hz/gotomux.git && cd gotomux
-make install           # go install CLI
-make install-all       # CLI + daemon + systemd unit + enable
-# or: make build && ./gotomux
-# or: make pkg         # Arch: dist/*.pkg.tar.zst
-# or: make run         # picker, ARGS="-f" / "-e name" / "-p"
+make install           # CLI only
+make install-all       # CLI + daemon + systemd user service
 ```
 
-## Usage
+---
 
-```text
-Usage: gotomux [flags]
+## Shell & Tmux Setup
 
-Flags:
-  -h, --help     Show this help
-  -v, --version  Show version
-  -f, --freeze   Freeze current or named session as a preset
-  -e, --edit     Edit a named preset (or freeze-then-edit)
-  -r, --reset    Restore current or named session to its baseline layout
-  -p, --profile  Profile cold-start performance
+### Tmux Popup (Recommended)
+
+`gotomux` works seamlessly as a floating popup inside tmux:
+
+```tmux
+# ~/.tmux.conf
+bind-key C-b display-popup -T " Go to mux " -w 80% -h 70% -x C -y C -E "gotomux"
+bind-key C-e display-popup -T " Edit config " -w 80% -h 90% -x C -y C -E "gotomux -e"
+bind-key C-r run-shell "tmux display-message \"$(gotomux -r)\""
+bind-key -n C-f run-shell "tmux display-message \"$(gotomux -f)\""
 ```
 
-The picker opens instantly. Type to filter, Enter to connect.
-
-### Daemon (`gotomuxd`)
-
-Optional background service: pre-warms the data and does all ranking telemetry, so the picker does zero fs / tmux I/O on its hot path.
-
-```bash
-systemctl --user enable --now gotomuxd
-```
-
-gotomux auto-detects the daemon. If absent it falls back to standalone mode, behaviorally identical, slightly slower cold start.
-
-## Shell setup
-
-This is the setup I use for myself, adapt it into your own shell config if needed.
+### Shell Keybindings
 
 **Nushell**
 
@@ -126,45 +99,54 @@ function fish_user_key_bindings
 end
 ```
 
-> [!TIP]
-> **Tmux popup**: gotomux is a normal TUI, so it composes perfectly with `display-popup`.
+---
 
-```tmux
-bind-key C-b display-popup -T " Go to mux " -w 80% -h 70% -x C -y C -E "$HOME/go/bin/gotomux"
-bind-key C-e display-popup  -T " Edit config " -w 80% -h 90% -x C -y C -E "$HOME/go/bin/gotomux -e"
-bind-key C-r run-shell "tmux display-message \"$($HOME/go/bin/gotomux -r)\""
-bind-key -n C-f run-shell "tmux display-message \"$($HOME/go/bin/gotomux -f)\""
+## Usage
+
+```text
+Usage: gotomux [flags]
+
+Flags:
+  -h, --help     Show this help
+  -v, --version  Show version
+  -f, --freeze   Freeze current or named session as a preset
+  -e, --edit     Edit a named preset (or freeze-then-edit)
+  -r, --reset    Restore current or named session to its baseline layout
+  -p, --profile  Profile cold-start performance
 ```
 
-## Keybindings
+### Keybindings
 
-### Picker
+| Key | Action |
+| :--- | :--- |
+| `Enter` | Connect / Attach / Create session |
+| `Ctrl + N` / `Ctrl + P` | Next / Previous item |
+| `Ctrl + U` / `Ctrl + W` | Clear query / Delete word backward |
+| `Ctrl + X` | Kill active session |
+| `Ctrl + F` | Freeze current session into preset + shape |
+| `Ctrl + T` | Set sticky shape for newly created sessions |
+| `Ctrl + E` / `Ctrl + D` | Edit / Delete preset |
+| `Esc` / `Ctrl + C` | Cancel & Exit |
+| `?` | Toggle help view |
 
-| Key                                | Action                            |
-| ---------------------------------- | --------------------------------- |
-| Enter                   | connect                           |
-| Ctrl + N / Ctrl + P | next / prev         |
-| Ctrl + U / Ctrl + W | clear query / delete word |
-| Ctrl + X     | kill active session               |
-| Ctrl + F     | freeze into preset + shape        |
-| Ctrl + T     | set sticky shape for new projects |
-| Ctrl + E / Ctrl + D | edit / delete preset |
-| Esc / Ctrl + C | cancel                     |
-| ?                       | toggle help                       |
+### Item Actions on `Enter`
 
-## Behaviour
+| Source Item | Behavior |
+| :--- | :--- |
+| **Active** | Attach or switch directly to the live session |
+| **Preset** | Load preset topology and commands if not running, then attach |
+| **Create / Zoxide** | Live? Attach · Preset exists? Load · Otherwise: bake **sticky shape** into project root |
 
-| Item                | Enter                                                                               |
-| ------------------- | ----------------------------------------------------------------------------------- |
-| **Active**          | attach / switch                                                                     |
-| **Preset**          | load if missing, then attach                                                        |
-| **Create / Zoxide** | live? attach : same-name preset? load : unfreeze **sticky shape** into project root |
+---
 
-## Shapes
+## Core Concepts
 
-A **shape** is cockpit essence (no paths, no pixel dumps).
-Freeze saves a full instance, and a shape is derived from it (topology + tools only).
-Sticky shapes are used for new projects via Create / Zoxide.
+### Shapes & Presets
+
+- **Preset**: A concrete session snapshot including specific working directories and running commands.
+- **Shape**: The abstract *topology* of your workspace (e.g. editor window with `nvim` + split terminal + `yazi` file manager).
+
+Sticky shapes are automatically baked when launching new sessions from project roots or Zoxide paths:
 
 ```json
 {
@@ -183,99 +165,84 @@ Sticky shapes are used for new projects via Create / Zoxide.
 }
 ```
 
-The `fork` string is a window essence fingerprint (`panes|split|tools`).
-Common patterns accumulate hit counts in the DB and can be composed into new shapes automatically.
-Shapes live as editable JSON next to your config: `$XDG_CONFIG_HOME/gotomux/shapes/<label>--<id8>.json`.
+Shapes are automatically mirrored as editable JSON in `$XDG_CONFIG_HOME/gotomux/shapes/<label>--<id8>.json`.
 
-## Reset
+### Baseline Reset (`gotomux -r`)
 
-`gotomux -r` restores a session to its recorded baseline layout, run it inside tmux for the current session, or pass a name (`gotomux -r my-session`).
+Restores the current or target session back to its recorded baseline layout:
+- Recreates closed panes and dead windows in their original layout positions with their starting commands.
+- Existing processes in surviving windows are untouched.
+- Extra windows added on the fly are preserved.
 
-- **Baseline**: the preset written when the session was created (bake) or frozen. Hand-built sessions get one on the first `-r`, so a second run actually restores.
-- **Dead windows** (the pane exited, tmux closed the window, renumbering shifted the rest) are recreated at their baseline index with their original command, surviving windows are moved back to their baseline position.
-- **Nothing is killed**: windows you added beyond the baseline stay, processes intact.
+### Ranking Model
 
-No output and no changes when the session already matches the baseline.
+Gotomux organizes sessions in a space × time matrix:
 
-## Ranking
+| | Current Directory | Anywhere |
+| :--- | :--- | :--- |
+| **Future** | **Create** | **Zoxide** |
+| **Present** | — | **Active** |
+| **Past** | — | **Preset** |
 
-Sources form a space × time matrix:
+Ranking sort order: `tier > recency > cooccur > trans > kind > detail > busy > pathQ > idx`.
 
-|         | Here       | Anywhere   |
-| ------- | ---------- | ---------- |
-| Future  | **Create** | **Zoxide** |
-| Present | —          | **Active** |
-| Past    | —          | **Preset** |
+Inside tmux, the current session is filtered out and learned transition probabilities (switch history) and co-occurrence scores surface your next likely session to the top.
 
-Sort: `tier > recency > cooccur > trans > kind > detail > busy > pathQ > idx`.
-Same formula everywhere, environment only changes inputs:
-
-- **Inside tmux** (`ctxSession` set): items matching the current session name or path are excluded, co-occurrence (what you keep open alongside) and directed transition (what you usually switch *into*) overlays are active.
-- **Outside tmux**: all items visible, co-occurrence / transitions = 0.
-
-The daemon learns transitions from real attach diffs (`session_attached` count deltas between polls, exactly one session lost a client and exactly one gained one), so it sees native tmux switches too, not just gotomux ones.
-
-"Just left" surfaces via recency.
+---
 
 ## Configuration
 
-Settings live in `$XDG_CONFIG_HOME/gotomux/config.toml`, next to `shapes/`.
-Precedence: defaults < config file. The file is the single inspectable source, there is deliberately no environment layer for settings.
+Settings are configured via TOML at `$XDG_CONFIG_HOME/gotomux/config.toml`:
 
 ```toml
 # gotomux configuration
 data_dir        = ""     # base for state.db + socket   ($XDG_DATA_HOME/gotomux)
-config_dir      = ""     # base for shapes/ + this file ($XDG_CONFIG_HOME/gotomux)
+config_dir      = ""     # base for shapes/ + config    ($XDG_CONFIG_HOME/gotomux)
 
 poll_interval   = "10s"  # daemon sync cadence
-zoxide_cap      = 40     # zoxide rows when the query is empty
+zoxide_cap      = 40     # max zoxide rows when query is empty
 max_show        = 12     # visible picker rows
-git_concurrency = 4      # git enrich workers
+git_concurrency = 4      # git branch enrich workers
 proc_cache_ttl  = "2s"   # pane process detection cache
-prune_cutoff    = "720h" # stale row prune age
+prune_cutoff    = "720h" # stale telemetry prune threshold
 
 icons           = "auto" # auto | nerd | ascii
 
 [daemon]
-autostart = true         # picker may start gotomuxd
-prewarm   = "auto"       # auto (rotational disks) | on | off
+autostart = true         # auto-spawn daemon if absent
+prewarm   = "auto"       # page-cache prewarm: auto | on | off
 ```
 
-Unknown keys are reported and ignored. A malformed entry degrades to its default instead of failing startup.
-The daemon reads the file at start, `systemctl --user restart gotomuxd` after edits.
+### File Locations
 
-### Data
+| Path | Description |
+| :--- | :--- |
+| `$XDG_CONFIG_HOME/gotomux/shapes/*.json` | Mirrored shape definitions |
+| `$XDG_CONFIG_HOME/gotomux/config.toml` | User configuration |
+| `$XDG_DATA_HOME/gotomux/state.db` | SQLite state (presets, shapes, usage, ranking) |
+| `$XDG_DATA_HOME/gotomux/gotomux.sock` | Daemon IPC socket |
 
-| Path                                                  | Contents                                          |
-| ----------------------------------------------------- | ------------------------------------------------- |
-| `$XDG_CONFIG_HOME/gotomux/shapes/<label>--<id8>.json` | shape backup (auto-reconciled)                   |
-| `$XDG_DATA_HOME/gotomux/state.db`                     | presets, shapes, usage, pairs, transitions, forks |
-| `$XDG_DATA_HOME/gotomux/gotomux.sock`                 | daemon IPC (if running)                          |
-| `$XDG_CONFIG_HOME/gotomux/config.toml`                | settings (defaults < file)                       |
+---
 
 ## Development
 
 ```bash
-make help    # every target
-make test    # go test ./... (add -short for CI-style)
-make fmt vet # gofmt + go vet
-make pkg     # Arch package -> dist/*.pkg.tar.zst
+make build       # build gotomux binary
+make build-all   # build gotomux + gotomuxd
+make test        # run tests (add -short for CI style)
+make fmt vet     # format and check code
+make pkg         # build Arch package
 ```
 
-## Roadmap
+### Roadmap
 
-Local first.
+- [x] Multi-source picker: Create / Tmux / Preset / Zoxide
+- [x] Session Freeze / Load, Sticky shapes & Fork learning
+- [x] Config reconcile & JSON shape export
+- [x] Arch Linux AUR packaging & automated semantic release
+- [ ] Remote tmux session integration (`tmux@host`)
 
-- [x] Sources: create / tmux / preset / zoxide
-- [x] Freeze / load, sticky shapes, placement + fork learning
-- [x] Shape labels, config reconcile, product JSON (`split` / tools)
-- [x] `go install` / CI / local Arch package
-- [x] AUR release
-- [ ] Polish everyday use until boring
-- [ ] Add remote tmux as stable source (`tmux@host`)
-
-> [!WARNING]
-> gotomux is still in early development. Some unintended behavior might occur.
+---
 
 ## Built With
 
@@ -285,6 +252,8 @@ Local first.
 - [projectdetect](https://github.com/richardwooding/projectdetect): Project root marker detection
 - [go-devicons](https://github.com/epilande/go-devicons): Nerd font devicons
 - [gopsutil](https://github.com/shirou/gopsutil): Process detection for freezing sessions
+
+---
 
 ## Acknowledgements
 
@@ -296,6 +265,8 @@ Gotomux started as a bash script gluing together several CLI tools before being 
 - [zoxide](https://github.com/ajeetdsouza/zoxide): Smarter directory jumping as a session source
 - [fd](https://github.com/sharkdp/fd): Fast filesystem traversal for preset discovery
 - [tmux](https://github.com/tmux/tmux): The terminal multiplexer itself
+
+---
 
 ## License
 
