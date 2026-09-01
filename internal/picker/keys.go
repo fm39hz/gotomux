@@ -11,10 +11,9 @@ type uiKeyMap struct {
 	Quit    key.Binding
 	Help    key.Binding
 	Sticky  key.Binding
-	Kill    key.Binding
 	Freeze  key.Binding
 	Edit    key.Binding
-	Delete  key.Binding
+	Unmake  key.Binding
 }
 
 var defaultKeyMap = uiKeyMap{
@@ -42,10 +41,6 @@ var defaultKeyMap = uiKeyMap{
 		key.WithKeys("ctrl+t"),
 		key.WithHelp("^t", "sticky template"),
 	),
-	Kill: key.NewBinding(
-		key.WithKeys("ctrl+x"),
-		key.WithHelp("^x", "kill session"),
-	),
 	Freeze: key.NewBinding(
 		key.WithKeys("ctrl+f"),
 		key.WithHelp("^f", "freeze"),
@@ -54,20 +49,47 @@ var defaultKeyMap = uiKeyMap{
 		key.WithKeys("ctrl+e"),
 		key.WithHelp("^e", "edit preset"),
 	),
-	Delete: key.NewBinding(
+	Unmake: key.NewBinding(
 		key.WithKeys("ctrl+d"),
-		key.WithHelp("^d", "delete preset"),
+		key.WithHelp("^d", "remove"),
 	),
 }
 
-func (k uiKeyMap) ShortHelp() []key.Binding {
-	return []key.Binding{k.Up, k.Down, k.Confirm, k.Quit, k.Help}
+func (k uiKeyMap) ShortHelp(it Item) []key.Binding {
+	b := []key.Binding{k.Up, k.Down, k.Confirm, k.Quit, k.Help}
+	if u, ok := unmakeBinding(it); ok {
+		b = append(b, u)
+	}
+	return b
 }
 
 func (k uiKeyMap) FullHelp() [][]key.Binding {
 	return [][]key.Binding{
 		{k.Up, k.Down, k.Confirm, k.Quit},
-		{k.Sticky, k.Kill, k.Freeze, k.Edit, k.Delete},
+		{k.Sticky, k.Freeze, k.Edit, k.Unmake},
+	}
+}
+
+// unmakeBinding names ^d for the row under the cursor. The key is one; the row's
+// existence level picks the verb, because the two operations were already
+// disjoint — an Active row shadows its own Preset row in the list, so no row
+// ever accepted both "kill" and "delete". Create and Zoxide rows have nothing
+// materialized, so ^d is left out of the help line instead of being advertised
+// with a verb it will not perform.
+func unmakeBinding(it Item) (key.Binding, bool) {
+	switch it.Kind {
+	case KindActive:
+		return key.NewBinding(
+			key.WithKeys("ctrl+d"),
+			key.WithHelp("^d", "kill "+truncateRunes(it.Name, 24)),
+		), true
+	case KindPreset:
+		return key.NewBinding(
+			key.WithKeys("ctrl+d"),
+			key.WithHelp("^d", "del "+truncateRunes(it.Name, 24)),
+		), true
+	default:
+		return key.Binding{}, false
 	}
 }
 

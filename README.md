@@ -122,10 +122,10 @@ Flags:
 | `Enter` | Connect / Attach / Create session |
 | `Ctrl + N` / `Ctrl + P` | Next / Previous item |
 | `Ctrl + U` / `Ctrl + W` | Clear query / Delete word backward |
-| `Ctrl + X` | Kill active session |
 | `Ctrl + F` | Freeze current session into preset + shape |
 | `Ctrl + T` | Set sticky shape for newly created sessions |
-| `Ctrl + E` / `Ctrl + D` | Edit / Delete preset |
+| `Ctrl + E` | Edit preset |
+| `Ctrl + D` | Kill an active session / delete a preset |
 | `Esc` / `Ctrl + C` | Cancel & Exit |
 | `?` | Toggle help view |
 

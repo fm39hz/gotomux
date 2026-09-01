@@ -575,24 +575,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m, nil
 
-		case key.Matches(msg, defaultKeyMap.Kill):
-			if len(m.ui.items) > 0 {
-				it := m.ui.items[m.ui.cursor]
-				if it.Kind == KindActive {
-					if err := m.ctl.Kill(context.Background(), it.Name); err != nil {
-						m.ui.status = err.Error()
-					} else {
-						if st := m.ensureStore(); st != nil {
-							_ = st.RecordKill(it.Name)
-						}
-						m.ui.status = "killed " + it.Name
-						m.cache.invalidate()
-						m.reload()
-					}
-				}
-			}
-			return m, nil
-
 		case key.Matches(msg, defaultKeyMap.Freeze):
 			if len(m.ui.items) > 0 {
 				it := m.ui.items[m.ui.cursor]
@@ -652,19 +634,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m, nil
 
-		case key.Matches(msg, defaultKeyMap.Delete):
-			if len(m.ui.items) > 0 {
-				it := m.ui.items[m.ui.cursor]
-				if it.Kind == KindPreset {
-					if err := m.ensureStore().Delete(it.Name); err != nil {
-						m.ui.status = err.Error()
-					} else {
-						m.ui.status = "deleted " + it.Name
-						m.cache.invalidate()
-						m.reload()
-					}
-				}
-			}
+		case key.Matches(msg, defaultKeyMap.Unmake):
+			m.unmake()
 			return m, nil
 		}
 
@@ -719,6 +690,55 @@ func (m *model) reload() {
 			m.ui.syncViewport()
 		}
 	}
+}
+
+// unmake steps the row under the cursor down one level of existence.
+//
+// One key covers both former bindings because they were never both applicable:
+// an Active session shadows its own Preset row in the list, so "kill" only ever
+// reached Active rows and "delete" only ever reached Preset rows — each was a
+// silent no-op on the other's. The row's existence level therefore already chose
+// the operation; the second chord only made the cursor's Kind invisible.
+//
+// Killing leaves the preset in place (RecordKill touches telemetry only), which
+// is what makes the step down land on Preset rather than on nothing. Tearing a
+// project down completely is now two presses with the surviving row visible
+// between them, instead of one press that destroys both layers.
+func (m *model) unmake() {
+	if len(m.ui.items) == 0 {
+		return
+	}
+	it := m.ui.items[m.ui.cursor]
+	switch it.Kind {
+	case KindActive:
+		if err := m.ctl.Kill(context.Background(), it.Name); err != nil {
+			m.ui.status = err.Error()
+			return
+		}
+		if st := m.ensureStore(); st != nil {
+			_ = st.RecordKill(it.Name)
+		}
+		m.ui.status = "killed " + it.Name
+	case KindPreset:
+		st := m.ensureStore()
+		if st == nil {
+			m.ui.status = "delete: store unavailable"
+			return
+		}
+		if err := st.Delete(it.Name); err != nil {
+			m.ui.status = err.Error()
+			return
+		}
+		m.ui.status = "deleted " + it.Name
+	default:
+		// Create and Zoxide rows name a directory, not a stored object: there is
+		// nothing gotomux owns here to remove, and silence would read as a dropped
+		// keypress now that the same chord destroys the other two kinds.
+		m.ui.status = "nothing to remove"
+		return
+	}
+	m.cache.invalidate()
+	m.reload()
 }
 
 type editDoneMsg struct {
@@ -805,7 +825,11 @@ func (m model) View() tea.View {
 
 	meta := fmt.Sprintf("  [%d/%d]", len(m.ui.items), m.totalCount())
 	if m.ui.helpOpen {
-		meta += "  " + m.ui.helpModel.ShortHelpView(defaultKeyMap.ShortHelp())
+		var cur Item
+		if len(m.ui.items) > 0 {
+			cur = m.ui.items[m.ui.cursor]
+		}
+		meta += "  " + m.ui.helpModel.ShortHelpView(defaultKeyMap.ShortHelp(cur))
 	} else if m.tmpl != "" && m.tmpl != "default" {
 		meta += " " + m.formatStickyMeta(m.tmpl) + " ?"
 	} else {

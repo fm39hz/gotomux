@@ -32,6 +32,11 @@ type countingStore struct {
 	transitionScores int
 	loadZox          int
 	stickyID         int
+
+	// The ^d side effects. Deliberately outside calls(): that helper means
+	// "construction-path I/O", which TestNoHotPathIO pins at zero.
+	deletedPreset []string
+	killLogged    []string
 }
 
 func (s *countingStore) ListMeta() ([]store.PresetMeta, error) {
@@ -83,6 +88,23 @@ func (s *countingStore) StickyID() string {
 	return ""
 }
 
+func (s *countingStore) Delete(name string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.deletedPreset = append(s.deletedPreset, name)
+	return nil
+}
+
+// RecordKill is telemetry only — the preset row survives a kill. That is what
+// makes ^d on an Active row a step down to Preset rather than a step to nothing,
+// so the double must not touch `presets` here.
+func (s *countingStore) RecordKill(name string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.killLogged = append(s.killLogged, name)
+	return nil
+}
+
 func (s *countingStore) calls() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -103,6 +125,8 @@ type countingConnector struct {
 	currentSession int
 	currentPath    int
 	currentCtx     int
+
+	killed []string
 }
 
 func (c *countingConnector) ListLive(ctx context.Context) ([]tmux.LiveSession, error) {
@@ -131,6 +155,24 @@ func (c *countingConnector) CurrentContext(ctx context.Context) (string, string)
 	defer c.mu.Unlock()
 	c.currentCtx++
 	return c.session, c.path
+}
+
+func (c *countingConnector) Kill(ctx context.Context, name string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.killed = append(c.killed, name)
+	return nil
+}
+
+func (c *countingConnector) Has(ctx context.Context, name string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, s := range c.live {
+		if s.Name == name {
+			return true
+		}
+	}
+	return false
 }
 
 func (c *countingConnector) calls() int {
