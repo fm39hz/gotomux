@@ -24,7 +24,7 @@ sha256sums=()
 
 pkgver() {
   local desc
-  desc=$(git describe --tags --long --match 'v*' 2>/dev/null || true)
+  desc=$(git describe --tags --long --dirty --match 'v*' 2>/dev/null || true)
   if [[ -n $desc ]]; then
     echo "$desc" | sed -E 's/^v//; s/-([0-9]+)-g/.r\1.g/; s/-/./g'
   else
@@ -34,8 +34,15 @@ pkgver() {
 
 prepare() {
   mkdir -p "${srcdir}/${pkgname}"
-  git archive --format=tar HEAD | tar -x -C "${srcdir}/${pkgname}"
-  git diff HEAD -- . ':!gotomux' ':!dist' ':!src' ':!pkg' |
+  # makepkg runs the build functions from $srcdir, not $startdir, and `git
+  # archive`/`git diff` take the current directory as an implicit pathspec.
+  # From $srcdir — which is itself git-ignored — `git archive HEAD` therefore
+  # emits a 10 KB empty archive and `git diff HEAD -- .` an empty patch, so
+  # prepare() "succeeds" with nothing extracted and build() dies on
+  # "no Go files", while any uncommitted work silently vanishes from the
+  # package. Anchor git to the repo root explicitly.
+  git -C "$startdir" archive --format=tar HEAD | tar -x -C "${srcdir}/${pkgname}"
+  git -C "$startdir" diff HEAD -- . ':!gotomux' ':!dist' ':!src' ':!pkg' |
     patch -d "${srcdir}/${pkgname}" -p1 --forward --batch >/dev/null 2>&1 || true
 }
 

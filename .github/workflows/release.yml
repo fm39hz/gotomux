@@ -43,19 +43,107 @@ jobs:
         env:
           TAG_BEFORE: ${{ env.TAG_BEFORE }}
         run: |
-          TAG_AFTER="$(git tag --list 'v*' --sort=-v:refname | head -1)"
+          set -euo pipefail
+          # `|| true`: head exits as soon as it has a line, which can leave
+          # git tag on SIGPIPE and pipefail would turn that into a step failure.
+          TAG_AFTER="$(git tag --list 'v*' --sort=-v:refname | head -1 || true)"
           if [ "$TAG_BEFORE" = "$TAG_AFTER" ]; then
             echo "released=false" >> "$GITHUB_OUTPUT"
-            echo "no new release; skipping AUR"
+            echo "no new release"
+          else
+            echo "released=true" >> "$GITHUB_OUTPUT"
+            echo "version=${TAG_AFTER#v}" >> "$GITHUB_OUTPUT"
+            echo "new release: ${TAG_AFTER}"
+          fi
+
+      # pkgver and pkgrel are orthogonal: pkgver is which code, pkgrel is
+      # which recipe. vercmp reports "0.4.5" == "0.4.5-1", so a fix confined
+      # to the packaging layer is invisible to pacman unless pkgrel moves.
+      # Under the 0.x rules feat/fix/perf always release, so arriving here
+      # with no new tag means only chore/docs/ci landed — exactly the case
+      # where a recipe fix would otherwise never reach anyone.
+      #
+      # Only files that live *in the AUR repository* can ride a pkgrel bump:
+      # PKGBUILD.aur itself and the install hook shipped as an asset. The
+      # service unit and the manpage come from the immutable v$pkgver source
+      # tarball, so bumping pkgrel for them would announce a fix that the
+      # rebuilt package still does not contain. Those need a tag.
+      #
+      # The repo copy of PKGBUILD.aur is a template CI rewrites and never
+      # commits back, so the live pkgrel exists only on AUR: read it from the
+      # public RPC rather than assuming 1.
+      - name: Resolve AUR version
+        id: aur
+        env:
+          RELEASED: ${{ steps.newrelease.outputs.released }}
+          NEW_VERSION: ${{ steps.newrelease.outputs.version }}
+          PUSH_BEFORE: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+
+          if [ "$RELEASED" = true ]; then
+            printf 'pkgver=%s\npkgrel=1\npush=true\ncommit=Release v%s\n' \
+              "$NEW_VERSION" "$NEW_VERSION" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          echo "released=true" >> "$GITHUB_OUTPUT"
-          echo "version=${TAG_AFTER#v}" >> "$GITHUB_OUTPUT"
-          sed -i "s/^pkgver=.*/pkgver=${TAG_AFTER#v}/" PKGBUILD.aur
-          grep ^pkgver PKGBUILD.aur
+
+          BASE="$PUSH_BEFORE"
+          case "$BASE" in
+            ''|0000000000000000000000000000000000000000)
+              # --verify --quiet: plain rev-parse echoes an unresolvable
+              # revision to stdout and still exits 1, so a bare `|| true`
+              # leaves BASE non-empty garbage that git diff then fails on —
+              # and the empty TOUCHED reads as "packaging untouched".
+              BASE="$(git rev-parse --verify --quiet "$GITHUB_SHA^" || true)" ;;
+          esac
+          if [ -z "$BASE" ] || ! git rev-parse --verify --quiet "${BASE}^{commit}" >/dev/null; then
+            # A force-push can name a base the checkout no longer holds.
+            # Diffing against garbage silently under-reports, so say so.
+            echo "::warning::no usable base revision; skipping pkgrel bump"
+            exit 0
+          fi
+          # grep without -q: it must drain the pipe, or pipefail turns the
+          # reader's exit-141 into a false "packaging surface untouched".
+          TOUCHED="$(git diff --name-only "$BASE" "$GITHUB_SHA" \
+                     | grep -E '^(PKGBUILD\.aur|dist/gotomux\.install)$' || true)"
+          if [ -z "$TOUCHED" ]; then
+            echo "packaging surface untouched; skipping AUR"
+            exit 0
+          fi
+          echo "packaging-only change in:"
+          printf '  %s\n' $TOUCHED
+
+          SERVED="$(curl -fsS --max-time 20 -G https://aur.archlinux.org/rpc \
+                     --data-urlencode v=5 --data-urlencode type=info \
+                     --data-urlencode 'arg[]=gotomux' \
+                   | jq -r '.results[0].Version // empty' || true)"
+          if [ -z "$SERVED" ]; then
+            # Falling back to pkgrel=1 here would push a version-identical
+            # package that pacman quietly declines to install. Fail loudly.
+            echo "::error::could not read the served version for gotomux from the AUR RPC"
+            exit 1
+          fi
+          PKGVER="${SERVED%-*}"
+          PKGREL="${SERVED##*-}"
+          case "$PKGREL" in
+            ''|*[!0-9]*)
+              echo "::error::unexpected AUR version '$SERVED' (want pkgver-pkgrel)"
+              exit 1 ;;
+          esac
+          echo "AUR serves $SERVED -> bumping to $PKGVER-$((PKGREL + 1))"
+          printf 'pkgver=%s\npkgrel=%s\npush=true\ncommit=Bump pkgrel to %s\n' \
+            "$PKGVER" "$((PKGREL + 1))" "$((PKGREL + 1))" >> "$GITHUB_OUTPUT"
+
+      - name: Apply AUR version
+        if: steps.aur.outputs.push == 'true'
+        run: |
+          set -euo pipefail
+          sed -i "s/^pkgver=.*/pkgver=${{ steps.aur.outputs.pkgver }}/" PKGBUILD.aur
+          sed -i "s/^pkgrel=.*/pkgrel=${{ steps.aur.outputs.pkgrel }}/" PKGBUILD.aur
+          grep -E '^(pkgver|pkgrel)=' PKGBUILD.aur
 
       - name: Push to AUR
-        if: github.repository == 'fm39hz/gotomux' && steps.newrelease.outputs.released == 'true'
+        if: github.repository == 'fm39hz/gotomux' && steps.aur.outputs.push == 'true'
         uses: KSXGitHub/github-actions-deploy-aur@v4.2.0
         with:
           pkgname: gotomux
@@ -69,3 +157,4 @@ jobs:
           commit_username: ${{ secrets.AUR_USERNAME }}
           commit_email: ${{ secrets.AUR_EMAIL }}
           ssh_private_key: ${{ secrets.AUR_SSH_KEY }}
+          commit_message: ${{ steps.aur.outputs.commit }}

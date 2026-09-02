@@ -1,6 +1,13 @@
 BIN     := gotomux
 DAEMON  := gotomuxd
-LDFLAGS := -s -w
+# A dev binary must not print a bare tag: "0.4.5" built three commits past
+# v0.4.5 is indistinguishable from the real release, and the commit is the
+# first thing you need when a bug gets reported. Same derivation as pkgver()
+# in PKGBUILD, so build / install / run / makepkg all agree. --dirty stops an
+# uncommitted tree from claiming to be exactly its tag commit; no git or no
+# tag yet leaves the compiled-in "dev" fallback in place.
+VERSION := $(shell git describe --tags --long --dirty --match 'v*' 2>/dev/null | sed -E 's/^v//; s/-([0-9]+)-g/.r\1.g/; s/-/./g')
+LDFLAGS := -s -w $(if $(VERSION),-X main.version=$(VERSION))
 REMOTE  := origin
 BRANCH  := master
 
@@ -16,7 +23,7 @@ build-all: build ## build both CLI and daemon
 	go build -ldflags='$(LDFLAGS)' -o $(DAEMON) ./cmd/gotomuxd/
 
 run: ## run picker (ARGS='-h')
-	go run . $(ARGS)
+	go run -ldflags='$(LDFLAGS)' . $(ARGS)
 
 test: ## unit + integration tests
 	go test ./...
