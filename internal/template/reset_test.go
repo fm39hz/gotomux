@@ -136,3 +136,93 @@ func TestPlanResetAdoptsNothingOnEmptyBaseline(t *testing.T) {
 		t.Fatalf("empty baseline must plan nothing, got %+v", p)
 	}
 }
+
+func TestPlanResetRepairsModifiedKhoCongWindow(t *testing.T) {
+	root := "/work/kho-cong"
+	base := sess(
+		model.Window{Idx: 1, Name: "editor", Panes: []model.Pane{{Cmd: "nvim"}}},
+		model.Window{Idx: 2, Name: "command", Layout: "tiled", Panes: []model.Pane{
+			{Cwd: root + "/cong-dlqg"},
+			{Cwd: root + "/kho-dl-mo"},
+			{Cwd: root},
+			{Cwd: root, Cmd: "make"},
+		}},
+		model.Window{Idx: 3, Name: "files", Panes: []model.Pane{{Cmd: "yazi"}}},
+		model.Window{Idx: 4, Name: "agent", Panes: []model.Pane{{Cmd: "omp"}}},
+	)
+	live := sess(
+		model.Window{Idx: 1, Name: "editor", Panes: []model.Pane{{Cmd: "nvim"}}},
+		model.Window{Idx: 2, Name: "command", Layout: "even-horizontal", Panes: []model.Pane{
+			{Cwd: root + "/cong-dlqg"},
+			{Cwd: root + "/kho-dl-mo"},
+			{Cwd: root},
+		}},
+		model.Window{Idx: 3, Name: "files", Panes: []model.Pane{{Cmd: "yazi"}}},
+		model.Window{Idx: 4, Name: "agent", Panes: []model.Pane{{Cmd: "omp"}}},
+	)
+
+	p := planReset(base, live, 2)
+	if len(p.creates) != 0 {
+		t.Fatalf("modified live window must be repaired, not recreated: %+v", p.creates)
+	}
+	if len(p.repairs) != 1 {
+		t.Fatalf("repairs = %+v, want one command-window repair", p.repairs)
+	}
+	r := p.repairs[0]
+	if r.idx != 2 || len(r.missing) != 1 || r.missing[0].Cmd != "make" {
+		t.Fatalf("repair = %+v, want missing make pane at window 2", r)
+	}
+	if r.layout != "tiled" {
+		t.Fatalf("repair layout = %q, want tiled", r.layout)
+	}
+}
+
+func TestExactMatchChecksFullWindowTopology(t *testing.T) {
+	base := sess(
+		model.Window{Idx: 1, Name: "command", Layout: "tiled", Panes: []model.Pane{{}, {}, {}, {Cmd: "make"}}},
+	)
+	live := sess(
+		model.Window{Idx: 1, Name: "command", Layout: "tiled", Panes: []model.Pane{{}, {}, {}}},
+	)
+	if exactMatch(base, live) {
+		t.Fatal("window with a missing pane must not be treated as an exact match")
+	}
+}
+
+func TestPlanResetMatchesRenamedWindowFromTopology(t *testing.T) {
+	base := sess(
+		model.Window{Idx: 1, Name: "command", Layout: "tiled", Panes: []model.Pane{
+			{Cwd: "/work/a"}, {Cwd: "/work/b"}, {Cmd: "make", Cwd: "/work"},
+		}},
+	)
+	live := sess(
+		model.Window{Idx: 1, Name: "wrong-name", Layout: "tiled", Panes: []model.Pane{
+			{Cwd: "/work/a"}, {Cwd: "/work/b"}, {Cmd: "make", Cwd: "/work"},
+		}},
+	)
+	p := planReset(base, live, 1)
+	if len(p.creates) != 0 || len(p.repairs) != 1 {
+		t.Fatalf("renamed window should match by topology and repair name: %+v", p)
+	}
+	if !p.repairs[0].rename || p.repairs[0].name != "command" {
+		t.Fatalf("repair = %+v, want rename to command", p.repairs[0])
+	}
+}
+
+func TestPlanResetDoesNotMatchByNameAlone(t *testing.T) {
+	base := sess(model.Window{Idx: 1, Name: "command", Panes: []model.Pane{{Cmd: "nvim", Cwd: "/work"}}})
+	live := sess(model.Window{Idx: 1, Name: "command", Panes: []model.Pane{{Cmd: "yazi", Cwd: "/other"}}})
+	p := planReset(base, live, 1)
+	if len(p.creates) != 1 || len(p.repairs) != 0 {
+		t.Fatalf("same name alone must not identify a window: %+v", p)
+	}
+}
+
+func TestPlanResetDoesNotUseNameForDifferentShellTopology(t *testing.T) {
+	base := sess(model.Window{Idx: 1, Name: "command", Layout: "tiled", Panes: []model.Pane{{}, {}, {}}})
+	live := sess(model.Window{Idx: 1, Name: "command", Layout: "even-horizontal", Panes: []model.Pane{{}, {}, {}}})
+	p := planReset(base, live, 1)
+	if len(p.creates) != 1 || len(p.repairs) != 0 {
+		t.Fatalf("same name/count without topology evidence must not match: %+v", p)
+	}
+}

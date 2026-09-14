@@ -93,6 +93,35 @@ func (c *Ctl) NewWindowAt(ctx context.Context, session string, idx int, w model.
 	return c.runChain(ctx, parts...)
 }
 
+// AddPane repairs a surviving window without disturbing its existing panes.
+// Extra panes are deliberately never removed by reconciliation.
+func (c *Ctl) AddPane(ctx context.Context, session string, idx int, p model.Pane) error {
+	t := windowTarget(session, idx)
+	args := []string{"split-window", "-t", t, "-h"}
+	if p.Cwd != "" {
+		args = append(args, "-c", p.Cwd)
+	}
+	if cmd := paneCmd(p); cmd != "" {
+		args = append(args, cmdArgs(cmd)...)
+	}
+	return tmuxRun(ctx, args...)
+}
+
+func (c *Ctl) RenameWindow(ctx context.Context, session string, idx int, name string) error {
+	name = safeWindowName(name, session)
+	if name == "" {
+		return nil
+	}
+	return tmuxRun(ctx, "rename-window", "-t", windowTarget(session, idx), name)
+}
+
+func (c *Ctl) ApplyLayout(ctx context.Context, session string, idx int, layout string) error {
+	if layout == "" {
+		return nil
+	}
+	return tmuxRun(ctx, "select-layout", "-t", windowTarget(session, idx), layout)
+}
+
 // ActiveWindow reports the current window index of a session, so a restore
 // can leave the user exactly where they were working. Read via the
 // window_active flag (not display-message -t session): current window is

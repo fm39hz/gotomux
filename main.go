@@ -42,7 +42,7 @@ Flags:
   -v, --version  Show version
   -f, --freeze   Freeze current or named session as a preset
   -e, --edit     Edit a named preset (or freeze-then-edit)
-  -r, --reset    Restore current or named session to its baseline layout
+  -r, --reconcile Reconcile current or named session to its baseline layout
   -p, --profile  Profile cold-start performance`)
 }
 
@@ -68,12 +68,12 @@ func main() {
 				os.Exit(1)
 			}
 			return
-		case "-r", "--reset":
+		case "-r", "--reconcile":
 			name := ""
 			if len(os.Args) > 2 && !strings.HasPrefix(os.Args[2], "-") {
 				name = os.Args[2]
 			}
-			if err := resetCLI(cfg, name); err != nil && !errors.Is(err, errCancel) {
+			if err := reconcileCLI(cfg, name); err != nil && !errors.Is(err, errCancel) {
 				fmt.Fprintln(os.Stderr, err)
 				os.Exit(1)
 			}
@@ -594,9 +594,10 @@ func freezeCLI(cfg *config.Config, name string) error {
 	return nil
 }
 
-// resetCLI restores a session to its recorded baseline layout. Deliberately
-// standalone: a restore is a rare, interactive action, not a hot path.
-func resetCLI(cfg *config.Config, name string) error {
+// reconcileCLI brings a session toward its recorded baseline layout.
+// Deliberately standalone: reconciliation is a rare, interactive action, not
+// a hot path.
+func reconcileCLI(cfg *config.Config, name string) error {
 	ctl, err := tmux.New()
 	if err != nil {
 		return fmt.Errorf("tmux: %w", err)
@@ -610,7 +611,7 @@ func resetCLI(cfg *config.Config, name string) error {
 		name = ctl.CurrentSession(context.Background())
 	}
 	if name == "" {
-		return fmt.Errorf("no active session: run gotomux -r inside tmux or pass a session name")
+		return fmt.Errorf("no active session: run gotomux -r/--reconcile inside tmux or pass a session name")
 	}
 	stop := picker.HoldInterrupt()
 	report, err := template.RestoreSession(context.Background(), ctl, st, name)

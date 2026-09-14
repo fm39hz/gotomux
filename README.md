@@ -27,7 +27,7 @@ One keystroke opens a unified fuzzy picker across all your workspaces:
 - ⚡ **Instant Response**: Hot-path queries run in RAM via a background daemon (~1.2ms IPC round-trip, 0 disk/tmux I/O on pick) with an automatic standalone fallback (~5ms cold).
 - 🧩 **Topology & Shapes**: Captures the *essence* of your workspace (window roles, splits, tool intents) without hardcoding absolute paths.
 - 🧠 **Smart Ranking**: Ranks candidates using frecency, pairwise session co-occurrence, and directed switch sequences.
-- 🔄 **Baseline Recovery (`-r`)**: Restore altered sessions to their initial layout state without killing running processes.
+- 🔄 **Baseline Reconciliation (`-r`)**: Reconcile altered sessions toward their baseline without killing running processes.
 
 ---
 
@@ -111,7 +111,7 @@ Flags:
   -v, --version  Show version
   -f, --freeze   Freeze current or named session as a preset
   -e, --edit     Edit a named preset (or freeze-then-edit)
-  -r, --reset    Restore current or named session to its baseline layout
+  -r, --reconcile Reconcile current or named session to its baseline layout
   -p, --profile  Profile cold-start performance
 ```
 
@@ -167,12 +167,13 @@ Sticky shapes are automatically baked when launching new sessions from project r
 
 Shapes are automatically mirrored as editable JSON in `$XDG_CONFIG_HOME/gotomux/shapes/<label>--<id8>.json`.
 
-### Baseline Reset (`gotomux -r`)
+### Baseline Reconciliation (`gotomux -r`)
 
-Restores the current or target session back to its recorded baseline layout:
-- Recreates closed panes and dead windows in their original layout positions with their starting commands.
-- Existing processes in surviving windows are untouched.
-- Extra windows added on the fly are preserved.
+Reconciles the current or target session toward its recorded baseline layout:
+- Recreates dead windows and missing panes in their original layout positions with their starting commands.
+- Repairs the layout and name of surviving windows without killing their existing panes or processes.
+- Extra panes and windows added on the fly are preserved.
+- The recorded baseline is the reconciliation target; editing a preset does not silently change an already-running session's target.
 
 ### Ranking Model
 
