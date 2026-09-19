@@ -353,23 +353,50 @@ func windowMatchScore(base, live model.Window) int {
 		score += 2
 	}
 
-	// Ordered tool intents are strong identity evidence. Empty intent means a
-	// shell and is deliberately weak by itself; cwd/path evidence separates
-	// otherwise identical shell panes when available.
-	common := len(base.Panes)
-	if len(live.Panes) < common {
-		common = len(live.Panes)
+	// Bag-of-tools match: panes may have shifted position (a middle pane died,
+	// tmux renumbered the rest). Positional comparison misses this entirely.
+	// Instead, greedily match each base tool intent against any unused live pane.
+	baseIntents := paneIntents(base)
+	liveIntents := paneIntents(live)
+	used := make([]bool, len(liveIntents))
+	for _, bi := range baseIntents {
+		for j, li := range liveIntents {
+			if used[j] {
+				continue
+			}
+			if bi == li {
+				// Non-shell tool match is strong identity evidence; weight it
+				// higher than the old positional +2 so a single surviving tool
+				// pane can carry a window match even when count differs by 1.
+				if bi != "" {
+					score += 3
+				} else {
+					score += 2
+				}
+				used[j] = true
+				break
+			}
+		}
 	}
-	for i := 0; i < common; i++ {
-		if tmux.ToolIntent(base.Panes[i].Cmd) == tmux.ToolIntent(live.Panes[i].Cmd) {
-			score += 2
+
+	// Cwd/CmdPath evidence: also use bag matching so shifted panes still count.
+	for _, bp := range base.Panes {
+		for _, lp := range live.Panes {
+			if bp.Cwd != "" && bp.Cwd == lp.Cwd {
+				score++
+				goto nextCwd
+			}
 		}
-		if base.Panes[i].Cwd != "" && base.Panes[i].Cwd == live.Panes[i].Cwd {
-			score++
+	nextCwd:
+	}
+	for _, bp := range base.Panes {
+		for _, lp := range live.Panes {
+			if bp.CmdPath != "" && bp.CmdPath == lp.CmdPath {
+				score += 2
+				goto nextPath
+			}
 		}
-		if base.Panes[i].CmdPath != "" && base.Panes[i].CmdPath == live.Panes[i].CmdPath {
-			score += 2
-		}
+	nextPath:
 	}
 	if base.Cwd != "" && base.Cwd == live.Cwd {
 		score++
@@ -378,23 +405,36 @@ func windowMatchScore(base, live model.Window) int {
 }
 
 func windowMatchAllowed(base, live model.Window) bool {
-	// If a non-shell tool or a cwd/path signal exists, it is meaningful
-	// identity evidence. Without one, only an identical shell topology is safe:
-	// two indistinguishable shell windows are an equivalence class, while a
-	// changed tool must never be accepted merely because its name survived.
-	for i := 0; i < len(base.Panes) && i < len(live.Panes); i++ {
-		bi := tmux.ToolIntent(base.Panes[i].Cmd)
-		li := tmux.ToolIntent(live.Panes[i].Cmd)
-		if bi != "" || li != "" {
-			if bi == li && bi != "" {
-				return true
+	// If a non-shell tool or a cwd/path signal exists anywhere in either
+	// window's panes, it is meaningful identity evidence. Use bag matching
+	// so reordered panes still satisfy the gate.
+	for _, bp := range base.Panes {
+		bi := tmux.ToolIntent(bp.Cmd)
+		if bi != "" {
+			for _, lp := range live.Panes {
+				if tmux.ToolIntent(lp.Cmd) == bi {
+					return true
+				}
 			}
 		}
-		if base.Panes[i].Cwd != "" && base.Panes[i].Cwd == live.Panes[i].Cwd {
-			return true
+	}
+	for _, lp := range live.Panes {
+		if tmux.ToolIntent(lp.Cmd) != "" {
+			for _, bp := range base.Panes {
+				if tmux.ToolIntent(bp.Cmd) == tmux.ToolIntent(lp.Cmd) {
+					return true
+				}
+			}
 		}
-		if base.Panes[i].CmdPath != "" && base.Panes[i].CmdPath == live.Panes[i].CmdPath {
-			return true
+	}
+	for _, bp := range base.Panes {
+		for _, lp := range live.Panes {
+			if bp.Cwd != "" && bp.Cwd == lp.Cwd {
+				return true
+			}
+			if bp.CmdPath != "" && bp.CmdPath == lp.CmdPath {
+				return true
+			}
 		}
 	}
 	if base.Cwd != "" && base.Cwd == live.Cwd {
@@ -417,8 +457,21 @@ func shellTopologyEquivalent(base, live model.Window) bool {
 
 func repairWindow(base, live model.Window) (repairStep, bool) {
 	r := repairStep{rename: base.Name != "" && base.Name != live.Name}
-	if len(live.Panes) < len(base.Panes) {
-		r.missing = append([]model.Pane(nil), base.Panes[len(live.Panes):]...)
+	// Find genuinely missing panes: base panes whose tool+cwd identity has no
+	// match in live. This handles the case where a middle pane died and the
+	// remaining panes shifted left — tail-slice would wrongly duplicate them.
+	for _, bp := range base.Panes {
+		found := false
+		for _, lp := range live.Panes {
+			if tmux.ToolIntent(bp.Cmd) == tmux.ToolIntent(lp.Cmd) &&
+				bp.Cwd == lp.Cwd && bp.CmdPath == lp.CmdPath {
+				found = true
+				break
+			}
+		}
+		if !found {
+			r.missing = append(r.missing, bp)
+		}
 	}
 	if r.rename {
 		r.name = base.Name
