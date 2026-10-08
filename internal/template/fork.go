@@ -7,10 +7,10 @@ import (
 	"log"
 	"strings"
 
+	paneclassify "github.com/fm39hz/gotomux/internal/classify"
 	"github.com/fm39hz/gotomux/internal/model"
 	"github.com/fm39hz/gotomux/internal/store"
 	"github.com/fm39hz/gotomux/internal/tmux"
-	"github.com/fm39hz/gotomux/internal/toolclass"
 )
 
 // Fork = multi-window tool-group essence.
@@ -19,11 +19,7 @@ import (
 
 // PaneClass returns the fork class name for a pane command.
 func PaneClass(cmd string) string {
-	base := toolclass.Base(cmd)
-	if base == "" {
-		return "shell"
-	}
-	return toolclass.ClassLabel(base)
+	return paneclassify.ClassifyPane(cmd, "", paneclassify.ProjectContext{}).PortableClass()
 }
 
 // paneClassSlice returns ordered class names for a window's panes.
@@ -82,7 +78,7 @@ func ShapeForkBody(p *model.Session) string {
 		for j := 0; j < n; j++ {
 			var cmd string
 			if j < len(w.Panes) {
-				cmd = tmux.ToolIntent(w.Panes[j].Cmd)
+				cmd = paneclassify.ClassifyPane(w.Panes[j].Cmd, "", paneclassify.ProjectContext{}).Tool
 			}
 			wj.Panes = append(wj.Panes, pane{Tool: cmd})
 		}
@@ -125,7 +121,7 @@ func ForkClassKeyString(cmds []string) string {
 		if c == "" {
 			classes[i] = "shell"
 		} else {
-			classes[i] = toolclass.ClassLabel(c)
+			classes[i] = PaneClass(c)
 		}
 	}
 	return strings.Join(classes, ",")

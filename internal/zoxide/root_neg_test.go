@@ -34,7 +34,8 @@ func (f *fakeRootNeg) RememberMiss(path string) {
 	f.neg[path] = true
 }
 
-// markerlessPaths uses a non-existent prefix (same trick as zoxide_test.go):
+// markerlessPaths uses a non-existent prefix outside marked /tmp (same trick
+// as zoxide_test.go):
 // the walk deterministically exhausts, so these are guaranteed misses.
 var markerlessPaths = []string{pfx + "/alpha", pfx + "/beta"}
 

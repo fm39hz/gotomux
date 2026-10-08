@@ -5,7 +5,7 @@ import "testing"
 // Paths under a non-existent prefix: FindProjectRoot returns its argument when
 // it walks up without finding a project marker, so these are deterministic
 // regardless of where the test runs.
-const pfx = "/tmp/gotomux-zoxide-test-nonexistent"
+const pfx = "/dev/shm/gotomux-zoxide-test-nonexistent"
 
 func TestRowsRecencyIsListOrder(t *testing.T) {
 	rows := Rows([]string{pfx + "/alpha", pfx + "/beta", pfx + "/gamma"})

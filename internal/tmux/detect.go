@@ -126,12 +126,6 @@ func resolvePaneCmdPath(name string, panePid int32, procs *procIndex) string {
 	return ""
 }
 
-// ToolIntent: pane role tool (nvim, yazi, ...). Empty = default shell.
-// Delegates to toolclass (single vocabulary).
-func ToolIntent(cmd string) string {
-	return toolclass.Intent(cmd)
-}
-
 func binBase(cmd string) string {
 	return toolclass.Base(cmd)
 }

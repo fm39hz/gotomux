@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	paneclassify "github.com/fm39hz/gotomux/internal/classify"
 	"github.com/fm39hz/gotomux/internal/model"
 	"github.com/fm39hz/gotomux/internal/store"
 	"github.com/fm39hz/gotomux/internal/tmux"
@@ -48,7 +49,7 @@ func ToShape(p *model.Session, id string) *model.Session {
 		for j := 0; j < n; j++ {
 			pw.Panes[j].Idx = j
 			if j < len(w.Panes) {
-				pw.Panes[j].Cmd = tmux.ToolIntent(w.Panes[j].Cmd)
+				pw.Panes[j].Cmd = paneclassify.ClassifyPane(w.Panes[j].Cmd, "", paneclassify.ProjectContext{}).Tool
 			}
 		}
 		pw.Name = windowChromeRole(w.Name, pw, i, sess, base)
@@ -133,7 +134,7 @@ func roleFromTools(w model.Window) string {
 	var tools []string
 	seen := map[string]bool{}
 	for _, pn := range w.Panes {
-		t := tmux.ToolIntent(pn.Cmd)
+		t := paneclassify.ClassifyPane(pn.Cmd, pn.Cwd, paneclassify.ProjectContext{}).Tool
 		if t == "" || seen[t] {
 			continue
 		}

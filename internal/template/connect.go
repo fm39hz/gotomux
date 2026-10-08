@@ -141,14 +141,9 @@ func FreezeSave(st store.Storer, s *model.Session, setSticky bool) (shapeID stri
 	}
 	ensureShapesReady(st)
 	id, key, body := shapeBody(s, false)
-	shapeID, shapeCreated, err = st.SaveFreeze(s, id, key, body, setSticky)
+	shapeID, shapeCreated, err = st.SaveFreezeWithBaseline(s, s, id, key, body, setSticky)
 	if err != nil {
 		return "", false, fmt.Errorf("freeze save: %w", err)
-	}
-	// A freeze is the user saying "this is the good layout" — it becomes the
-	// restore baseline for this session.
-	if err := st.SaveBaseline(s); err != nil {
-		return "", false, fmt.Errorf("freeze save: baseline: %w", err)
 	}
 	emitShapeEvent(context.Background(), st, shapeID, s)
 	return shapeID, shapeCreated, nil
@@ -202,12 +197,7 @@ func ConnectProject(ctl tmux.Connector, st store.Storer, name, cwd string) error
 	if st != nil {
 		if p, err := st.Get(name); err == nil && p != nil {
 			_ = st.Touch(name)
-			if err := ctl.ConnectPreset(context.Background(), p); err != nil {
-				return fmt.Errorf("load preset %q: %w", name, err)
-			}
-			// Loading a preset defines the session's starting layout.
-			_ = st.SaveBaseline(p)
-			return nil
+			return ConnectPreset(ctl, st, p)
 		}
 	}
 	tmpl, sid, err := LoadActive(st)
@@ -215,10 +205,61 @@ func ConnectProject(ctl tmux.Connector, st store.Storer, name, cwd string) error
 		return fmt.Errorf("load sticky shape: %w", err)
 	}
 	baked := bakeShape(st, tmpl, name, cwd, sid)
-	if err := ctl.ConnectPreset(context.Background(), baked); err != nil {
-		return fmt.Errorf("bake sticky %q as %q: %w", sid, name, err)
+	if st == nil {
+		return ctl.ConnectPreset(context.Background(), baked)
 	}
-	// A baked session is the starting layout; record it for `gotomux -r`.
-	_ = st.SaveBaseline(baked)
-	return nil
+	return ConnectPreset(ctl, st, baked)
+}
+
+// ConnectPreset loads a saved/baked instance, records its baseline before an
+// outside-tmux attach can replace the process, then connects the client.
+func ConnectPreset(ctl tmux.Connector, st store.Storer, p *model.Session) error {
+	if ctl == nil || p == nil {
+		return fmt.Errorf("connect preset: nil tmux or preset")
+	}
+	ctx := context.Background()
+	if ctl.Has(ctx, p.Name) {
+		return ctl.Connect(ctx, p.Name, "")
+	}
+	if err := ctl.Load(ctx, p); err != nil {
+		return fmt.Errorf("load preset %q: %w", p.Name, err)
+	}
+	if st != nil {
+		baseline := cloneSession(p)
+		if observed, err := ctl.Freeze(ctx, p.Name); err == nil {
+			bindLoadedIDs(baseline, observed)
+		}
+		baseline.SchemaVersion = 2
+		if err := st.SaveBaseline(baseline); err != nil {
+			return fmt.Errorf("save baseline %q: %w", p.Name, err)
+		}
+	}
+	return ctl.Connect(ctx, p.Name, p.Cwd)
+}
+
+func cloneSession(p *model.Session) *model.Session {
+	if p == nil {
+		return nil
+	}
+	copy := *p
+	copy.Windows = append([]model.Window(nil), p.Windows...)
+	for i := range copy.Windows {
+		copy.Windows[i].Panes = append([]model.Pane(nil), p.Windows[i].Panes...)
+	}
+	return &copy
+}
+
+func bindLoadedIDs(target, observed *model.Session) {
+	if target == nil || observed == nil {
+		return
+	}
+	target.ServerKey = observed.ServerKey
+	for wi := 0; wi < len(target.Windows) && wi < len(observed.Windows); wi++ {
+		tw, ow := &target.Windows[wi], observed.Windows[wi]
+		tw.Idx, tw.TmuxID = ow.Idx, ow.TmuxID
+		for pi := 0; pi < len(tw.Panes) && pi < len(ow.Panes); pi++ {
+			tw.Panes[pi].Idx = ow.Panes[pi].Idx
+			tw.Panes[pi].TmuxID = ow.Panes[pi].TmuxID
+		}
+	}
 }

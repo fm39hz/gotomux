@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"testing"
 )
 
@@ -98,15 +100,15 @@ func TestFindByID(t *testing.T) {
 
 // TestIsNoServerErrorReadsStderr pins a dead branch that mattered.
 //
-// tmux reports "no server running on …" on stderr. exec.Cmd.Output() surfaces that
-// through ExitError.Stderr, but err.Error() is only "exit status 1" — so matching
-// on the message alone made IsNoServerError always false for ListLive, leaving its
-// (nil, nil) branch unreachable and `gotomux -f` reporting a raw exit status
-// instead of "no active sessions".
+// A fake tmux executable emits the real no-server stderr shape. This tests the
+// ListLive branch without consulting or mutating the developer's tmux server.
 func TestIsNoServerErrorReadsStderr(t *testing.T) {
 	dir := t.TempDir()
-	t.Setenv("TMUX_TMPDIR", dir)
-	t.Setenv("TMUX", "")
+	bin := filepath.Join(dir, "tmux")
+	if err := os.WriteFile(bin, []byte("#!/bin/sh\necho 'no server running on test-socket' >&2\nexit 1\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
 
 	c, err := New()
 	if err != nil {

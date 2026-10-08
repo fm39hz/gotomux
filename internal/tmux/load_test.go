@@ -19,20 +19,19 @@ import (
 //	w0 editor: 1 pane nvim @ root
 //	w1 test:   2 panes shell @ root and root/test
 func TestLoadGrimoireShape(t *testing.T) {
-	if testing.Short() {
-		t.Skip("live tmux")
-	}
+	tmp := tmuxtest.Isolate(t)
 	ctl, err := New()
 	if err != nil {
 		t.Fatal(err)
 	}
 	name := "tp-test-grimoire"
-	_ = ctl.Kill(context.Background(), name)
 	defer func() { _ = ctl.Kill(context.Background(), name) }()
 
-	root := "/tmp/tp-grimoire"
+	root := filepath.Join(tmp, "grimoire")
 	testDir := root + "/test"
-	_ = exec.Command("mkdir", "-p", testDir).Run()
+	if err := os.MkdirAll(testDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
 
 	p := &model.Session{
 		Name: name,
@@ -125,20 +124,21 @@ func TestLoadGrimoireShape(t *testing.T) {
 
 // mirrors tmuxp/kho-cong.json shape
 func TestLoadKhoCongShape(t *testing.T) {
-	if testing.Short() {
-		t.Skip("live tmux")
-	}
+	tmp := tmuxtest.Isolate(t)
 	ctl, err := New()
 	if err != nil {
 		t.Fatal(err)
 	}
 	name := "tp-test-kho"
-	_ = ctl.Kill(context.Background(), name)
 	defer func() { _ = ctl.Kill(context.Background(), name) }()
 
-	root := "/tmp/tp-kho"
+	root := filepath.Join(tmp, "kho")
 	a, b := root+"/cong-dlqg", root+"/kho-dl-mo"
-	_ = exec.Command("mkdir", "-p", a, b).Run()
+	for _, path := range []string{a, b} {
+		if err := os.MkdirAll(path, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
 
 	p := &model.Session{
 		Name: name,
@@ -214,19 +214,18 @@ func TestLoadKhoCongShape(t *testing.T) {
 // Freeze often stores a middle window named like the session (cwd basename).
 // new-window -t bare name then fails with "index N in use".
 func TestLoadWindowNamedLikeSession(t *testing.T) {
-	if testing.Short() {
-		t.Skip("live tmux")
-	}
+	tmp := tmuxtest.Isolate(t)
 	ctl, err := New()
 	if err != nil {
 		t.Fatal(err)
 	}
 	name := "tp-test-ambig-name"
-	_ = ctl.Kill(context.Background(), name)
 	defer func() { _ = ctl.Kill(context.Background(), name) }()
 
-	root := "/tmp/tp-ambig"
-	_ = exec.Command("mkdir", "-p", root).Run()
+	root := filepath.Join(tmp, "ambiguous")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
 
 	p := &model.Session{
 		Name: name,

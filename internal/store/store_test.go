@@ -77,7 +77,10 @@ func TestSaveFreezeAtomic(t *testing.T) {
 	}
 	// pure shape body minimal
 	body := `{"name":"w","windows":[{"name":"w","panes":[{"cwd":""}]}]}`
-	sid, created, err := st.SaveFreeze(p, "w", "keyacid01", body, true)
+	p.ServerKey = "socket:device:inode"
+	p.Windows[0].TmuxID = "@17"
+	p.Windows[0].Panes[0].TmuxID = "%42"
+	sid, created, err := st.SaveFreezeWithBaseline(p, p, "w", "keyacid01", body, true)
 	if err != nil || !created || sid == "" {
 		t.Fatalf("savefreeze %q %v %v", sid, created, err)
 	}
@@ -86,6 +89,10 @@ func TestSaveFreezeAtomic(t *testing.T) {
 	}
 	if st.StickyID() != sid {
 		t.Fatalf("sticky %q want %q", st.StickyID(), sid)
+	}
+	baseline, err := st.GetBaseline("zz-acid")
+	if err != nil || baseline == nil || baseline.SchemaVersion != 2 || baseline.ServerKey != p.ServerKey || baseline.Windows[0].TmuxID != "@17" || baseline.Windows[0].Panes[0].TmuxID != "%42" {
+		t.Fatalf("atomic baseline missing runtime identity: %+v, err=%v", baseline, err)
 	}
 	// same key again: no new shape, preset still updates
 	p.Windows[0].Panes[0].Cmd = "false"
@@ -98,6 +105,18 @@ func TestSaveFreezeAtomic(t *testing.T) {
 		t.Fatal("preset not updated")
 	}
 	_ = st.Delete("zz-acid")
+}
+
+func TestGetBaselineReadsLegacySessionJSON(t *testing.T) {
+	st := isolatedStore(t)
+	legacy := `{"Name":"legacy","Cwd":"/tmp","Windows":[{"Idx":1,"Name":"shell","Panes":[{"Idx":0,"Cwd":"/tmp"}]}]}`
+	if _, err := st.db.Exec(`INSERT INTO baseline(name,body,updated_at) VALUES(?,?,1)`, "legacy", legacy); err != nil {
+		t.Fatal(err)
+	}
+	got, err := st.GetBaseline("legacy")
+	if err != nil || got == nil || got.Name != "legacy" || got.SchemaVersion != 0 || got.Windows[0].TmuxID != "" {
+		t.Fatalf("legacy baseline = %+v, err=%v", got, err)
+	}
 }
 
 func TestRebindNameMergesUsageAndPairs(t *testing.T) {

@@ -45,6 +45,21 @@ func TestPatternFromPresetUmbrella(t *testing.T) {
 	}
 }
 
+func TestPatternFromPresetKeepsUnknownOutsideRoot(t *testing.T) {
+	root := t.TempDir()
+	child := filepath.Join(root, "child")
+	_ = os.MkdirAll(filepath.Join(child, ".git"), 0o755)
+	p := &model.Session{
+		Name: "scope", Cwd: root,
+		Windows: []model.Window{{Panes: []model.Pane{
+			{Cwd: child}, {Cwd: filepath.Join(root, "..", "outside")},
+		}}},
+	}
+	if got, want := PatternFromPreset(p), "C0,?"; got != want {
+		t.Fatalf("pattern = %q, want %q", got, want)
+	}
+}
+
 func TestObserveAndBakePlacement(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("XDG_DATA_HOME", filepath.Join(dir, "data"))
@@ -143,4 +158,38 @@ func TestBakeMissingChildFallsBackRoot(t *testing.T) {
 		t.Fatalf("c1 fallback %s", baked.Windows[1].Panes[1].Cwd)
 	}
 	_ = strings.Contains
+}
+
+func TestBakeUnknownPlacementFallsBackRootWithoutBecomingObservedScope(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("XDG_DATA_HOME", filepath.Join(dir, "data"))
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(dir, "cfg"))
+	st, err := store.Open()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	if err := st.RecordPlacement("shape-unknown", "C0,?,C1"); err != nil {
+		t.Fatal(err)
+	}
+	body := `{"name":"shape-unknown","windows":[{"name":"shell","panes":[{},{},{}]}]}`
+	if err := st.UpsertShapeByID("shape-unknown", "key-unknown", body); err != nil {
+		t.Fatal(err)
+	}
+	root := filepath.Join(dir, "root")
+	child := filepath.Join(root, "child")
+	if err := os.MkdirAll(filepath.Join(child, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	tmpl, err := Parse(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	baked := bakeShape(st, tmpl, "unknown", root, "shape-unknown")
+	if got := []string{baked.Windows[0].Panes[0].Cwd, baked.Windows[0].Panes[1].Cwd, baked.Windows[0].Panes[2].Cwd}; got[0] != child || got[1] != root || got[2] != root {
+		t.Fatalf("baked cwd slots = %v, want [child root root]", got)
+	}
+	if got := PatternFromPreset(&model.Session{Cwd: root, Windows: []model.Window{{Panes: []model.Pane{{Cwd: root}, {Cwd: root}}}}}); got != "" {
+		t.Fatalf("operational fallback was learned as placement %q", got)
+	}
 }

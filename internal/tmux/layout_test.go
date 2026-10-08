@@ -76,3 +76,15 @@ func TestLayoutForShapeClassifiesDump(t *testing.T) {
 		t.Fatal("InferSplit classifies dump")
 	}
 }
+
+func TestLayoutTopologyIgnoresGeometryAndPaneIDsButKeepsTreeOrder(t *testing.T) {
+	a := "aaaa,100x30,0,0{49x30,0,0,1,50x30,50,0{24x30,50,0,2,25x30,75,0,3}}"
+	b := "bbbb,140x40,0,0{69x40,0,0,7,70x40,70,0{34x40,70,0,8,35x40,105,0,9}}"
+	c := "cccc,100x30,0,0{49x30,0,0{24x30,0,0,1,25x30,25,0,2},50x30,50,0,3}"
+	if gotA, gotB := LayoutTopology(a), LayoutTopology(b); gotA != gotB {
+		t.Fatalf("same split tree differs by geometry/IDs: %q vs %q", gotA, gotB)
+	}
+	if gotA, gotC := LayoutTopology(a), LayoutTopology(c); gotA == gotC {
+		t.Fatalf("split tree nesting/order was lost: %q vs %q", gotA, gotC)
+	}
+}

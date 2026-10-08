@@ -36,6 +36,7 @@ type Storer interface {
 	TransitionScores(ctx string, now int64) (map[string]int64, error)
 
 	SaveFreeze(s *model.Session, shapeID, shapeKey, shapeBody string, setSticky bool) (outShapeID string, shapeCreated bool, err error)
+	SaveFreezeWithBaseline(s *model.Session, baseline *model.Session, shapeID, shapeKey, shapeBody string, setSticky bool) (outShapeID string, shapeCreated bool, err error)
 	StickShape(shapeID, shapeKey, shapeBody string) (outID string, created bool, err error)
 	RememberShapeOnly(shapeID, shapeKey, shapeBody string) (outID string, created bool, err error)
 	GetShape(id string) (body string, ok bool)

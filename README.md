@@ -111,7 +111,9 @@ Flags:
   -v, --version  Show version
   -f, --freeze   Freeze current or named session as a preset
   -e, --edit     Edit a named preset (or freeze-then-edit)
-  -r, --reconcile Reconcile current or named session to its baseline layout
+  -r, --reconcile [session] Reconcile a session to its baseline
+      --hard               With --reconcile, rebuild windows and terminate pane processes
+      --force              With --hard, skip confirmation
   -p, --profile  Profile cold-start performance
 ```
 
@@ -170,10 +172,17 @@ Shapes are automatically mirrored as editable JSON in `$XDG_CONFIG_HOME/gotomux/
 ### Baseline Reconciliation (`gotomux -r`)
 
 Reconciles the current or target session toward its recorded baseline layout:
+
 - Recreates dead windows and missing panes in their original layout positions with their starting commands.
 - Repairs the layout and name of surviving windows without killing their existing panes or processes.
 - Extra panes and windows added on the fly are preserved.
 - The recorded baseline is the reconciliation target; editing a preset does not silently change an already-running session's target.
+- Existing sessions without either a baseline or saved preset must be frozen once with `gotomux -f` before reconciliation.
+
+Use `gotomux --reconcile --hard [session]` to recreate all windows and panes
+from the frozen baseline, including its saved tmux split layout. This terminates
+every current pane process and asks for confirmation. Add `--force` only when
+that prompt should be skipped.
 
 ### Ranking Model
 

@@ -11,26 +11,55 @@ import (
 )
 
 // Baseline: the recorded starting layout of a live session, stored as a full
-// instance preset (windows / panes / commands / cwds). RestoreSession diffs the
+// instance preset (windows / panes / commands / cwds). ReconcileSession diffs the
 // live session against it and rebuilds missing windows at their baseline
 // positions. JSON keeps the whole tree readable in one row — baseline is always
 // read wholesale, never queried by parts.
 //
 // Written when a session is first created (ConnectProject), when a preset is
-// loaded, on every freeze, and after a successful restore.
+// loaded, on every freeze, and after reconciliation refreshes runtime bindings.
 func (s *Store) SaveBaseline(sess *model.Session) error {
 	if sess == nil {
 		return fmt.Errorf("save baseline: nil session")
 	}
-	body, err := json.Marshal(sess)
+	if sess.Name == "" {
+		return fmt.Errorf("save baseline: empty session name")
+	}
+	copy := *sess
+	if copy.SchemaVersion == 0 {
+		copy.SchemaVersion = 2
+	}
+	body, err := json.Marshal(&copy)
 	if err != nil {
 		return fmt.Errorf("save baseline: %w", err)
 	}
-	_, err = s.db.Exec(
-		`INSERT INTO baseline (name, body, updated_at) VALUES (?, ?, ?)
-		 ON CONFLICT(name) DO UPDATE SET body = excluded.body, updated_at = excluded.updated_at`,
-		sess.Name, body, time.Now().Unix(),
-	)
+	_, err = s.db.Exec(`INSERT INTO baseline (name, body, updated_at) VALUES (?, ?, ?)
+		ON CONFLICT(name) DO UPDATE SET body = excluded.body, updated_at = excluded.updated_at`,
+		copy.Name, body, time.Now().Unix())
+	if err != nil {
+		return fmt.Errorf("save baseline: %w", err)
+	}
+	return nil
+}
+
+func saveBaselineTx(tx *sql.Tx, sess *model.Session) error {
+	if sess == nil {
+		return fmt.Errorf("save baseline: nil session")
+	}
+	if sess.Name == "" {
+		return fmt.Errorf("save baseline: empty session name")
+	}
+	copy := *sess
+	if copy.SchemaVersion == 0 {
+		copy.SchemaVersion = 2
+	}
+	body, err := json.Marshal(&copy)
+	if err != nil {
+		return fmt.Errorf("save baseline: %w", err)
+	}
+	_, err = tx.Exec(`INSERT INTO baseline (name, body, updated_at) VALUES (?, ?, ?)
+		ON CONFLICT(name) DO UPDATE SET body = excluded.body, updated_at = excluded.updated_at`,
+		copy.Name, body, time.Now().Unix())
 	if err != nil {
 		return fmt.Errorf("save baseline: %w", err)
 	}

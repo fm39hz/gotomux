@@ -107,6 +107,14 @@ func (m *mockStorer) SaveFreeze(p *model.Session, shapeID, shapeKey, shapeBody s
 	return shapeID, true, nil
 }
 
+func (m *mockStorer) SaveFreezeWithBaseline(p, baseline *model.Session, shapeID, shapeKey, shapeBody string, setSticky bool) (string, bool, error) {
+	id, created, err := m.SaveFreeze(p, shapeID, shapeKey, shapeBody, setSticky)
+	if err == nil && baseline != nil {
+		err = m.SaveBaseline(baseline)
+	}
+	return id, created, err
+}
+
 func (m *mockStorer) RememberShapeOnly(shapeID, shapeKey, shapeBody string) (string, bool, error) {
 	m.shapes[shapeID] = shapeBody
 	m.keys[shapeKey] = shapeID
@@ -139,14 +147,25 @@ func (m *mockStorer) ListShapes() ([]string, error) {
 
 type mockConnector struct {
 	tmux.Connector
-	has      bool
-	loadCall atomic.Int32
+	has       bool
+	loadCall  atomic.Int32
+	onConnect func()
 }
 
-func (m *mockConnector) Has(ctx context.Context, name string) bool           { return m.has }
-func (m *mockConnector) Connect(ctx context.Context, name, cwd string) error { return nil }
+func (m *mockConnector) Has(ctx context.Context, name string) bool { return m.has }
+func (m *mockConnector) Connect(ctx context.Context, name, cwd string) error {
+	if m.onConnect != nil {
+		m.onConnect()
+	}
+	return nil
+}
 func (m *mockConnector) Freeze(ctx context.Context, name string) (*model.Session, error) {
 	return &model.Session{Name: name, Cwd: "/tmp"}, nil
+}
+
+func (m *mockConnector) Load(ctx context.Context, p *model.Session) error {
+	m.loadCall.Add(1)
+	return nil
 }
 
 func (m *mockConnector) ConnectPreset(ctx context.Context, s *model.Session) error {
@@ -288,7 +307,11 @@ func TestConnectProjectExisting(t *testing.T) {
 func TestConnectProjectPreset(t *testing.T) {
 	st := newMockStorer()
 	st.presets["my-session"] = &model.Session{Name: "my-session", Cwd: "/tmp"}
-	ctl := &mockConnector{}
+	ctl := &mockConnector{onConnect: func() {
+		if st.baseline["my-session"] == nil {
+			t.Error("attach started before baseline was recorded")
+		}
+	}}
 	err := template.ConnectProject(ctl, st, "my-session", "/tmp")
 	if err != nil {
 		t.Fatalf("ConnectProject: %v", err)
@@ -296,17 +319,27 @@ func TestConnectProjectPreset(t *testing.T) {
 	if ctl.loadCall.Load() != 1 {
 		t.Errorf("ConnectPreset called %d times, want 1", ctl.loadCall.Load())
 	}
+	if st.baseline["my-session"] == nil {
+		t.Fatal("loaded preset baseline was not recorded before connect")
+	}
 }
 
 func TestConnectProjectBake(t *testing.T) {
 	st := newMockStorer()
-	ctl := &mockConnector{}
+	ctl := &mockConnector{onConnect: func() {
+		if st.baseline["new-session"] == nil {
+			t.Error("attach started before baked baseline was recorded")
+		}
+	}}
 	err := template.ConnectProject(ctl, st, "new-session", "/tmp")
 	if err != nil {
 		t.Fatalf("ConnectProject: %v", err)
 	}
 	if ctl.loadCall.Load() != 1 {
 		t.Errorf("ConnectPreset called %d times, want 1", ctl.loadCall.Load())
+	}
+	if st.baseline["new-session"] == nil {
+		t.Fatal("baked session baseline was not recorded before connect")
 	}
 }
 

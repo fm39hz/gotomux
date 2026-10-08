@@ -20,11 +20,20 @@ type ShapeRow struct {
 // setSticky true -> sticky points at resulting shape id in same tx.
 // Call writeConfigMirror only AFTER this returns nil (post-commit).
 func (s *Store) SaveFreeze(sess *model.Session, shapeID, shapeKey, shapeBody string, setSticky bool) (outShapeID string, shapeCreated bool, err error) {
+	return s.SaveFreezeWithBaseline(sess, nil, shapeID, shapeKey, shapeBody, setSticky)
+}
+
+// SaveFreezeWithBaseline commits the instance preset, pure shape, optional
+// sticky pointer and reset baseline atomically.
+func (s *Store) SaveFreezeWithBaseline(sess, baseline *model.Session, shapeID, shapeKey, shapeBody string, setSticky bool) (outShapeID string, shapeCreated bool, err error) {
 	if sess == nil {
 		return "", false, fmt.Errorf("nil preset")
 	}
 	if !project.ValidSessionName(sess.Name) {
 		return "", false, fmt.Errorf("invalid session name %q", sess.Name)
+	}
+	if baseline != nil && baseline.Name != sess.Name {
+		return "", false, fmt.Errorf("baseline name %q does not match frozen session %q", baseline.Name, sess.Name)
 	}
 	tx, err := s.db.Begin()
 	if err != nil {
@@ -40,6 +49,11 @@ func (s *Store) SaveFreeze(sess *model.Session, shapeID, shapeKey, shapeBody str
 	}
 	if setSticky {
 		if err := setStickyTx(tx, outShapeID); err != nil {
+			return "", false, err
+		}
+	}
+	if baseline != nil {
+		if err := saveBaselineTx(tx, baseline); err != nil {
 			return "", false, err
 		}
 	}

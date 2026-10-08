@@ -1,12 +1,12 @@
 package template
 
 import (
-	"fmt"
 	"log"
 	"os"
 	"path/filepath"
 	"strings"
 
+	"github.com/fm39hz/gotomux/internal/classify"
 	"github.com/fm39hz/gotomux/internal/model"
 	"github.com/fm39hz/gotomux/internal/project"
 	"github.com/fm39hz/gotomux/internal/store"
@@ -43,11 +43,15 @@ func PatternFromPreset(p *model.Session) string {
 			if cwd == "" {
 				cwd = root
 			}
-			s := slotOf(root, children, cwd)
-			if s != "R" {
+			s := classify.ScopeForPath(cwd, classify.ProjectContext{Root: root, Children: children})
+			if s != classify.ScopeRoot {
 				allR = false
 			}
-			slots = append(slots, s)
+			if s == classify.ScopeUnknown {
+				slots = append(slots, "?")
+			} else {
+				slots = append(slots, string(s))
+			}
 		}
 		wins = append(wins, strings.Join(slots, ","))
 	}
@@ -55,34 +59,6 @@ func PatternFromPreset(p *model.Session) string {
 		return ""
 	}
 	return strings.Join(wins, "|")
-}
-
-func slotOf(root string, children []string, cwd string) string {
-	cwd = filepath.Clean(cwd)
-	root = filepath.Clean(root)
-	if cwd == root {
-		return "R"
-	}
-	// longest child prefix match
-	best := -1
-	bestLen := -1
-	for i, ch := range children {
-		ch = filepath.Clean(ch)
-		if cwd == ch || strings.HasPrefix(cwd, ch+string(os.PathSeparator)) {
-			if len(ch) > bestLen {
-				best = i
-				bestLen = len(ch)
-			}
-		}
-	}
-	if best >= 0 {
-		return fmt.Sprintf("C%d", best)
-	}
-	// under root but not a known child (e.g. src/) -> treat as R for placement
-	if rel, err := filepath.Rel(root, cwd); err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
-		return "R"
-	}
-	return "R"
 }
 
 // ObservePlacement: best-effort learn non-trivial pattern for shapeID from instance.
@@ -169,11 +145,11 @@ func parsePattern(pat string) [][]string {
 
 func resolveSlot(root string, children []string, slot string) string {
 	slot = strings.TrimSpace(slot)
-	if slot == "" || slot == "R" {
+	if slot == "" || classify.ScopeRef(slot) == classify.ScopeRoot || classify.ScopeRef(slot) == classify.ScopeUnknown {
 		return root
 	}
-	var k int
-	if _, err := fmt.Sscanf(slot, "C%d", &k); err != nil || k < 0 {
+	k, ok := classify.ScopeRef(slot).ChildIndex()
+	if !ok {
 		return root
 	}
 	if k >= len(children) {

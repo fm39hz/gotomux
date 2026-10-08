@@ -1,9 +1,11 @@
 package model
 
 type Session struct {
-	Name    string
-	Cwd     string
-	Windows []Window
+	Name          string
+	Cwd           string
+	Windows       []Window
+	ServerKey     string `json:"server_key,omitempty"`
+	SchemaVersion int    `json:"baseline_version,omitempty"`
 }
 
 type Window struct {
@@ -12,6 +14,7 @@ type Window struct {
 	Cwd    string
 	Layout string
 	Panes  []Pane
+	TmuxID string `json:"tmux_id,omitempty"`
 }
 
 type Pane struct {
@@ -26,6 +29,7 @@ type Pane struct {
 	// dropped the window from rebuilt sessions.
 	CmdPath  string
 	StartCmd string // the command the pane was started with (keeps args)
+	TmuxID   string `json:"tmux_id,omitempty"`
 }
 
 type Usage struct {

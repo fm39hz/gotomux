@@ -1,10 +1,12 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/exec"
@@ -42,7 +44,9 @@ Flags:
   -v, --version  Show version
   -f, --freeze   Freeze current or named session as a preset
   -e, --edit     Edit a named preset (or freeze-then-edit)
-  -r, --reconcile Reconcile current or named session to its baseline layout
+  -r, --reconcile [session] Reconcile a session to its baseline
+      --hard               With --reconcile, rebuild windows and terminate pane processes
+      --force              With --hard, skip confirmation
   -p, --profile  Profile cold-start performance`)
 }
 
@@ -69,15 +73,19 @@ func main() {
 			}
 			return
 		case "-r", "--reconcile":
-			name := ""
-			if len(os.Args) > 2 && !strings.HasPrefix(os.Args[2], "-") {
-				name = os.Args[2]
+			name, hard, force, err := parseReconcileArgs(os.Args[2:])
+			if err != nil {
+				fmt.Fprintln(os.Stderr, err)
+				os.Exit(2)
 			}
-			if err := reconcileCLI(cfg, name); err != nil && !errors.Is(err, errCancel) {
+			if err := reconcileCLI(cfg, name, hard, force); err != nil && !errors.Is(err, errCancel) {
 				fmt.Fprintln(os.Stderr, err)
 				os.Exit(1)
 			}
 			return
+		case "--hard", "--force":
+			fmt.Fprintf(os.Stderr, "%s is only valid with --reconcile\n", os.Args[1])
+			os.Exit(2)
 		case "-e", "--edit":
 			name := ""
 			if len(os.Args) > 2 && !strings.HasPrefix(os.Args[2], "-") {
@@ -290,7 +298,7 @@ func runPickerIPC(cfg *config.Config, conn net.Conn) error {
 		if e != nil {
 			return e
 		}
-		return ctl.ConnectPreset(ctx, p)
+		return template.ConnectPreset(ctl, st.get(), p)
 	default:
 		return template.ConnectProject(ctl, st.get(), it.Name, it.Path)
 	}
@@ -493,7 +501,7 @@ func connectItem(ctl tmux.Connector, st store.Storer, res picker.Result) error {
 		if e != nil {
 			return e
 		}
-		return ctl.ConnectPreset(ctx, p)
+		return template.ConnectPreset(ctl, st, p)
 	default:
 		return fmt.Errorf("unknown kind %v", it.Kind)
 	}
@@ -597,7 +605,7 @@ func freezeCLI(cfg *config.Config, name string) error {
 // reconcileCLI brings a session toward its recorded baseline layout.
 // Deliberately standalone: reconciliation is a rare, interactive action, not
 // a hot path.
-func reconcileCLI(cfg *config.Config, name string) error {
+func reconcileCLI(cfg *config.Config, name string, hard, force bool) error {
 	ctl, err := tmux.New()
 	if err != nil {
 		return fmt.Errorf("tmux: %w", err)
@@ -613,8 +621,11 @@ func reconcileCLI(cfg *config.Config, name string) error {
 	if name == "" {
 		return fmt.Errorf("no active session: run gotomux -r/--reconcile inside tmux or pass a session name")
 	}
+	if hard && !force && !confirmHardReconcile(name) {
+		return errCancel
+	}
 	stop := picker.HoldInterrupt()
-	report, err := template.RestoreSession(context.Background(), ctl, st, name)
+	report, err := template.ReconcileSession(context.Background(), ctl, st, name, hard)
 	stop()
 	if err != nil {
 		return err
@@ -623,6 +634,46 @@ func reconcileCLI(cfg *config.Config, name string) error {
 		fmt.Println(report)
 	}
 	return nil
+}
+
+func parseReconcileArgs(args []string) (name string, hard, force bool, err error) {
+	for _, arg := range args {
+		switch arg {
+		case "--hard":
+			hard = true
+		case "--force":
+			force = true
+		default:
+			if strings.HasPrefix(arg, "-") {
+				return "", false, false, fmt.Errorf("unknown reconcile option %q", arg)
+			}
+			if name != "" {
+				return "", false, false, fmt.Errorf("reconcile accepts one session name")
+			}
+			name = arg
+		}
+	}
+	if force && !hard {
+		return "", false, false, fmt.Errorf("--force requires --hard")
+	}
+	return name, hard, force, nil
+}
+
+func confirmHardReconcile(name string) bool {
+	if name == "" {
+		name = "current session"
+	}
+	fmt.Fprintf(os.Stderr, "Hard reconcile of %s will terminate every current pane process. Continue? [y/N] ", name)
+	return acceptHardReconcile(bufio.NewReader(os.Stdin))
+}
+
+func acceptHardReconcile(input io.Reader) bool {
+	line, err := bufio.NewReader(input).ReadString('\n')
+	if err != nil && len(line) == 0 {
+		return false
+	}
+	answer := strings.TrimSpace(line)
+	return strings.EqualFold(answer, "y") || strings.EqualFold(answer, "yes")
 }
 
 // freezeViaDaemon attempts the freeze over IPC.
