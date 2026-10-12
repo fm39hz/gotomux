@@ -2,8 +2,8 @@ module github.com/fm39hz/gotomux
 
 go 1.26.5
 
-// Cursor-style restoration patch for Bubble Tea upstream issue #1559.
-replace charm.land/bubbletea/v2 => github.com/fm39hz/bubbletea/v2 v2.1.1-0.20261012033831-caed214dc9de
+// Cursor restoration (#1559) and host-style preservation for inline input.
+replace charm.land/bubbletea/v2 => github.com/fm39hz/bubbletea/v2 v2.1.1-0.20261012050725-9fc7c213ebe4
 
 require (
 	charm.land/bubbles/v2 v2.1.1

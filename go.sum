@@ -44,8 +44,8 @@ github.com/ebitengine/purego v0.10.0 h1:QIw4xfpWT6GWTzaW5XEKy3HXoqrJGx1ijYHzTF0/
 github.com/ebitengine/purego v0.10.0/go.mod h1:iIjxzd6CiRiOG0UyXP+V1+jWqUXVjPKLAI0mRfJZTmQ=
 github.com/epilande/go-devicons v0.0.0-20250505162540-0661cab71a28 h1:FIj2HjafVK1pAOKtBscHQA/Fjnb4TsYkFROhMwHiG0g=
 github.com/epilande/go-devicons v0.0.0-20250505162540-0661cab71a28/go.mod h1:myBNrCUxmCh3ktYaRUMfL8epmWMBu6/yj0JFnQHYFSU=
-github.com/fm39hz/bubbletea/v2 v2.1.1-0.20261012033831-caed214dc9de h1:wqYIw7nllqLPcHBlUTVIYTdNznqaEtPANHOn52RNvWI=
-github.com/fm39hz/bubbletea/v2 v2.1.1-0.20261012033831-caed214dc9de/go.mod h1:xWHeyxIX9/wiFU2kgPW04ojOZyTzrWf+8lGjUCaftiU=
+github.com/fm39hz/bubbletea/v2 v2.1.1-0.20261012050725-9fc7c213ebe4 h1:x3v39BoKoJa9ARNTBylRFEMisW1fpeA8PXWVa8L0V1g=
+github.com/fm39hz/bubbletea/v2 v2.1.1-0.20261012050725-9fc7c213ebe4/go.mod h1:xWHeyxIX9/wiFU2kgPW04ojOZyTzrWf+8lGjUCaftiU=
 github.com/go-ole/go-ole v1.2.6 h1:/Fpf6oFPoeFik9ty7siob0G6Ke8QvQEuVcuChpwXzpY=
 github.com/go-ole/go-ole v1.2.6/go.mod h1:pprOEPIfldk/42T2oK7lQ4v4JSDwmV0As9GaiUsvbm0=
 github.com/google/cel-go v0.28.1 h1:YWIwi77J4xIsYUwAF/iIuS6haffzIHS8yWI8glSbLWM=

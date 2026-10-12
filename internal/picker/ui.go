@@ -898,6 +898,8 @@ func (m model) View() tea.View {
 	view.AltScreen = m.altScreen
 	view.Cursor = m.ui.queryInput.Cursor()
 	if view.Cursor != nil {
+		view.Cursor.PreserveStyle = true
+		view.Cursor.Color = nil
 		view.Cursor.Position.X += lipgloss.Width(m.iconPrompt())
 	}
 	return view

@@ -110,6 +110,9 @@ func TestViewUsesRealTextCursorWithPromptOffset(t *testing.T) {
 	if view.Cursor == nil {
 		t.Fatal("view has no hardware cursor")
 	}
+	if !view.Cursor.PreserveStyle || view.Cursor.Color != nil {
+		t.Fatal("text cursor must preserve host shape/blink and terminal color")
+	}
 	// The contract is positional, not stylistic: the hardware cursor must sit
 	// immediately after the typed query. Derive the offset from the prompt's
 	// cell width instead of pinning a constant that every glyph restyle would
