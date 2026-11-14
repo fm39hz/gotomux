@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/fm39hz/gotomux/internal/classify"
 	"github.com/fm39hz/gotomux/internal/event"
 	"github.com/fm39hz/gotomux/internal/model"
 	"github.com/fm39hz/gotomux/internal/store"
@@ -140,8 +141,11 @@ func FreezeSave(st store.Storer, s *model.Session, setSticky bool) (shapeID stri
 		return "", false, fmt.Errorf("freeze save: nil store or preset")
 	}
 	ensureShapesReady(st)
+	baseline := cloneSession(s)
+	baseline.SchemaVersion = model.CurrentBaselineSchemaVersion
+	stampSemanticMetadata(baseline)
 	id, key, body := shapeBody(s, false)
-	shapeID, shapeCreated, err = st.SaveFreezeWithBaseline(s, s, id, key, body, setSticky)
+	shapeID, shapeCreated, err = st.SaveFreezeWithBaseline(s, baseline, id, key, body, setSticky)
 	if err != nil {
 		return "", false, fmt.Errorf("freeze save: %w", err)
 	}
@@ -156,7 +160,11 @@ func FreezeRemember(ctl tmux.Connector, st store.Storer, name string) (shapeID s
 	if st == nil {
 		return "", false, fmt.Errorf("freeze: nil store")
 	}
-	p, err := ctl.Freeze(context.Background(), name)
+	ops, ok := ctl.(IdentityOps)
+	if !ok {
+		return "", false, fmt.Errorf("freeze: tmux adapter does not support logical identity metadata")
+	}
+	p, err := EnsureLiveIdentities(context.Background(), ops, name)
 	if err != nil {
 		return "", false, err
 	}
@@ -206,7 +214,7 @@ func ConnectProject(ctl tmux.Connector, st store.Storer, name, cwd string) error
 	}
 	baked := bakeShape(st, tmpl, name, cwd, sid)
 	if st == nil {
-		return ctl.ConnectPreset(context.Background(), baked)
+		return ConnectPreset(ctl, nil, baked)
 	}
 	return ConnectPreset(ctl, st, baked)
 }
@@ -221,20 +229,50 @@ func ConnectPreset(ctl tmux.Connector, st store.Storer, p *model.Session) error 
 	if ctl.Has(ctx, p.Name) {
 		return ctl.Connect(ctx, p.Name, "")
 	}
-	if err := ctl.Load(ctx, p); err != nil {
+	ops, ok := ctl.(IdentityOps)
+	if !ok {
+		return fmt.Errorf("connect preset: tmux adapter does not support logical identity metadata")
+	}
+	instance := cloneSession(p)
+	instance.LogicalID, instance.TmuxID, instance.ServerKey = "", "", ""
+	for wi := range instance.Windows {
+		instance.Windows[wi].SlotID = ""
+		instance.Windows[wi].TmuxID = ""
+		for pi := range instance.Windows[wi].Panes {
+			instance.Windows[wi].Panes[pi].SlotID = ""
+			instance.Windows[wi].Panes[pi].TmuxID = ""
+		}
+	}
+	if err := ctl.Load(ctx, instance); err != nil {
 		return fmt.Errorf("load preset %q: %w", p.Name, err)
 	}
+	observed, err := EnsureLiveIdentities(ctx, ops, p.Name)
+	if err != nil {
+		return fmt.Errorf("load preset %q identity: %w", p.Name, err)
+	}
 	if st != nil {
-		baseline := cloneSession(p)
-		if observed, err := ctl.Freeze(ctx, p.Name); err == nil {
-			bindLoadedIDs(baseline, observed)
-		}
-		baseline.SchemaVersion = 2
+		baseline := cloneSession(instance)
+		bindLoadedIDs(baseline, observed)
+		baseline.SchemaVersion = model.CurrentBaselineSchemaVersion
+		stampSemanticMetadata(baseline)
 		if err := st.SaveBaseline(baseline); err != nil {
 			return fmt.Errorf("save baseline %q: %w", p.Name, err)
 		}
 	}
-	return ctl.Connect(ctx, p.Name, p.Cwd)
+	return ctl.Connect(ctx, instance.Name, instance.Cwd)
+}
+
+func stampSemanticMetadata(s *model.Session) {
+	if s == nil {
+		return
+	}
+	reclassify := s.ClassifierVersion != classify.WindowRoleVersion
+	s.ClassifierVersion = classify.WindowRoleVersion
+	for i := range s.Windows {
+		if reclassify || s.Windows[i].Role == "" {
+			s.Windows[i].Role = classify.WindowRole(s.Windows[i])
+		}
+	}
 }
 
 func cloneSession(p *model.Session) *model.Session {
@@ -253,13 +291,15 @@ func bindLoadedIDs(target, observed *model.Session) {
 	if target == nil || observed == nil {
 		return
 	}
+	target.LogicalID, target.TmuxID = observed.LogicalID, observed.TmuxID
 	target.ServerKey = observed.ServerKey
 	for wi := 0; wi < len(target.Windows) && wi < len(observed.Windows); wi++ {
 		tw, ow := &target.Windows[wi], observed.Windows[wi]
-		tw.Idx, tw.TmuxID = ow.Idx, ow.TmuxID
+		tw.Idx, tw.TmuxID, tw.SlotID = ow.Idx, ow.TmuxID, ow.SlotID
 		for pi := 0; pi < len(tw.Panes) && pi < len(ow.Panes); pi++ {
 			tw.Panes[pi].Idx = ow.Panes[pi].Idx
 			tw.Panes[pi].TmuxID = ow.Panes[pi].TmuxID
+			tw.Panes[pi].SlotID = ow.Panes[pi].SlotID
 		}
 	}
 }

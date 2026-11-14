@@ -1,11 +1,16 @@
 package model
 
 type Session struct {
-	Name          string
-	Cwd           string
-	Windows       []Window
-	ServerKey     string `json:"server_key,omitempty"`
-	SchemaVersion int    `json:"baseline_version,omitempty"`
+	Name    string
+	Cwd     string
+	Windows []Window
+	// LogicalID persists across supported session renames. TmuxID
+	// is tmux's session_id and is valid only within ServerKey's generation.
+	LogicalID         string `json:"logical_id,omitempty"`
+	TmuxID            string `json:"tmux_id,omitempty"`
+	ServerKey         string `json:"server_key,omitempty"`
+	SchemaVersion     int    `json:"baseline_version,omitempty"`
+	ClassifierVersion int    `json:"classifier_version,omitempty"`
 }
 
 type Window struct {
@@ -14,6 +19,9 @@ type Window struct {
 	Cwd    string
 	Layout string
 	Panes  []Pane
+	Role   string `json:"semantic_role,omitempty"`
+	// SlotID identifies this required baseline window; TmuxID is the live tmux window_id.
+	SlotID string `json:"slot_id,omitempty"`
 	TmuxID string `json:"tmux_id,omitempty"`
 }
 
@@ -29,7 +37,9 @@ type Pane struct {
 	// dropped the window from rebuilt sessions.
 	CmdPath  string
 	StartCmd string // the command the pane was started with (keeps args)
-	TmuxID   string `json:"tmux_id,omitempty"`
+	// SlotID identifies this required baseline pane; TmuxID is the live tmux pane_id.
+	SlotID string `json:"slot_id,omitempty"`
+	TmuxID string `json:"tmux_id,omitempty"`
 }
 
 type Usage struct {

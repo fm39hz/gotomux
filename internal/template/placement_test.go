@@ -77,11 +77,11 @@ func TestObserveAndBakePlacement(t *testing.T) {
 		_ = os.MkdirAll(filepath.Join(d, ".git"), 0o755)
 	}
 	inst := &model.Session{
-		Name: "ua", Cwd: rootA,
+		Name: "ua", LogicalID: "00000000-0000-4000-8000-000000000001", SchemaVersion: model.CurrentBaselineSchemaVersion, Cwd: rootA,
 		Windows: []model.Window{
-			{Name: "ed", Panes: []model.Pane{{Cwd: rootA, Cmd: "nvim"}}},
-			{Name: "sh", Layout: "tiled", Panes: []model.Pane{
-				{Cwd: c0a}, {Cwd: c1a},
+			{SlotID: "00000000-0000-4000-8000-000000000002", Name: "ed", Panes: []model.Pane{{SlotID: "00000000-0000-4000-8000-000000000003", Cwd: rootA, Cmd: "nvim"}}},
+			{SlotID: "00000000-0000-4000-8000-000000000004", Name: "sh", Layout: "tiled", Panes: []model.Pane{
+				{SlotID: "00000000-0000-4000-8000-000000000005", Cwd: c0a}, {SlotID: "00000000-0000-4000-8000-000000000006", Cwd: c1a},
 			}},
 		},
 	}

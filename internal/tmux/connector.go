@@ -17,5 +17,4 @@ type Connector interface {
 	Freeze(ctx context.Context, name string) (*model.Session, error)
 	Load(ctx context.Context, p *model.Session) error
 	Connect(ctx context.Context, name, cwd string) error
-	ConnectPreset(ctx context.Context, p *model.Session) error
 }

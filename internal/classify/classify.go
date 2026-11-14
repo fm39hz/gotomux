@@ -8,8 +8,11 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/fm39hz/gotomux/internal/model"
 	"github.com/fm39hz/gotomux/internal/toolclass"
 )
+
+const WindowRoleVersion = 1
 
 type ScopeRef string
 
@@ -54,6 +57,47 @@ func ClassifyPane(command, effectiveCwd string, ctx ProjectContext) PaneClass {
 		kind = toolclass.Classify(tool)
 	}
 	return PaneClass{Tool: tool, Kind: kind, Scope: ScopeForPath(effectiveCwd, ctx)}
+}
+
+// WindowRole derives a stable product role from pane tools, then falls back to
+// a small set of canonical names. Arbitrary window names never become roles.
+func WindowRole(window model.Window) string {
+	roles := map[string]bool{}
+	for _, pane := range window.Panes {
+		tool := toolclass.Intent(pane.Cmd)
+		if tool == "" {
+			continue
+		}
+		switch toolclass.Classify(tool) {
+		case toolclass.KindEditor:
+			roles["editor"] = true
+		case toolclass.KindFiles:
+			roles["files"] = true
+		case toolclass.KindGit:
+			roles["git"] = true
+		case toolclass.KindAgent:
+			roles["agent"] = true
+		}
+	}
+	if len(roles) == 1 {
+		for role := range roles {
+			return role
+		}
+	}
+	switch strings.ToLower(strings.TrimSpace(window.Name)) {
+	case "editor", "nvim", "vim", "vi", "helix":
+		return "editor"
+	case "files", "yazi", "lf", "ranger", "nnn", "broot":
+		return "files"
+	case "git", "lazygit", "gitui", "tig":
+		return "git"
+	case "agent", "codex", "claude", "opencode", "aider", "pi":
+		return "agent"
+	case "shell", "command":
+		return "shell"
+	default:
+		return ""
+	}
 }
 
 func (p PaneClass) PortableClass() string {

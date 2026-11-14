@@ -44,6 +44,13 @@ type Storer interface {
 
 	SaveBaseline(sess *model.Session) error
 	GetBaseline(name string) (*model.Session, error)
+	GetBaselineByLogicalID(id string) (*model.Session, error)
+	StartReconcile(journal model.ReconcileJournal) error
+	UpdateReconcile(id string, status model.ReconcileJournalStatus, completedStep int, lastError string) error
+	GetReconcile(id string) (*model.ReconcileJournal, error)
+	GetActiveReconcile(sessionKey string) (*model.ReconcileJournal, error)
+	ListActiveReconciles() ([]model.ReconcileJournal, error)
+	CommitReconcile(sess *model.Session, journalID string) error
 	GetShapeMeta(id string) (ShapeMeta, bool)
 	SetShapeMirror(id, path, sig string) error
 	PutShape(id, key, body string) (outID string, created bool, err error)
@@ -245,7 +252,7 @@ func (s *Store) Ping() error {
 // The migration itself stays additive-only and idempotent — the fast path is an
 // optimisation, not a replacement, so a DB from a future version or one that
 // somehow lost user_version still gets the full run.
-const schemaVersion = 7
+const schemaVersion = 8
 
 func (s *Store) migrate() error {
 	var have int
@@ -444,8 +451,38 @@ CREATE TABLE IF NOT EXISTS fork (
 CREATE TABLE IF NOT EXISTS baseline (
   name       TEXT PRIMARY KEY,
   body       TEXT NOT NULL,
-  updated_at INTEGER NOT NULL
+  updated_at INTEGER NOT NULL,
+  logical_id TEXT NOT NULL DEFAULT ''
 );`); err != nil {
+		return err
+	}
+	var baselineHasLogicalID int
+	_ = s.db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('baseline') WHERE name='logical_id'`).Scan(&baselineHasLogicalID)
+	if baselineHasLogicalID == 0 {
+		if _, err := s.db.Exec(`ALTER TABLE baseline ADD COLUMN logical_id TEXT NOT NULL DEFAULT ''`); err != nil {
+			return err
+		}
+	}
+	if _, err := s.db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_baseline_logical_id ON baseline(logical_id) WHERE logical_id <> ''`); err != nil {
+		return err
+	}
+	if _, err := s.db.Exec(`
+CREATE TABLE IF NOT EXISTS reconcile_journal (
+  id                 TEXT PRIMARY KEY,
+  session_key        TEXT NOT NULL,
+  session_name       TEXT NOT NULL,
+  session_logical_id TEXT NOT NULL DEFAULT '',
+  policy             TEXT NOT NULL,
+  status             TEXT NOT NULL,
+  plan_json          TEXT NOT NULL,
+  completed_step     INTEGER NOT NULL DEFAULT 0,
+  last_error         TEXT NOT NULL DEFAULT '',
+  created_at         INTEGER NOT NULL,
+  updated_at         INTEGER NOT NULL
+);`); err != nil {
+		return err
+	}
+	if _, err := s.db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_reconcile_active_session ON reconcile_journal(session_key) WHERE status IN ('planned','running','needs_attention')`); err != nil {
 		return err
 	}
 	_, _ = s.db.Exec(`DELETE FROM fork`)

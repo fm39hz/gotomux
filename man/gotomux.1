@@ -5,6 +5,7 @@ gotomux \- fuzzy tmux session picker
 .B gotomux
 [\fB\-f\fR [\fIname\fR]]
 [\fB\-e\fR [\fIname\fR]]
+[\fB\-r\fR [\fIsession\fR] [\fB\-\-hard\fR] [\fB\-\-force\fR]]
 .SH DESCRIPTION
 .B gotomux
 is a fuzzy tmux session picker.
@@ -24,6 +25,19 @@ Edit a preset in $EDITOR.
 If
 .I name
 is omitted, opens an interactive picker.
+.TP
+.B \-r [\fIsession\fR]
+Reconcile a live session toward its frozen baseline. Extra windows and panes
+are preserved by default. If identity evidence is ambiguous, no dependent
+mutation is made.
+.TP
+.B \-\-hard
+With \fB-r\fR, rebuild the session to match the baseline exactly when it differs.
+This terminates pane processes it replaces and requires confirmation.
+.TP
+.B \-\-force
+With \fB-r --hard\fR, skip the confirmation prompt. Identity and verification
+checks still apply.
 .TP
 .B \-h
 Show help text.

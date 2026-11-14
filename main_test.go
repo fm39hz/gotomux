@@ -6,18 +6,18 @@ import (
 )
 
 func TestParseReconcileArgs(t *testing.T) {
-	name, hard, force, err := parseReconcileArgs([]string{"kho-cong", "--hard"})
-	if err != nil || name != "kho-cong" || !hard || force {
-		t.Fatalf("parsed name=%q hard=%v force=%v err=%v", name, hard, force, err)
+	opts, err := parseReconcileArgs([]string{"kho-cong", "--hard"})
+	if err != nil || opts.Name != "kho-cong" || !opts.Hard || opts.Force {
+		t.Fatalf("parsed options=%+v err=%v", opts, err)
 	}
-	name, hard, force, err = parseReconcileArgs([]string{"--force", "--hard", "kho-cong"})
-	if err != nil || name != "kho-cong" || !hard || !force {
-		t.Fatalf("parsed name=%q hard=%v force=%v err=%v", name, hard, force, err)
+	opts, err = parseReconcileArgs([]string{"--force", "--hard", "kho-cong"})
+	if err != nil || opts.Name != "kho-cong" || !opts.Hard || !opts.Force {
+		t.Fatalf("parsed options=%+v err=%v", opts, err)
 	}
-	if _, _, _, err := parseReconcileArgs([]string{"--force", "kho-cong"}); err == nil {
+	if _, err := parseReconcileArgs([]string{"--force", "kho-cong"}); err == nil {
 		t.Fatal("--force without --hard must be rejected")
 	}
-	if _, _, _, err := parseReconcileArgs([]string{"a", "b"}); err == nil {
+	if _, err := parseReconcileArgs([]string{"a", "b"}); err == nil {
 		t.Fatal("multiple session names must be rejected")
 	}
 }

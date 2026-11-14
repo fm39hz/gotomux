@@ -53,7 +53,7 @@ func (s *Store) SaveFreezeWithBaseline(sess, baseline *model.Session, shapeID, s
 		}
 	}
 	if baseline != nil {
-		if err := saveBaselineTx(tx, baseline); err != nil {
+		if err := saveBaselineTx(tx, baseline, true); err != nil {
 			return "", false, err
 		}
 	}

@@ -150,6 +150,7 @@ type mockConnector struct {
 	has       bool
 	loadCall  atomic.Int32
 	onConnect func()
+	session   *model.Session
 }
 
 func (m *mockConnector) Has(ctx context.Context, name string) bool { return m.has }
@@ -160,16 +161,85 @@ func (m *mockConnector) Connect(ctx context.Context, name, cwd string) error {
 	return nil
 }
 func (m *mockConnector) Freeze(ctx context.Context, name string) (*model.Session, error) {
-	return &model.Session{Name: name, Cwd: "/tmp"}, nil
+	if m.session == nil {
+		m.session = &model.Session{Name: name, Cwd: "/tmp", TmuxID: "$1", ServerKey: "mock-server", Windows: []model.Window{{Idx: 0, Name: "shell", Cwd: "/tmp", TmuxID: "@1", Panes: []model.Pane{{Idx: 0, Cwd: "/tmp", TmuxID: "%1"}}}}}
+	}
+	return cloneMockSession(m.session), nil
 }
 
 func (m *mockConnector) Load(ctx context.Context, p *model.Session) error {
 	m.loadCall.Add(1)
+	copy := cloneMockSession(p)
+	copy.TmuxID, copy.ServerKey = "$1", "mock-server"
+	if len(copy.Windows) == 0 {
+		copy.Windows = []model.Window{{Idx: 0, Name: "shell", Cwd: "/tmp", Panes: []model.Pane{{Idx: 0, Cwd: "/tmp"}}}}
+	}
+	for wi := range copy.Windows {
+		copy.Windows[wi].Idx = wi
+		copy.Windows[wi].TmuxID = "@" + string(rune('1'+wi))
+		for pi := range copy.Windows[wi].Panes {
+			copy.Windows[wi].Panes[pi].Idx = pi
+			copy.Windows[wi].Panes[pi].TmuxID = "%" + string(rune('1'+pi))
+		}
+	}
+	m.session = copy
 	return nil
 }
 
-func (m *mockConnector) ConnectPreset(ctx context.Context, s *model.Session) error {
-	m.loadCall.Add(1)
+func cloneMockSession(s *model.Session) *model.Session {
+	if s == nil {
+		return nil
+	}
+	copy := *s
+	copy.Windows = append([]model.Window(nil), s.Windows...)
+	for i := range copy.Windows {
+		copy.Windows[i].Panes = append([]model.Pane(nil), s.Windows[i].Panes...)
+	}
+	return &copy
+}
+
+func (m *mockConnector) Observe(ctx context.Context, name string) (*model.Snapshot, error) {
+	s, err := m.Freeze(ctx, name)
+	if err != nil {
+		return nil, err
+	}
+	snapshot := &model.Snapshot{ServerKey: s.ServerKey, Complete: true, Target: *s, TargetSessionID: s.TmuxID}
+	snapshot.Sessions = []model.SessionIdentity{{Name: s.Name, LogicalID: s.LogicalID, RuntimeID: s.TmuxID}}
+	snapshot.Objects = append(snapshot.Objects, model.ObjectIdentity{Kind: "session", LogicalID: s.LogicalID, RuntimeID: s.TmuxID})
+	for _, w := range s.Windows {
+		snapshot.Objects = append(snapshot.Objects, model.ObjectIdentity{Kind: "window", SlotID: w.SlotID, RuntimeID: w.TmuxID})
+		snapshot.Memberships = append(snapshot.Memberships, model.WindowMembership{SessionID: s.TmuxID, WindowID: w.TmuxID, Index: w.Idx})
+		for _, p := range w.Panes {
+			snapshot.Objects = append(snapshot.Objects, model.ObjectIdentity{Kind: "pane", SlotID: p.SlotID, RuntimeID: p.TmuxID, ParentID: w.TmuxID})
+		}
+	}
+	return snapshot, nil
+}
+
+func (m *mockConnector) SetStableID(ctx context.Context, kind tmux.IdentityKind, runtimeID, logicalID string) error {
+	s, err := m.Freeze(ctx, "")
+	if err != nil {
+		return err
+	}
+	switch kind {
+	case tmux.IdentitySession:
+		s.LogicalID = logicalID
+	case tmux.IdentityWindow:
+		for i := range s.Windows {
+			if s.Windows[i].TmuxID == runtimeID {
+				s.Windows[i].SlotID = logicalID
+			}
+		}
+	case tmux.IdentityPane:
+		for wi := range s.Windows {
+			for pi := range s.Windows[wi].Panes {
+				if s.Windows[wi].Panes[pi].TmuxID == runtimeID {
+					s.Windows[wi].Panes[pi].SlotID = logicalID
+				}
+			}
+		}
+	}
+	m.session = s
 	return nil
 }
 
@@ -206,9 +276,9 @@ func TestFreezeRemember(t *testing.T) {
 func TestFreezeSave(t *testing.T) {
 	st := newMockStorer()
 	s := &model.Session{
-		Name: "test", Cwd: "/tmp",
+		Name: "test", LogicalID: "00000000-0000-4000-8000-000000000001", SchemaVersion: model.CurrentBaselineSchemaVersion, Cwd: "/tmp",
 		Windows: []model.Window{
-			{Name: "editor", Panes: []model.Pane{{Cmd: "nvim"}}},
+			{SlotID: "00000000-0000-4000-8000-000000000002", Name: "editor", Panes: []model.Pane{{SlotID: "00000000-0000-4000-8000-000000000003", Cmd: "nvim"}}},
 		},
 	}
 	shapeID, created, err := template.FreezeSave(st, s, true)
@@ -321,6 +391,24 @@ func TestConnectProjectPreset(t *testing.T) {
 	}
 	if st.baseline["my-session"] == nil {
 		t.Fatal("loaded preset baseline was not recorded before connect")
+	}
+}
+
+func TestConnectPresetAssignsFreshLogicalTreeForEachPresetInstance(t *testing.T) {
+	st := newMockStorer()
+	ctl := &mockConnector{}
+	tmpl := &model.Session{Name: "first", Cwd: "/tmp", LogicalID: "00000000-0000-4000-8000-000000000001", Windows: []model.Window{{Name: "editor", SlotID: "00000000-0000-4000-8000-000000000002", Panes: []model.Pane{{Cmd: "nvim", SlotID: "00000000-0000-4000-8000-000000000003"}}}}}
+	if err := template.ConnectPreset(ctl, st, tmpl); err != nil {
+		t.Fatalf("connect first instance: %v", err)
+	}
+	first := cloneMockSession(st.baseline["first"])
+	tmpl.Name = "second"
+	if err := template.ConnectPreset(ctl, st, tmpl); err != nil {
+		t.Fatalf("connect second instance: %v", err)
+	}
+	second := st.baseline["second"]
+	if first.LogicalID == second.LogicalID || first.Windows[0].SlotID == second.Windows[0].SlotID || first.Windows[0].Panes[0].SlotID == second.Windows[0].Panes[0].SlotID {
+		t.Fatalf("preset instances reused logical identity: first=%+v second=%+v", first, second)
 	}
 }
 

@@ -2,24 +2,62 @@ package template
 
 import (
 	"context"
-	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/fm39hz/gotomux/internal/config"
 	"github.com/fm39hz/gotomux/internal/model"
-	"github.com/fm39hz/gotomux/internal/reconcile"
+	core "github.com/fm39hz/gotomux/internal/reconcile/core"
+	"github.com/fm39hz/gotomux/internal/reconcile/runner"
 	"github.com/fm39hz/gotomux/internal/store"
 	"github.com/fm39hz/gotomux/internal/tmux"
 )
 
-type noBaselineOps struct{ reconcile.Executor }
+type noBaselineOps struct{ runner.TmuxPort }
 
-func (noBaselineOps) Freeze(_ context.Context, name string) (*model.Session, error) {
-	return &model.Session{Name: name, Cwd: "/tmp", Windows: []model.Window{{Idx: 0, Panes: []model.Pane{{Cwd: "/tmp"}}}}}, nil
+func (noBaselineOps) Observe(_ context.Context, name string) (*model.Snapshot, error) {
+	session := model.Session{Name: name, TmuxID: "$1", ServerKey: "test-server"}
+	return &model.Snapshot{ServerKey: session.ServerKey, Complete: true, Target: session, TargetSessionID: session.TmuxID, Sessions: []model.SessionIdentity{{Name: name, RuntimeID: session.TmuxID}}, Objects: []model.ObjectIdentity{{Kind: model.ObjectSession, RuntimeID: session.TmuxID}}}, nil
 }
-func (noBaselineOps) ActiveWindow(context.Context, string) (int, error) { return 0, nil }
+func (noBaselineOps) SetStableID(context.Context, tmux.IdentityKind, string, string) error {
+	return nil
+}
+
+type identifiedTestOps struct {
+	runner.TmuxPort
+	snapshot model.Snapshot
+	sets     int
+}
+
+func (o *identifiedTestOps) Observe(context.Context, string) (*model.Snapshot, error) {
+	copy := o.snapshot
+	return &copy, nil
+}
+
+func (o *identifiedTestOps) SetStableID(context.Context, tmux.IdentityKind, string, string) error {
+	o.sets++
+	return nil
+}
+
+type baselineTestStore struct {
+	store.Storer
+	baseline *model.Session
+	started  bool
+}
+
+func (s *baselineTestStore) GetBaselineByLogicalID(string) (*model.Session, error) {
+	return s.baseline, nil
+}
+
+func (*baselineTestStore) GetActiveReconcile(string) (*model.ReconcileJournal, error) {
+	return nil, nil
+}
+
+func (s *baselineTestStore) StartReconcile(model.ReconcileJournal) error {
+	s.started = true
+	return nil
+}
 
 func TestReconcileRequiresAnExplicitBaseline(t *testing.T) {
 	dir := t.TempDir()
@@ -40,6 +78,28 @@ func TestReconcileRequiresAnExplicitBaseline(t *testing.T) {
 	}
 }
 
+func TestReconcileRejectsUnidentifiedBaselineBeforeMutation(t *testing.T) {
+	baseline := &model.Session{
+		Name: "work", LogicalID: "00000000-0000-4000-8000-000000000001", TmuxID: "$1", ServerKey: "server-a",
+		Windows: []model.Window{{Idx: 1, Name: "editor", TmuxID: "@1", Panes: []model.Pane{{Idx: 0, TmuxID: "%1", Cmd: "nvim"}}}},
+	}
+	live := model.Session{Name: "work", LogicalID: baseline.LogicalID, TmuxID: "$1", ServerKey: "server-a", Windows: baseline.Windows}
+	ops := &identifiedTestOps{snapshot: model.Snapshot{
+		ServerKey: "server-a", Complete: true, Target: live, TargetSessionID: "$1",
+		Sessions:    []model.SessionIdentity{{Name: "work", LogicalID: live.LogicalID, RuntimeID: "$1"}},
+		Objects:     []model.ObjectIdentity{{Kind: model.ObjectSession, LogicalID: live.LogicalID, RuntimeID: "$1"}, {Kind: model.ObjectWindow, RuntimeID: "@1", PaneCount: 1}, {Kind: model.ObjectPane, RuntimeID: "%1", ParentID: "@1"}},
+		Memberships: []model.WindowMembership{{SessionID: "$1", WindowID: "@1", Index: 1}},
+	}}
+	st := &baselineTestStore{baseline: baseline}
+	report, err := ReconcileSession(context.Background(), ops, st, "work", false)
+	if err == nil || !strings.Contains(err.Error(), "gotomux -f") || report != "" {
+		t.Fatalf("incomplete baseline result = report %q, err %v", report, err)
+	}
+	if ops.sets != 0 || st.started {
+		t.Fatalf("reconcile mutated identity or journal before rejecting incomplete baseline: sets=%d started=%v", ops.sets, st.started)
+	}
+}
+
 func TestReconcileRejectsHiddenDaemonSession(t *testing.T) {
 	dir := t.TempDir()
 	st, err := store.OpenWithConfig(&config.Config{DataDir: filepath.Join(dir, "data")})
@@ -53,193 +113,18 @@ func TestReconcileRejectsHiddenDaemonSession(t *testing.T) {
 	}
 }
 
-func session(root string, wins ...model.Window) *model.Session {
-	return &model.Session{Name: "t", Cwd: root, Windows: wins}
-}
-
-func TestPlanRepairsKhoCongWindowWithoutRestartingSurvivors(t *testing.T) {
-	root := t.TempDir()
-	children := []string{filepath.Join(root, "cong-dlqg"), filepath.Join(root, "kho-dl-mo")}
-	for _, child := range children {
-		if err := os.MkdirAll(filepath.Join(child, ".git"), 0o755); err != nil {
-			t.Fatal(err)
-		}
+func TestReconcileReportsIncludeRuntimeIDsAndPolicyOutcome(t *testing.T) {
+	ambiguous := core.Resolution{Status: core.ResolutionAmbiguous, Ambiguous: []core.Ambiguity{{Baseline: "editor@index-1", Live: []string{"editor@index-2[@9]", "editor@index-3[@10]"}, Reason: "equal evidence"}}}
+	report := resolutionReport(ambiguous)
+	if !strings.Contains(report, "@9") || !strings.Contains(report, "@10") || !strings.Contains(report, "equal evidence") {
+		t.Fatalf("ambiguity report omits runtime candidates: %q", report)
 	}
-	base := session(root,
-		model.Window{Idx: 1, Name: "editor", Cwd: root, Panes: []model.Pane{{Idx: 0, Cwd: root, Cmd: "nvim", TmuxID: "%1"}}},
-		model.Window{Idx: 2, Name: "command", Cwd: root, Layout: "tiled", TmuxID: "@2", Panes: []model.Pane{
-			{Idx: 0, Cwd: children[0], TmuxID: "%2"},
-			{Idx: 1, Cwd: children[1], TmuxID: "%3"},
-			{Idx: 2, Cwd: root, TmuxID: "%4"},
-			{Idx: 3, Cwd: root, Cmd: "make", TmuxID: "%5"},
-		}},
-		model.Window{Idx: 3, Name: "files", Cwd: root, Panes: []model.Pane{{Idx: 0, Cwd: root, Cmd: "yazi", TmuxID: "%6"}}},
-		model.Window{Idx: 4, Name: "agent", Cwd: root, Panes: []model.Pane{{Idx: 0, Cwd: root, Cmd: "omp", TmuxID: "%7"}}},
-	)
-	live := session(root,
-		model.Window{Idx: 1, Name: "editor", Cwd: root, Panes: []model.Pane{{Idx: 0, Cwd: root, Cmd: "nvim", TmuxID: "%1"}}},
-		model.Window{Idx: 2, Name: "command", Cwd: root, Layout: "even-horizontal", TmuxID: "@2", Panes: []model.Pane{
-			{Idx: 0, Cwd: children[0], TmuxID: "%2"},
-			{Idx: 1, Cwd: children[1], TmuxID: "%3"},
-			{Idx: 2, Cwd: root, TmuxID: "%4"},
-		}},
-		model.Window{Idx: 3, Name: "files", Cwd: root, Panes: []model.Pane{{Idx: 0, Cwd: root, Cmd: "yazi", TmuxID: "%6"}}},
-		model.Window{Idx: 4, Name: "agent", Cwd: root, Panes: []model.Pane{{Idx: 0, Cwd: root, Cmd: "omp", TmuxID: "%7"}}},
-	)
-	base.ServerKey, live.ServerKey = "srv", "srv"
-	p := reconcile.Build(base, live, 2)
-	if len(p.Ambiguous) != 0 || len(p.Creates) != 0 || len(p.Repairs) != 1 {
-		t.Fatalf("plan = %+v; want one non-destructive repair", p)
+	noop := reconcileReport(core.PlanResult{Status: core.PlanNoop, Policy: core.PolicyPreserve, PreservedWindows: []string{"@9"}, PreservedPanes: []string{"%20"}})
+	if !strings.Contains(noop, "already aligned") || !strings.Contains(noop, "preserved 1 extra window") {
+		t.Fatalf("preserve no-op report = %q", noop)
 	}
-	r := p.Repairs[0]
-	if r.Index != 2 || r.WindowID != "@2" || len(r.MissingPanes) != 1 || r.MissingPanes[0].Cmd != "make" || r.Layout != "tiled" {
-		t.Fatalf("repair = %+v", r)
-	}
-	if len(p.Moves) != 0 {
-		t.Fatalf("no windows need moving, got %+v", p.Moves)
-	}
-}
-
-func TestPlanUsesWindowIDsAcrossRenameAndRenumber(t *testing.T) {
-	base := session("/work", model.Window{Idx: 1, Name: "editor", TmuxID: "@11", Panes: []model.Pane{{Cmd: "nvim", TmuxID: "%11"}}})
-	live := session("/work", model.Window{Idx: 0, Name: "renamed", TmuxID: "@11", Panes: []model.Pane{{Cmd: "nvim", TmuxID: "%11"}}})
-	base.ServerKey, live.ServerKey = "server-generation", "server-generation"
-	p := reconcile.Build(base, live, 0)
-	if len(p.Ambiguous) != 0 || len(p.Matched) != 1 || !p.Matched[0].ByRuntime {
-		t.Fatalf("runtime identity match = %+v", p)
-	}
-	if len(p.Moves) != 2 || p.Moves[0].WindowID != "@11" || p.Moves[1].WindowID != "@11" {
-		t.Fatalf("moves should address stable window id: %+v", p.Moves)
-	}
-	if len(p.Repairs) != 1 || p.Repairs[0].RenameTo != "editor" {
-		t.Fatalf("rename repair = %+v", p.Repairs)
-	}
-}
-
-func TestPlanNameAloneCannotMatchWindow(t *testing.T) {
-	root := t.TempDir()
-	a, b := filepath.Join(root, "a"), filepath.Join(root, "b")
-	for _, path := range []string{a, b} {
-		if err := os.MkdirAll(filepath.Join(path, ".git"), 0o755); err != nil {
-			t.Fatal(err)
-		}
-	}
-	base := session(root, model.Window{Idx: 0, Name: "command", Cwd: a, Panes: []model.Pane{{Cwd: a, Cmd: "nvim"}}})
-	live := session(root, model.Window{Idx: 0, Name: "command", Cwd: b, Panes: []model.Pane{{Cwd: b, Cmd: "yazi"}}})
-	p := reconcile.Build(base, live, 0)
-	if len(p.Matched) != 0 || len(p.Creates) != 0 || len(p.Ambiguous) == 0 || p.NeedsApply {
-		t.Fatalf("same name alone must leave the candidate unresolved: %+v", p)
-	}
-}
-
-func TestRuntimeWindowIDMismatchCannotBecomeSemanticMatch(t *testing.T) {
-	root := t.TempDir()
-	base := session(root, model.Window{Idx: 0, Name: "editor", Cwd: root, TmuxID: "@1", Panes: []model.Pane{{Cwd: root, Cmd: "nvim"}}})
-	live := session(root, model.Window{Idx: 0, Name: "editor", Cwd: root, TmuxID: "@9", Panes: []model.Pane{{Cwd: root, Cmd: "yazi"}}})
-	base.ServerKey, live.ServerKey = "same-server", "same-server"
-	p := reconcile.Build(base, live, 0)
-	if len(p.Matched) != 0 || len(p.Ambiguous) != 0 || len(p.Missing) != 1 || len(p.Extra) != 1 {
-		t.Fatalf("different live @window-id must not match by name/shape: %+v", p)
-	}
-}
-
-func TestPlanSkipsWindowNameTmuxWillNotApply(t *testing.T) {
-	root := t.TempDir()
-	base := session(root, model.Window{Idx: 0, Name: "s", Cwd: root, TmuxID: "@3", Panes: []model.Pane{{Cwd: root, Cmd: "nvim", TmuxID: "%4"}}})
-	live := session(root, model.Window{Idx: 0, Name: "editor", Cwd: root, TmuxID: "@3", Panes: []model.Pane{{Cwd: root, Cmd: "nvim", TmuxID: "%4"}}})
-	base.Name, live.Name = "s", "s"
-	base.ServerKey, live.ServerKey = "srv", "srv"
-	p := reconcile.Build(base, live, 0)
-	if len(p.Repairs) != 0 || p.NeedsApply {
-		t.Fatalf("unapplicable session-name window should not create a futile repair: %+v", p)
-	}
-}
-
-func TestPlanPairsWindowsGloballyByStableProjectScope(t *testing.T) {
-	root := t.TempDir()
-	a, b := filepath.Join(root, "a"), filepath.Join(root, "b")
-	for _, path := range []string{a, b} {
-		if err := os.MkdirAll(filepath.Join(path, ".git"), 0o755); err != nil {
-			t.Fatal(err)
-		}
-	}
-	base := session(root,
-		model.Window{Idx: 0, Name: "a", Cwd: a, Panes: []model.Pane{{Cwd: a}}},
-		model.Window{Idx: 1, Name: "b", Cwd: b, Panes: []model.Pane{{Cwd: b}}},
-	)
-	live := session(root,
-		model.Window{Idx: 0, Name: "unknown-1", Cwd: b, Panes: []model.Pane{{Cwd: b}}},
-		model.Window{Idx: 1, Name: "unknown-2", Cwd: a, Panes: []model.Pane{{Cwd: a}}},
-	)
-	p := reconcile.Build(base, live, 0)
-	if len(p.Ambiguous) != 0 || len(p.Matched) != 2 || p.Matched[0].LiveIndex != 1 || p.Matched[1].LiveIndex != 0 {
-		t.Fatalf("global assignment = %+v", p)
-	}
-}
-
-func TestPlanDoesNotTreatChangedCwdAsMissingPane(t *testing.T) {
-	root := t.TempDir()
-	base := session(root, model.Window{Idx: 0, Name: "shell", Cwd: root, Panes: []model.Pane{{Idx: 0, Cwd: root}}})
-	live := session(root, model.Window{Idx: 0, Name: "shell", Cwd: root, Panes: []model.Pane{{Idx: 0, Cwd: filepath.Join(root, "src")}}})
-	p := reconcile.Build(base, live, 0)
-	if len(p.Ambiguous) != 0 || len(p.Creates) != 0 || len(p.Repairs) != 0 {
-		t.Fatalf("ordinary cwd change must remain untouched: %+v", p)
-	}
-}
-
-func TestPlanExactToolSurvivesProjectScopeChange(t *testing.T) {
-	root := t.TempDir()
-	a, b := filepath.Join(root, "a"), filepath.Join(root, "b")
-	for _, path := range []string{a, b} {
-		if err := os.MkdirAll(filepath.Join(path, ".git"), 0o755); err != nil {
-			t.Fatal(err)
-		}
-	}
-	base := session(root, model.Window{Idx: 0, Name: "editor", Cwd: a, Panes: []model.Pane{{Idx: 0, Cwd: a, Cmd: "nvim"}}})
-	live := session(root, model.Window{Idx: 0, Name: "editor", Cwd: b, Panes: []model.Pane{{Idx: 0, Cwd: b, Cmd: "nvim"}}})
-	p := reconcile.Build(base, live, 0)
-	if len(p.Matched) != 1 || p.Matched[0].BaseIndex != 0 || len(p.Creates) != 0 || len(p.Repairs) != 0 {
-		t.Fatalf("tool identity must survive scope change: %+v", p)
-	}
-}
-
-func TestPlanRepairsSplitTreeWhenLayoutClassIsUnchanged(t *testing.T) {
-	root := t.TempDir()
-	baseLayout := "aaaa,100x30,0,0{49x30,0,0,1,50x30,50,0{24x30,50,0,2,25x30,75,0,3}}"
-	liveLayout := "cccc,100x30,0,0{49x30,0,0{24x30,0,0,1,25x30,25,0,2},50x30,50,0,3}"
-	base := session(root, model.Window{Idx: 0, Name: "shell", Cwd: root, Layout: baseLayout, Panes: []model.Pane{{Idx: 0, Cwd: root}, {Idx: 1, Cwd: root}, {Idx: 2, Cwd: root}}})
-	live := session(root, model.Window{Idx: 0, Name: "shell", Cwd: root, Layout: liveLayout, Panes: []model.Pane{{Idx: 0, Cwd: root}, {Idx: 1, Cwd: root}, {Idx: 2, Cwd: root}}})
-	p := reconcile.Build(base, live, 0)
-	if len(p.Ambiguous) != 0 || len(p.Repairs) != 1 || p.Repairs[0].Layout != baseLayout {
-		t.Fatalf("changed split tree should restore baseline dump: %+v", p)
-	}
-}
-
-func TestPlanReportsUnresolvableDuplicateShellWindows(t *testing.T) {
-	root := t.TempDir()
-	base := session(root,
-		model.Window{Idx: 0, Name: "one", Cwd: root, Panes: []model.Pane{{Cwd: root}}},
-		model.Window{Idx: 1, Name: "two", Cwd: root, Panes: []model.Pane{{Cwd: root}}},
-	)
-	live := session(root,
-		model.Window{Idx: 0, Name: "x", Cwd: root, Panes: []model.Pane{{Cwd: root}}},
-		model.Window{Idx: 1, Name: "y", Cwd: root, Panes: []model.Pane{{Cwd: root}}},
-	)
-	p := reconcile.Build(base, live, 0)
-	if len(p.Ambiguous) == 0 || p.NeedsApply {
-		t.Fatalf("indistinguishable identities must stop mutation: %+v", p)
-	}
-}
-
-func TestPlanPreservesExtraWindowOutsideBaselineRange(t *testing.T) {
-	root := t.TempDir()
-	base := session(root, model.Window{Idx: 0, Name: "editor", Cwd: root, Panes: []model.Pane{{Cmd: "nvim", Cwd: root}}})
-	live := session(root,
-		model.Window{Idx: 0, Name: "editor", Cwd: root, Panes: []model.Pane{{Cmd: "nvim", Cwd: root}}},
-		model.Window{Idx: 2, Name: "extra", Cwd: root, Panes: []model.Pane{{Cmd: "htop", Cwd: root}}},
-	)
-	p := reconcile.Build(base, live, 2)
-	if len(p.Ambiguous) != 0 || len(p.Extra) != 1 || p.Extra[0] != 1 || p.NeedsApply {
-		t.Fatalf("extra outside target range must remain untouched: %+v", p)
+	exact := reconcileReport(core.PlanResult{Status: core.PlanReady, Policy: core.PolicyExact, DesiredSession: model.Session{Windows: []model.Window{{}, {}}}})
+	if !strings.Contains(exact, "hard reconciled") || !strings.Contains(exact, "2 window(s)") {
+		t.Fatalf("exact report = %q", exact)
 	}
 }

@@ -11,177 +11,19 @@ import (
 	"strings"
 	"syscall"
 
+	"github.com/fm39hz/gotomux/internal/classify"
 	"github.com/fm39hz/gotomux/internal/model"
 	"github.com/fm39hz/gotomux/internal/project"
+	"github.com/fm39hz/gotomux/internal/tmuxlayout"
 	"github.com/fm39hz/gotomux/internal/toolclass"
 )
 
-var namedLayouts = map[string]bool{
-	"even-horizontal": true,
-	"even-vertical":   true,
-	"main-horizontal": true,
-	"main-vertical":   true,
-	"tiled":           true,
-}
-
-func IsNamedLayout(s string) bool { return namedLayouts[s] }
-
-func IsLayoutDump(s string) bool {
-	return strings.Contains(s, ",") && (strings.Contains(s, "{") || strings.Contains(s, "[") || strings.Contains(s, "x"))
-}
-
-// LayoutTopology keeps only split-tree delimiters from a tmux layout dump.
-// Sizes, coordinates, checksums and pane IDs vary independently of topology.
-func LayoutTopology(layout string) string {
-	if !IsLayoutDump(layout) {
-		return ""
-	}
-	checksumEnd := strings.IndexByte(layout, ',')
-	body := layout[checksumEnd+1:]
-	p := layoutTreeParser{src: body}
-	tree, err := p.node()
-	if err == nil && p.pos == len(p.src) {
-		return tree
-	}
-	// Unknown tmux dump dialect: retain at least the split orientations and
-	// nesting, without treating dimensions or pane IDs as identity.
-	var fallback strings.Builder
-	for _, r := range body {
-		switch r {
-		case '[', ']', '{', '}':
-			fallback.WriteRune(r)
-		}
-	}
-	return fallback.String()
-}
-
-type layoutTreeParser struct {
-	src string
-	pos int
-}
-
-func (p *layoutTreeParser) node() (string, error) {
-	for field := 0; field < 3; field++ {
-		start := p.pos
-		for p.pos < len(p.src) && p.src[p.pos] != ',' && p.src[p.pos] != '[' && p.src[p.pos] != ']' && p.src[p.pos] != '{' && p.src[p.pos] != '}' {
-			p.pos++
-		}
-		if p.pos == start {
-			return "", fmt.Errorf("empty layout node field")
-		}
-		if field < 2 {
-			if p.pos >= len(p.src) || p.src[p.pos] != ',' {
-				return "", fmt.Errorf("incomplete layout node header")
-			}
-			p.pos++
-		}
-	}
-	if p.pos >= len(p.src) {
-		return "_", nil
-	}
-	open := p.src[p.pos]
-	if open != '[' && open != '{' {
-		if p.src[p.pos] == ',' {
-			if p.consumePaneID() {
-				return "_", nil
-			}
-		}
-		return "_", nil
-	}
-	p.pos++
-	close := byte(']')
-	if open == '{' {
-		close = '}'
-	}
-	children := make([]string, 0, 2)
-	for {
-		child, err := p.node()
-		if err != nil {
-			return "", err
-		}
-		children = append(children, child)
-		if p.pos >= len(p.src) {
-			return "", fmt.Errorf("unterminated layout node")
-		}
-		if p.src[p.pos] == close {
-			p.pos++
-			break
-		}
-		if p.src[p.pos] != ',' {
-			return "", fmt.Errorf("invalid layout child separator")
-		}
-		p.pos++
-	}
-	return string(open) + strings.Join(children, ",") + string(close), nil
-}
-
-func (p *layoutTreeParser) consumePaneID() bool {
-	start := p.pos + 1
-	end := start
-	for end < len(p.src) && p.src[end] != ',' && p.src[end] != '[' && p.src[end] != ']' && p.src[end] != '{' && p.src[end] != '}' {
-		end++
-	}
-	field := p.src[start:end]
-	if field == "" || strings.Contains(field, "x") {
-		return false
-	}
-	if _, err := strconv.Atoi(field); err != nil {
-		return false
-	}
-	p.pos = end
-	return true
-}
-
-func LayoutForStore(layout string, nPanes int) string {
-	if nPanes <= 1 || layout == "" {
-		return ""
-	}
-	if IsNamedLayout(layout) || IsLayoutDump(layout) {
-		return layout
-	}
-	return ""
-}
-
-func LayoutForShape(layout string, nPanes int) string {
-	if nPanes <= 1 {
-		return ""
-	}
-	if IsNamedLayout(layout) {
-		return layout
-	}
-	if IsLayoutDump(layout) {
-		return classifyDump(layout)
-	}
-	return ""
-}
-
-func classifyDump(dump string) string {
-	h := strings.Contains(dump, "{")
-	v := strings.Contains(dump, "[")
-	switch {
-	case h && v:
-		return "tiled"
-	case v:
-		return "even-vertical"
-	case h:
-		return "even-horizontal"
-	default:
-		return "even-horizontal"
-	}
-}
-
-func InferSplit(layout string, nPanes int) string {
-	if nPanes <= 1 {
-		return ""
-	}
-	if IsNamedLayout(layout) {
-		return layout
-	}
-	if IsLayoutDump(layout) {
-		return classifyDump(layout)
-	}
-	return "even-horizontal"
-}
+func IsNamedLayout(s string) bool           { return tmuxlayout.IsNamed(s) }
+func IsLayoutDump(s string) bool            { return tmuxlayout.IsDump(s) }
+func LayoutTopology(s string) string        { return tmuxlayout.Topology(s) }
+func LayoutForStore(s string, n int) string { return tmuxlayout.ForStore(s, n) }
+func LayoutForShape(s string, n int) string { return tmuxlayout.ForShape(s, n) }
+func InferSplit(s string, n int) string     { return tmuxlayout.InferSplit(s, n) }
 
 // IsNoServerError reports whether a tmux error means the server isn't running,
 // so callers can tell "nothing to list" from a real failure.
@@ -486,7 +328,7 @@ func (c *Ctl) runChain(ctx context.Context, parts ...[]string) error {
 	return nil
 }
 
-const freezeFmt = "#{window_index}\t#{window_name}\t#{window_layout}\t#{pane_index}\t#{pane_current_path}\t#{pane_current_command}\t#{pane_start_command}\t#{pane_pid}\t#{pane_active}\t#{session_path}\t#{window_id}\t#{pane_id}\t#{socket_path}\t#{pid}"
+const freezeFmt = "#{window_index}\t#{window_name}\t#{window_layout}\t#{pane_index}\t#{pane_current_path}\t#{pane_current_command}\t#{pane_start_command}\t#{pane_pid}\t#{pane_active}\t#{session_path}\t#{session_id}\t#{@gotomux_session_id_v1}\t#{window_id}\t#{@gotomux_window_slot_v1}\t#{pane_id}\t#{@gotomux_pane_slot_v1}\t#{socket_path}\t#{pid}"
 
 func (c *Ctl) Freeze(ctx context.Context, name string) (*model.Session, error) {
 	if !project.ValidSessionName(name) {
@@ -506,14 +348,14 @@ func (c *Ctl) Freeze(ctx context.Context, name string) (*model.Session, error) {
 	serverPath, serverPID := "", ""
 	for _, line := range lines {
 		parts := strings.Split(line, "\t")
-		if len(parts) < 14 {
-			return nil, fmt.Errorf("list-panes: incomplete identity row for session %q", name)
+		if len(parts) != 18 {
+			return nil, fmt.Errorf("list-panes: incomplete identity row for session %q: got %d fields", name, len(parts))
 		}
 		if serverPath == "" {
-			serverPath, serverPID = parts[12], parts[13]
+			serverPath, serverPID = parts[16], parts[17]
 			continue
 		}
-		if parts[12] != serverPath || parts[13] != serverPID {
+		if parts[16] != serverPath || parts[17] != serverPID {
 			return nil, fmt.Errorf("tmux server changed while listing session %q; retry", name)
 		}
 	}
@@ -529,7 +371,7 @@ func (c *Ctl) Freeze(ctx context.Context, name string) (*model.Session, error) {
 			continue
 		}
 		parts := strings.Split(line, "\t")
-		for len(parts) < 10 {
+		for len(parts) < 18 {
 			parts = append(parts, "")
 		}
 		if base := toolclass.Base(parts[5]); base == "" || toolclass.IsShell(base) {
@@ -545,6 +387,7 @@ func (c *Ctl) Freeze(ctx context.Context, name string) (*model.Session, error) {
 	type winAcc struct {
 		idx    int
 		tmuxID string
+		slotID string
 		name   string
 		layout string
 		panes  []model.Pane
@@ -553,6 +396,7 @@ func (c *Ctl) Freeze(ctx context.Context, name string) (*model.Session, error) {
 	order := []int{}
 	byIdx := map[int]*winAcc{}
 	sessPath := ""
+	sessionID, sessionLogicalID := "", ""
 
 	for _, line := range lines {
 		if line == "" {
@@ -560,8 +404,8 @@ func (c *Ctl) Freeze(ctx context.Context, name string) (*model.Session, error) {
 		}
 		parts := strings.Split(line, "\t")
 		if len(parts) < 14 {
-			for len(parts) < 14 {
-				parts = append(parts, "")
+			if len(parts) != 18 {
+				return nil, fmt.Errorf("list-panes: incomplete identity row for session %q", name)
 			}
 		}
 		wIdx, _ := strconv.Atoi(parts[0])
@@ -576,11 +420,18 @@ func (c *Ctl) Freeze(ctx context.Context, name string) (*model.Session, error) {
 		if sessPath == "" {
 			sessPath = parts[9]
 		}
-		windowID, paneID := parts[10], parts[11]
+		rowSessionID, rowSessionLogicalID := parts[10], parts[11]
+		if sessionID == "" {
+			sessionID, sessionLogicalID = rowSessionID, rowSessionLogicalID
+		} else if rowSessionID != sessionID || rowSessionLogicalID != sessionLogicalID {
+			return nil, fmt.Errorf("session identity changed while listing panes for %q", name)
+		}
+		windowID, windowSlotID := parts[12], parts[13]
+		paneID, paneSlotID := parts[14], parts[15]
 
 		w, ok := byIdx[wIdx]
 		if !ok {
-			w = &winAcc{idx: wIdx, tmuxID: windowID, name: wName, layout: wLayout}
+			w = &winAcc{idx: wIdx, tmuxID: windowID, slotID: windowSlotID, name: wName, layout: wLayout}
 			byIdx[wIdx] = w
 			order = append(order, wIdx)
 		}
@@ -592,6 +443,7 @@ func (c *Ctl) Freeze(ctx context.Context, name string) (*model.Session, error) {
 			Cmd:      cmd,
 			CmdPath:  cmdPath,
 			StartCmd: pStart,
+			SlotID:   paneSlotID,
 			TmuxID:   paneID,
 		})
 		if w.cwd == "" || pActive {
@@ -601,7 +453,7 @@ func (c *Ctl) Freeze(ctx context.Context, name string) (*model.Session, error) {
 		}
 	}
 
-	sess := &model.Session{Name: name, Cwd: sessPath, ServerKey: serverKey, SchemaVersion: 2}
+	sess := &model.Session{Name: name, Cwd: sessPath, TmuxID: sessionID, LogicalID: sessionLogicalID, ServerKey: serverKey, SchemaVersion: model.CurrentBaselineSchemaVersion, ClassifierVersion: classify.WindowRoleVersion}
 	for _, wi := range order {
 		w := byIdx[wi]
 		if w.cwd == "" {
@@ -613,6 +465,8 @@ func (c *Ctl) Freeze(ctx context.Context, name string) (*model.Session, error) {
 			Cwd:    w.cwd,
 			Layout: LayoutForStore(w.layout, len(w.panes)),
 			Panes:  w.panes,
+			Role:   classify.WindowRole(model.Window{Name: w.name, Panes: w.panes}),
+			SlotID: w.slotID,
 			TmuxID: w.tmuxID,
 		})
 	}
@@ -715,9 +569,17 @@ func (c *Ctl) windowBaseIndex(ctx context.Context) int {
 	return n
 }
 
-func sessionTarget(session string) string { return "=" + session + ":" }
+func sessionTarget(session string) string {
+	if strings.HasPrefix(session, "$") {
+		return session + ":"
+	}
+	return "=" + session + ":"
+}
 
 func windowTarget(session string, idx int) string {
+	if strings.HasPrefix(session, "$") {
+		return fmt.Sprintf("%s:%d", session, idx)
+	}
 	return fmt.Sprintf("=%s:%d", session, idx)
 }
 
@@ -847,14 +709,4 @@ func (c *Ctl) Connect(ctx context.Context, name, cwd string) error {
 		return fmt.Errorf("attach to %q: %w", name, err)
 	}
 	return nil
-}
-
-func (c *Ctl) ConnectPreset(ctx context.Context, s *model.Session) error {
-	if s == nil {
-		return fmt.Errorf("connect preset: nil")
-	}
-	if err := c.Load(ctx, s); err != nil {
-		return fmt.Errorf("load preset %q: %w", s.Name, err)
-	}
-	return c.Connect(ctx, s.Name, s.Cwd)
 }

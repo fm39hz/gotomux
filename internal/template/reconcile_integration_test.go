@@ -3,6 +3,7 @@ package template
 import (
 	"context"
 	"os/exec"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -269,5 +270,214 @@ func TestSoftReconcileRestoresSplitTreeAndPreservesPaneProcesses(t *testing.T) {
 	}
 	if got, want := tmux.LayoutTopology(live.Windows[0].Layout), tmux.LayoutTopology(baseline.Windows[0].Layout); got != want {
 		t.Fatalf("split topology after reconcile = %q, want frozen %q", got, want)
+	}
+}
+
+func TestCodexNoDuplicate(t *testing.T) {
+	root := tmuxtest.Isolate(t)
+	st, err := store.OpenWithConfig(&config.Config{DataDir: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	ctl, _ := tmux.New()
+	name := "kho-cong-reconcile"
+	preset := &model.Session{Name: name, Cwd: "/tmp", Windows: []model.Window{
+		{Name: "editor", Cwd: "/tmp", Panes: []model.Pane{{Cmd: "sleep 300", Cwd: "/tmp"}}},
+		{Name: "command", Cwd: "/tmp", Layout: "even-horizontal", Panes: []model.Pane{{Cmd: "sleep 301", Cwd: "/tmp"}, {Cmd: "sleep 302", Cwd: "/tmp"}}},
+		{Name: "files", Cwd: "/tmp", Panes: []model.Pane{{Cmd: "sleep 303", Cwd: "/tmp"}}},
+		{Name: "agent", Cwd: "/tmp", Panes: []model.Pane{{Cmd: "sleep 304", Cwd: "/tmp"}}},
+	}}
+	if err := ctl.Load(context.Background(), preset); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(250 * time.Millisecond)
+	frozen, err := EnsureLiveIdentities(context.Background(), ctl, name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for wi := range frozen.Windows {
+		if frozen.Windows[wi].Name == "agent" {
+			// Model the frozen OMP slot while keeping a long-running process in tmux.
+			frozen.Windows[wi].Role = "agent"
+			frozen.Windows[wi].Panes[0].Cmd = "omp"
+			frozen.Windows[wi].Panes[0].CmdPath = ""
+			frozen.Windows[wi].Panes[0].StartCmd = "sleep 304"
+		}
+	}
+	if _, _, err := FreezeSave(st, frozen, false); err != nil {
+		t.Fatalf("save baseline: %v", err)
+	}
+	baseline, err := st.GetBaseline(name)
+	if err != nil || baseline == nil || len(baseline.Windows) != 4 {
+		t.Fatalf("baseline = %+v err=%v", baseline, err)
+	}
+	var files, agent model.Window
+	for _, window := range baseline.Windows {
+		switch window.Name {
+		case "files":
+			files = window
+		case "agent":
+			agent = window
+		}
+	}
+	if files.TmuxID == "" || agent.TmuxID == "" {
+		t.Fatalf("baseline runtime identities missing: files=%+v agent=%+v", files, agent)
+	}
+	tmuxOut(t, "rename-window", "-t", files.TmuxID, "yazi")
+	preservePID := tmuxOut(t, "display-message", "-p", "-t", files.TmuxID, "#{pane_pid}")
+	codexIndex := 10
+	if err := exec.Command("tmux", "kill-window", "-t", agent.TmuxID).Run(); err != nil {
+		t.Fatalf("close agent window: %v", err)
+	}
+	codexID := tmuxOut(t, "new-window", "-d", "-P", "-F", "#{window_id}", "-t", "="+name+":"+strconv.Itoa(codexIndex), "-n", "codex", "-c", "/tmp", "sleep", "305")
+	tmuxOut(t, "set-option", "-w", "-t", codexID, "automatic-rename", "off")
+	tmuxOut(t, "rename-window", "-t", codexID, "codex")
+	tmuxOut(t, "select-window", "-t", files.TmuxID)
+
+	firstReport, err := ReconcileSession(context.Background(), ctl, st, name, false)
+	if err != nil {
+		t.Fatalf("first reconcile: %v", err)
+	}
+	if !strings.Contains(firstReport, "1 recreated") {
+		t.Fatalf("first report = %q; want one recreated baseline window", firstReport)
+	}
+	if got := tmuxOut(t, "display-message", "-p", "-t", files.TmuxID, "#{pane_pid}"); got != preservePID {
+		t.Fatalf("files pane process changed: got %s want %s", got, preservePID)
+	}
+	secondReport, err := ReconcileSession(context.Background(), ctl, st, name, false)
+	if err != nil {
+		t.Fatalf("second reconcile: %v", err)
+	}
+	if !strings.Contains(secondReport, "already aligned") || !strings.Contains(secondReport, "preserved 1 extra window") {
+		t.Fatalf("second report = %q; want no-op with Codex preserved", secondReport)
+	}
+	if got := tmuxOut(t, "list-windows", "-t", "="+name, "-F", "#{window_name}"); strings.Count(got, "agent") != 1 || strings.Count(got, "codex") != 1 {
+		t.Fatalf("window names after two reconciles = %q; want one agent and one codex", got)
+	}
+	if got := tmuxOut(t, "display-message", "-p", "-t", codexID, "#{window_id}"); got != codexID {
+		t.Fatalf("Codex runtime window changed: got %q want %q", got, codexID)
+	}
+}
+
+func TestReconcileLooksUpBaselineBySessionLogicalIDAfterRename(t *testing.T) {
+	root := tmuxtest.Isolate(t)
+	st, err := store.OpenWithConfig(&config.Config{DataDir: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	ctl, _ := tmux.New()
+	base := &model.Session{Name: "rename-old", Cwd: "/tmp", Windows: []model.Window{{Name: "editor", Cwd: "/tmp", Panes: []model.Pane{{Cmd: "sleep 300", Cwd: "/tmp"}}}}}
+	if err := ctl.Load(context.Background(), base); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := FreezeRemember(ctl, st, base.Name); err != nil {
+		t.Fatal(err)
+	}
+	frozen, err := st.GetBaseline(base.Name)
+	if err != nil || frozen == nil || frozen.LogicalID == "" {
+		t.Fatalf("baseline identity = %+v err=%v", frozen, err)
+	}
+	tmuxOut(t, "rename-session", "-t", base.Name, "rename-new")
+	report, err := ReconcileSession(context.Background(), ctl, st, "rename-new", false)
+	if err != nil {
+		t.Fatalf("reconcile renamed session: %v", err)
+	}
+	if report != "" {
+		t.Fatalf("aligned renamed session report = %q", report)
+	}
+	if old, err := st.GetBaseline("rename-old"); err != nil || old != nil {
+		t.Fatalf("old baseline name lookup = %+v err=%v", old, err)
+	}
+	renamed, err := st.GetBaselineByLogicalID(frozen.LogicalID)
+	if err != nil || renamed == nil || renamed.Name != "rename-new" {
+		t.Fatalf("logical baseline after rename = %+v err=%v", renamed, err)
+	}
+}
+
+func TestEquivalentUntaggedWindowsKeepProcesses(t *testing.T) {
+	root := tmuxtest.Isolate(t)
+	st, err := store.OpenWithConfig(&config.Config{DataDir: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	ctl, _ := tmux.New()
+	name := "untagged-group"
+	preset := &model.Session{Name: name, Cwd: "/tmp", Windows: []model.Window{
+		{Name: "editor-a", Cwd: "/tmp", Panes: []model.Pane{{Cmd: "sleep 300", Cwd: "/tmp"}}},
+		{Name: "editor-b", Cwd: "/tmp", Panes: []model.Pane{{Cmd: "sleep 301", Cwd: "/tmp"}}},
+		{Name: "anchor", Cwd: "/tmp", Panes: []model.Pane{{Cmd: "sleep 302", Cwd: "/tmp"}}},
+	}}
+	if err := ctl.Load(context.Background(), preset); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(200 * time.Millisecond)
+	frozen, err := EnsureLiveIdentities(context.Background(), ctl, name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := FreezeSave(st, frozen, false); err != nil {
+		t.Fatal(err)
+	}
+	var oldEditors []string
+	for _, window := range frozen.Windows {
+		if strings.HasPrefix(window.Name, "editor") {
+			oldEditors = append(oldEditors, window.TmuxID)
+		}
+	}
+	if len(oldEditors) != 2 {
+		t.Fatalf("baseline editor IDs = %v", oldEditors)
+	}
+	for _, id := range oldEditors {
+		tmuxOut(t, "kill-window", "-t", id)
+	}
+	tmuxOut(t, "new-window", "-d", "-t", "="+name+":7", "-n", "new-a", "-c", "/tmp", "sleep", "310")
+	tmuxOut(t, "new-window", "-d", "-t", "="+name+":8", "-n", "new-b", "-c", "/tmp", "sleep", "311")
+	before := tmuxOut(t, "list-windows", "-t", "="+name, "-F", "#{window_id}|#{window_name}")
+	idsBefore, err := ctl.Observe(context.Background(), name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	report, err := ReconcileSession(context.Background(), ctl, st, name, false)
+	if err != nil {
+		t.Fatalf("group reconcile returned error: %v", err)
+	}
+	if !strings.Contains(report, "interchangeable live group") {
+		t.Fatalf("equivalent-group report = %q", report)
+	}
+	after := tmuxOut(t, "list-windows", "-t", "="+name, "-F", "#{window_id}|#{window_name}")
+	if len(strings.Split(before, "\n")) != len(strings.Split(after, "\n")) {
+		t.Fatalf("equivalent-group reconciliation changed window count:\nbefore=%s\nafter=%s", before, after)
+	}
+	idsAfter, err := ctl.Observe(context.Background(), name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeIDs, afterIDs := map[string]bool{}, map[string]bool{}
+	for _, window := range idsBefore.Target.Windows {
+		beforeIDs[window.TmuxID] = true
+	}
+	for _, window := range idsAfter.Target.Windows {
+		afterIDs[window.TmuxID] = true
+		if window.SlotID == "" {
+			t.Fatalf("slot binding missing on window %s", window.TmuxID)
+		}
+	}
+	if len(beforeIDs) != len(afterIDs) {
+		t.Fatalf("window runtime identities changed: before=%v after=%v", beforeIDs, afterIDs)
+	}
+	for id := range beforeIDs {
+		if !afterIDs[id] {
+			t.Fatalf("live process window %s was replaced while resolving the untagged group", id)
+		}
+	}
+	second, err := ReconcileSession(context.Background(), ctl, st, name, false)
+	if err != nil {
+		t.Fatalf("second grouped reconcile: %v", err)
+	}
+	if second != "" || len(strings.Split(tmuxOut(t, "list-windows", "-t", "="+name, "-F", "#{window_id}"), "\n")) != len(afterIDs) {
+		t.Fatalf("second reconcile was not idempotent: report=%q", second)
 	}
 }

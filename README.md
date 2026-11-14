@@ -174,15 +174,18 @@ Shapes are automatically mirrored as editable JSON in `$XDG_CONFIG_HOME/gotomux/
 Reconciles the current or target session toward its recorded baseline layout:
 
 - Recreates dead windows and missing panes in their original layout positions with their starting commands.
-- Repairs the layout and name of surviving windows without killing their existing panes or processes.
+- Repairs split topology of surviving windows without killing their existing panes or processes.
+- Matches by session identity, window/pane slot tags, and runtime IDs; untagged live objects require multiple semantic signals. Names and indices never decide identity on their own.
 - Extra panes and windows added on the fly are preserved.
+- If a baseline lacks session or window/pane slot identities, reconciliation stops without mutation; freeze the intended session again with `gotomux -f`. Interchangeable untagged live objects are matched as a group while preserving their running processes.
 - The recorded baseline is the reconciliation target; editing a preset does not silently change an already-running session's target.
-- Existing sessions without either a baseline or saved preset must be frozen once with `gotomux -f` before reconciliation.
+- A saved preset does not identify a live session. Freeze the live session with `gotomux -f` before reconciliation when no complete baseline exists.
 
 Use `gotomux --reconcile --hard [session]` to recreate all windows and panes
-from the frozen baseline, including its saved tmux split layout. This terminates
-every current pane process and asks for confirmation. Add `--force` only when
-that prompt should be skipped.
+from the frozen baseline, including its saved tmux split layout, when the live
+topology differs. It terminates pane processes it replaces and asks for
+confirmation. Add `--force` only when that prompt should be skipped; it does not
+skip identity or verification checks.
 
 ### Ranking Model
 

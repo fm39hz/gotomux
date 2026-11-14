@@ -72,13 +72,23 @@ func windowBodyParts(t, session string, w model.Window) [][]string {
 }
 
 // MoveWindowTo addresses a surviving window by tmux's stable @window-id when
-// available. from is used only for legacy baselines without a runtime binding.
+// available. from is used only when no same-server runtime binding exists.
 func (c *Ctl) MoveWindowTo(ctx context.Context, session, windowID string, from, to int) error {
 	source := windowTarget(session, from)
 	if windowID != "" {
 		source = windowID
+		if strings.HasPrefix(session, "$") {
+			source = session + ":" + windowID
+		}
 	}
 	return tmuxRun(ctx, "move-window", "-s", source, "-t", windowTarget(session, to))
+}
+
+func (c *Ctl) LinkWindowTo(ctx context.Context, session, windowID string, idx int) error {
+	if !strings.HasPrefix(windowID, "@") {
+		return fmt.Errorf("link-window requires a tmux window ID")
+	}
+	return tmuxRun(ctx, "link-window", "-s", windowID, "-t", windowTarget(session, idx))
 }
 
 func (c *Ctl) KillWindowAt(ctx context.Context, session, windowID string, idx int) error {
@@ -102,7 +112,58 @@ func (c *Ctl) NewWindowAt(ctx context.Context, session string, idx int, w model.
 	}
 	parts := [][]string{nw}
 	parts = append(parts, windowBodyParts(t, session, w)...)
-	return c.runChain(ctx, parts...)
+	if err := c.runChain(ctx, parts...); err != nil {
+		return err
+	}
+	if w.SlotID == "" && noPaneSlotIDs(w.Panes) {
+		return nil
+	}
+	windowID, err := tmuxCmd(ctx, "display-message", "-p", "-t", windowTarget(session, idx), "#{window_id}")
+	if err != nil {
+		return fmt.Errorf("observe created window identity: %w", err)
+	}
+	windowID = strings.TrimSpace(windowID)
+	if !strings.HasPrefix(windowID, "@") {
+		return fmt.Errorf("created window at index %d returned invalid ID %q", idx, windowID)
+	}
+	if w.SlotID != "" {
+		if err := c.SetStableID(ctx, IdentityWindow, windowID, w.SlotID); err != nil {
+			return fmt.Errorf("tag created window %s: %w", windowID, err)
+		}
+	}
+	if len(w.Panes) == 0 {
+		return nil
+	}
+	paneRows, err := tmuxCmd(ctx, "list-panes", "-t", windowID, "-F", "#{pane_id}")
+	if err != nil {
+		return fmt.Errorf("observe created pane identities: %w", err)
+	}
+	paneIDs := strings.Split(paneRows, "\n")
+	if len(paneIDs) != len(w.Panes) {
+		return fmt.Errorf("created window %s has %d panes; expected %d", windowID, len(paneIDs), len(w.Panes))
+	}
+	for i, pane := range w.Panes {
+		if pane.SlotID == "" {
+			continue
+		}
+		paneID := strings.TrimSpace(paneIDs[i])
+		if !strings.HasPrefix(paneID, "%") {
+			return fmt.Errorf("created pane %d returned invalid ID %q", i, paneID)
+		}
+		if err := c.SetStableID(ctx, IdentityPane, paneID, pane.SlotID); err != nil {
+			return fmt.Errorf("tag created pane %s: %w", paneID, err)
+		}
+	}
+	return nil
+}
+
+func noPaneSlotIDs(panes []model.Pane) bool {
+	for _, pane := range panes {
+		if pane.SlotID != "" {
+			return false
+		}
+	}
+	return true
 }
 
 func (c *Ctl) AddPaneToWindow(ctx context.Context, session, windowID string, idx int, p model.Pane) error {

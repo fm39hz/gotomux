@@ -39,11 +39,11 @@ func TestObserveForksLearnsFromFreeze(t *testing.T) {
 	defer st.Close()
 
 	p := &model.Session{
-		Name: "proj", Cwd: "/work/x",
+		Name: "proj", LogicalID: "00000000-0000-4000-8000-000000000001", SchemaVersion: model.CurrentBaselineSchemaVersion, Cwd: "/work/x",
 		Windows: []model.Window{
-			{Name: "editor", Panes: []model.Pane{{Cmd: "nvim"}}},
-			{Name: "shell", Layout: "4080,158x35,0,0[1,2]", Panes: []model.Pane{{}, {}}},
-			{Name: "yazi", Panes: []model.Pane{{Cmd: "yazi"}}},
+			{SlotID: "00000000-0000-4000-8000-000000000002", Name: "editor", Panes: []model.Pane{{SlotID: "00000000-0000-4000-8000-000000000003", Cmd: "nvim"}}},
+			{SlotID: "00000000-0000-4000-8000-000000000004", Name: "shell", Layout: "4080,158x35,0,0[1,2]", Panes: []model.Pane{{SlotID: "00000000-0000-4000-8000-000000000005"}, {SlotID: "00000000-0000-4000-8000-000000000006"}}},
+			{SlotID: "00000000-0000-4000-8000-000000000007", Name: "yazi", Panes: []model.Pane{{SlotID: "00000000-0000-4000-8000-000000000008", Cmd: "yazi"}}},
 		},
 	}
 	// two freezes -> hit counts on the multi-window fork
@@ -51,11 +51,11 @@ func TestObserveForksLearnsFromFreeze(t *testing.T) {
 		t.Fatal(err)
 	}
 	p2 := &model.Session{
-		Name: "other", Cwd: "/work/y",
+		Name: "other", LogicalID: "00000000-0000-4000-8000-000000000009", SchemaVersion: model.CurrentBaselineSchemaVersion, Cwd: "/work/y",
 		Windows: []model.Window{
-			{Name: "ed", Panes: []model.Pane{{Cmd: "nvim"}}},
-			{Name: "sh", Layout: "even-vertical", Panes: []model.Pane{{}, {}}},
-			{Name: "files", Panes: []model.Pane{{Cmd: "yazi"}}},
+			{SlotID: "00000000-0000-4000-8000-000000000010", Name: "ed", Panes: []model.Pane{{SlotID: "00000000-0000-4000-8000-000000000011", Cmd: "nvim"}}},
+			{SlotID: "00000000-0000-4000-8000-000000000012", Name: "sh", Layout: "even-vertical", Panes: []model.Pane{{SlotID: "00000000-0000-4000-8000-000000000013"}, {SlotID: "00000000-0000-4000-8000-000000000014"}}},
+			{SlotID: "00000000-0000-4000-8000-000000000015", Name: "files", Panes: []model.Pane{{SlotID: "00000000-0000-4000-8000-000000000016", Cmd: "yazi"}}},
 		},
 	}
 	if _, _, err := FreezeSave(st, p2, true); err != nil {
@@ -70,10 +70,10 @@ func TestObserveForksLearnsFromFreeze(t *testing.T) {
 
 	// divergence: different tool set → different fork
 	p3 := &model.Session{
-		Name: "z", Cwd: "/z",
+		Name: "z", LogicalID: "00000000-0000-4000-8000-000000000017", SchemaVersion: model.CurrentBaselineSchemaVersion, Cwd: "/z",
 		Windows: []model.Window{
-			{Panes: []model.Pane{{Cmd: "nvim"}}},
-			{Panes: []model.Pane{{Cmd: "opencode"}}},
+			{SlotID: "00000000-0000-4000-8000-000000000018", Panes: []model.Pane{{SlotID: "00000000-0000-4000-8000-000000000019", Cmd: "nvim"}}},
+			{SlotID: "00000000-0000-4000-8000-000000000020", Panes: []model.Pane{{SlotID: "00000000-0000-4000-8000-000000000021", Cmd: "opencode"}}},
 		},
 	}
 	ObserveForks(st, p3)

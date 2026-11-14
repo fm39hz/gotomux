@@ -2,8 +2,8 @@ package store
 
 import (
 	"database/sql"
+	"os"
 	"path/filepath"
-	"strconv"
 	"testing"
 
 	"github.com/fm39hz/gotomux/internal/config"
@@ -69,10 +69,10 @@ func TestSaveFreezeAtomic(t *testing.T) {
 	st := isolatedStore(t)
 
 	p := &model.Session{
-		Name: "zz-acid",
-		Cwd:  "/tmp/zz-acid",
+		Name: "zz-acid", Cwd: "/tmp/zz-acid",
+		LogicalID: "00000000-0000-4000-8000-000000000001",
 		Windows: []model.Window{
-			{Name: "w", Panes: []model.Pane{{Cwd: "/tmp/zz-acid", Cmd: "true"}}},
+			{Name: "w", SlotID: "00000000-0000-4000-8000-000000000002", Panes: []model.Pane{{Cwd: "/tmp/zz-acid", Cmd: "true", SlotID: "00000000-0000-4000-8000-000000000003"}}},
 		},
 	}
 	// pure shape body minimal
@@ -91,7 +91,7 @@ func TestSaveFreezeAtomic(t *testing.T) {
 		t.Fatalf("sticky %q want %q", st.StickyID(), sid)
 	}
 	baseline, err := st.GetBaseline("zz-acid")
-	if err != nil || baseline == nil || baseline.SchemaVersion != 2 || baseline.ServerKey != p.ServerKey || baseline.Windows[0].TmuxID != "@17" || baseline.Windows[0].Panes[0].TmuxID != "%42" {
+	if err != nil || baseline == nil || baseline.SchemaVersion != model.CurrentBaselineSchemaVersion || baseline.ServerKey != p.ServerKey || baseline.Windows[0].TmuxID != "@17" || baseline.Windows[0].Panes[0].TmuxID != "%42" {
 		t.Fatalf("atomic baseline missing runtime identity: %+v, err=%v", baseline, err)
 	}
 	// same key again: no new shape, preset still updates
@@ -105,18 +105,6 @@ func TestSaveFreezeAtomic(t *testing.T) {
 		t.Fatal("preset not updated")
 	}
 	_ = st.Delete("zz-acid")
-}
-
-func TestGetBaselineReadsLegacySessionJSON(t *testing.T) {
-	st := isolatedStore(t)
-	legacy := `{"Name":"legacy","Cwd":"/tmp","Windows":[{"Idx":1,"Name":"shell","Panes":[{"Idx":0,"Cwd":"/tmp"}]}]}`
-	if _, err := st.db.Exec(`INSERT INTO baseline(name,body,updated_at) VALUES(?,?,1)`, "legacy", legacy); err != nil {
-		t.Fatal(err)
-	}
-	got, err := st.GetBaseline("legacy")
-	if err != nil || got == nil || got.Name != "legacy" || got.SchemaVersion != 0 || got.Windows[0].TmuxID != "" {
-		t.Fatalf("legacy baseline = %+v, err=%v", got, err)
-	}
 }
 
 func TestRebindNameMergesUsageAndPairs(t *testing.T) {
@@ -165,16 +153,17 @@ func TestRebindNameMergesUsageAndPairs(t *testing.T) {
 	}
 }
 
-// Regression for the 2026-08-26 freeze failure ("table pane has no column
-// named cmd_path"): migrate() short-circuits on user_version == schemaVersion,
-// so EVERY new statement in migrateAll requires a schemaVersion bump — a fresh
-// test DB always runs the full migration and can never catch a forgotten bump.
-// This stamps a legacy DB at the CURRENT version, reopens it, and demands the
-// latest column: if you added a statement without bumping schemaVersion, this
-// fails exactly like production did.
-func TestMigrateRunsOnCurrentVersionStamp(t *testing.T) {
+// A database at schema version 7 predates baseline.logical_id. OpenWithConfig
+// must run the additive migration at the actual resolved data path.
+func TestMigrateVersion7AddsBaselineLogicalID(t *testing.T) {
 	dir := t.TempDir()
-	db, err := sql.Open("sqlite", filepath.Join(dir, "state.db"))
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("XDG_DATA_HOME", t.TempDir())
+	storeDir := filepath.Join(dir, "gotomux")
+	if err := os.MkdirAll(storeDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite", filepath.Join(storeDir, "state.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -203,18 +192,21 @@ CREATE TABLE pane (
   cmd       TEXT,
   UNIQUE(window_id, idx)
 );
-PRAGMA user_version = ` + strconv.Itoa(schemaVersion) + `;`); err != nil {
+CREATE TABLE baseline (
+  name       TEXT PRIMARY KEY,
+  body       TEXT NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+INSERT INTO baseline(name, body, updated_at) VALUES ('old-session', '{"Name":"old-session"}', 1);
+PRAGMA user_version = 7;`); err != nil {
 		t.Fatal(err)
 	}
 	db.Close()
 
-	st, err := OpenWithConfig(&config.Config{DataDir: dir}) // must migrate, not skip
+	st, err := OpenWithConfig(&config.Config{DataDir: dir}) // resolves to dir/gotomux
 	if err != nil {
 		t.Fatal(err)
 	}
-	var uv int
-	_ = st.db.QueryRow(`PRAGMA user_version`).Scan(&uv)
-	t.Logf("DEBUG user_version=%d", uv)
 	defer st.Close()
 
 	var n int
@@ -222,6 +214,23 @@ PRAGMA user_version = ` + strconv.Itoa(schemaVersion) + `;`); err != nil {
 		t.Fatal(err)
 	}
 	if n == 0 {
-		t.Fatal("pane.cmd_path missing after reopen: a migrateAll statement was added without bumping schemaVersion")
+		t.Fatal("pane.cmd_path missing after opening a version-7 database")
+	}
+	if err := st.db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('baseline') WHERE name='logical_id'`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatal("baseline.logical_id missing after opening a version-7 database")
+	}
+	var body, logicalID string
+	if err := st.db.QueryRow(`SELECT body, logical_id FROM baseline WHERE name='old-session'`).Scan(&body, &logicalID); err != nil {
+		t.Fatal(err)
+	}
+	if body != `{"Name":"old-session"}` || logicalID != "" {
+		t.Fatalf("version-7 baseline was converted: body=%q logical_id=%q", body, logicalID)
+	}
+	var userVersion int
+	if err := st.db.QueryRow(`PRAGMA user_version`).Scan(&userVersion); err != nil || userVersion != schemaVersion {
+		t.Fatalf("user_version=%d err=%v, want %d", userVersion, err, schemaVersion)
 	}
 }

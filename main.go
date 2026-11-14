@@ -73,12 +73,12 @@ func main() {
 			}
 			return
 		case "-r", "--reconcile":
-			name, hard, force, err := parseReconcileArgs(os.Args[2:])
+			opts, err := parseReconcileArgs(os.Args[2:])
 			if err != nil {
 				fmt.Fprintln(os.Stderr, err)
 				os.Exit(2)
 			}
-			if err := reconcileCLI(cfg, name, hard, force); err != nil && !errors.Is(err, errCancel) {
+			if err := reconcileCLI(cfg, opts); err != nil && !errors.Is(err, errCancel) {
 				fmt.Fprintln(os.Stderr, err)
 				os.Exit(1)
 			}
@@ -605,7 +605,13 @@ func freezeCLI(cfg *config.Config, name string) error {
 // reconcileCLI brings a session toward its recorded baseline layout.
 // Deliberately standalone: reconciliation is a rare, interactive action, not
 // a hot path.
-func reconcileCLI(cfg *config.Config, name string, hard, force bool) error {
+type reconcileCLIOptions struct {
+	Name  string
+	Hard  bool
+	Force bool
+}
+
+func reconcileCLI(cfg *config.Config, opts reconcileCLIOptions) error {
 	ctl, err := tmux.New()
 	if err != nil {
 		return fmt.Errorf("tmux: %w", err)
@@ -615,17 +621,17 @@ func reconcileCLI(cfg *config.Config, name string, hard, force bool) error {
 		return fmt.Errorf("store: %w", err)
 	}
 	defer st.Close()
-	if name == "" {
-		name = ctl.CurrentSession(context.Background())
+	if opts.Name == "" {
+		opts.Name = ctl.CurrentSession(context.Background())
 	}
-	if name == "" {
+	if opts.Name == "" {
 		return fmt.Errorf("no active session: run gotomux -r/--reconcile inside tmux or pass a session name")
 	}
-	if hard && !force && !confirmHardReconcile(name) {
+	if opts.Hard && !opts.Force && !confirmHardReconcile(opts.Name) {
 		return errCancel
 	}
 	stop := picker.HoldInterrupt()
-	report, err := template.ReconcileSession(context.Background(), ctl, st, name, hard)
+	report, err := template.ReconcileSession(context.Background(), ctl, st, opts.Name, opts.Hard)
 	stop()
 	if err != nil {
 		return err
@@ -636,27 +642,28 @@ func reconcileCLI(cfg *config.Config, name string, hard, force bool) error {
 	return nil
 }
 
-func parseReconcileArgs(args []string) (name string, hard, force bool, err error) {
+func parseReconcileArgs(args []string) (reconcileCLIOptions, error) {
+	var opts reconcileCLIOptions
 	for _, arg := range args {
 		switch arg {
 		case "--hard":
-			hard = true
+			opts.Hard = true
 		case "--force":
-			force = true
+			opts.Force = true
 		default:
 			if strings.HasPrefix(arg, "-") {
-				return "", false, false, fmt.Errorf("unknown reconcile option %q", arg)
+				return reconcileCLIOptions{}, fmt.Errorf("unknown reconcile option %q", arg)
 			}
-			if name != "" {
-				return "", false, false, fmt.Errorf("reconcile accepts one session name")
+			if opts.Name != "" {
+				return reconcileCLIOptions{}, fmt.Errorf("reconcile accepts one session name")
 			}
-			name = arg
+			opts.Name = arg
 		}
 	}
-	if force && !hard {
-		return "", false, false, fmt.Errorf("--force requires --hard")
+	if opts.Force && !opts.Hard {
+		return reconcileCLIOptions{}, fmt.Errorf("--force requires --hard")
 	}
-	return name, hard, force, nil
+	return opts, nil
 }
 
 func confirmHardReconcile(name string) bool {
