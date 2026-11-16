@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"io"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/fm39hz/gotomux/internal/config"
 	"github.com/fm39hz/gotomux/internal/model"
+	"github.com/fm39hz/gotomux/internal/store/dbgen"
 )
 
 type Storer interface {
@@ -74,8 +76,11 @@ type Storer interface {
 
 type Store struct {
 	db  *sql.DB
+	q   *dbgen.Queries
 	cfg *config.Config
 }
+
+var storeContext = context.Background()
 
 func Open() (*Store, error) { return OpenWithConfig(nil) }
 
@@ -93,19 +98,28 @@ func OpenWithConfig(cfg *config.Config) (*Store, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
 	}
-	_ = migrateLegacyDB(dir)
+	unlock, err := acquireMigrationLock(dir)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = unlock() }()
+	if err := migrateLegacyDB(dir); err != nil {
+		return nil, fmt.Errorf("copy legacy database: %w", err)
+	}
 	db, err := sql.Open("sqlite", filepath.Join(dir, "state.db"))
 	if err != nil {
 		return nil, err
 	}
 	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(1)
-	s := &Store{db: db, cfg: cfg}
+	s := &Store{db: db, q: dbgen.New(db), cfg: cfg}
 	if err := s.pragma(); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
-	if err := s.migrate(); err != nil {
+	ctx, cancel := context.WithTimeout(context.Background(), migrationLockTimeout)
+	defer cancel()
+	if err := migrateDB(ctx, db); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
@@ -213,8 +227,7 @@ func hasSessionRows(dbPath string) bool {
 		return false
 	}
 	defer db.Close()
-	var n int
-	err = db.QueryRow(`SELECT COUNT(*) FROM session`).Scan(&n)
+	n, err := dbgen.New(db).CountSessionRows(context.Background())
 	return err == nil && n > 0
 }
 
@@ -245,248 +258,4 @@ func (s *Store) Ping() error {
 	return s.db.Ping()
 }
 
-// schemaVersion is bumped whenever migrate() gains a statement. It gates the
-// whole migration behind one PRAGMA read: the CREATE TABLE IF NOT EXISTS
-// statements and pragma_table_info probes are individually cheap but there are
-// fifteen of them, on the cold path of every invocation, to do nothing.
-// The migration itself stays additive-only and idempotent — the fast path is an
-// optimisation, not a replacement, so a DB from a future version or one that
-// somehow lost user_version still gets the full run.
-const schemaVersion = 8
-
-func (s *Store) migrate() error {
-	var have int
-	if err := s.db.QueryRow(`PRAGMA user_version`).Scan(&have); err == nil && have == schemaVersion {
-		return nil
-	}
-	if err := s.migrateAll(); err != nil {
-		return err
-	}
-	_, _ = s.db.Exec(fmt.Sprintf(`PRAGMA user_version = %d`, schemaVersion))
-	return nil
-}
-
-func (s *Store) migrateAll() error {
-	_, err := s.db.Exec(`
-PRAGMA foreign_keys = ON;
-CREATE TABLE IF NOT EXISTS session (
-  name       TEXT PRIMARY KEY,
-  cwd        TEXT NOT NULL,
-  created_at INTEGER NOT NULL,
-  last_used  INTEGER NOT NULL DEFAULT 0
-);
-CREATE TABLE IF NOT EXISTS window (
-  id      INTEGER PRIMARY KEY,
-  session TEXT NOT NULL REFERENCES session(name) ON DELETE CASCADE,
-  idx     INTEGER NOT NULL,
-  name    TEXT NOT NULL DEFAULT '',
-  cwd     TEXT NOT NULL DEFAULT '',
-  layout  TEXT,
-  UNIQUE(session, idx)
-);
-CREATE TABLE IF NOT EXISTS pane (
-  id        INTEGER PRIMARY KEY,
-  window_id INTEGER NOT NULL REFERENCES window(id) ON DELETE CASCADE,
-  idx       INTEGER NOT NULL,
-  cwd       TEXT,
-  cmd       TEXT,
-  UNIQUE(window_id, idx)
-);
-`)
-	if err != nil {
-		return err
-	}
-	// soft-migrate older DBs missing window.cwd
-	var n int
-	_ = s.db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('window') WHERE name='cwd'`).Scan(&n)
-	if n == 0 {
-		_, _ = s.db.Exec(`ALTER TABLE window ADD COLUMN cwd TEXT NOT NULL DEFAULT ''`)
-	}
-	// soft-migrate older DBs missing pane.cmd_path
-	_ = s.db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('pane') WHERE name='cmd_path'`).Scan(&n)
-	if n == 0 {
-		_, _ = s.db.Exec(`ALTER TABLE pane ADD COLUMN cmd_path TEXT NOT NULL DEFAULT ''`)
-	}
-	if _, err = s.db.Exec(`
-CREATE TABLE IF NOT EXISTS usage (
-  name      TEXT PRIMARY KEY,
-  opens     INTEGER NOT NULL DEFAULT 0,
-  kills     INTEGER NOT NULL DEFAULT 0,
-  last_open INTEGER NOT NULL DEFAULT 0,
-  last_kill INTEGER NOT NULL DEFAULT 0
-);`); err != nil {
-		return err
-	}
-	if _, err = s.db.Exec(`
-CREATE TABLE IF NOT EXISTS pair (
-  a        TEXT NOT NULL,
-  b        TEXT NOT NULL,
-  n        INTEGER NOT NULL DEFAULT 0,
-  last     INTEGER NOT NULL DEFAULT 0,
-  PRIMARY KEY (a, b)
-);`); err != nil {
-		return err
-	}
-	if _, err = s.db.Exec(`
-CREATE TABLE IF NOT EXISTS transition (
-  prev TEXT NOT NULL,
-  next TEXT NOT NULL,
-  n    INTEGER NOT NULL DEFAULT 0,
-  last INTEGER NOT NULL DEFAULT 0,
-  PRIMARY KEY (prev, next)
-);`); err != nil {
-		return err
-	}
-	if _, err = s.db.Exec(`
-CREATE TABLE IF NOT EXISTS zox_meta (
-  id      INTEGER PRIMARY KEY CHECK (id = 1),
-  updated INTEGER NOT NULL DEFAULT 0,
-  sig     TEXT NOT NULL DEFAULT ''
-);
-CREATE TABLE IF NOT EXISTS zox_item (
-  ord     INTEGER PRIMARY KEY,
-  name    TEXT NOT NULL,
-  path    TEXT NOT NULL,
-  title   TEXT NOT NULL DEFAULT '',
-  desc    TEXT NOT NULL DEFAULT '',
-  recency INTEGER NOT NULL DEFAULT 0
-);`); err != nil {
-		return err
-	}
-	// root_neg remembers which paths a FindProjectRoot walk already proved
-	// markerless, so the next derive within RootNegTTL skips those walks
-	// entirely (see root_neg.go).
-	if _, err = s.db.Exec(`
-CREATE TABLE IF NOT EXISTS root_neg (
-  path    TEXT PRIMARY KEY,
-  checked INTEGER NOT NULL
-);`); err != nil {
-		return err
-	}
-	if _, err = s.db.Exec(`
-CREATE TABLE IF NOT EXISTS shape (
-  id         TEXT PRIMARY KEY,
-  key        TEXT NOT NULL UNIQUE,
-  body       TEXT NOT NULL,
-  created_at INTEGER NOT NULL DEFAULT 0,
-  updated_at INTEGER NOT NULL DEFAULT 0,
-  mirror_path TEXT NOT NULL DEFAULT '',
-  mirror_sig  TEXT NOT NULL DEFAULT ''
-);
-CREATE TABLE IF NOT EXISTS sticky (
-  id       INTEGER PRIMARY KEY CHECK (id = 1),
-  shape_id TEXT NOT NULL DEFAULT 'default'
-);`); err != nil {
-		return err
-	}
-	// Old DBs have shape without updated_at (CREATE IF NOT EXISTS does not alter).
-	//
-	// The ALTER and its backfill go in one transaction: a crash between them left
-	// every shape at updated_at = 0, which makes the config mirror's
-	// `mtime > dbUpd` comparison always pick the file — so any hand-edited shape
-	// file would win over the DB forever, with nothing to indicate why.
-	var shapeHasUpdated int
-	_ = s.db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('shape') WHERE name='updated_at'`).Scan(&shapeHasUpdated)
-	if shapeHasUpdated == 0 {
-		tx, txErr := s.db.Begin()
-		if txErr != nil {
-			return txErr
-		}
-		if _, err := tx.Exec(`ALTER TABLE shape ADD COLUMN updated_at INTEGER NOT NULL DEFAULT 0`); err != nil {
-			_ = tx.Rollback()
-			return err
-		}
-		if _, err := tx.Exec(`UPDATE shape SET updated_at = created_at WHERE updated_at = 0`); err != nil {
-			_ = tx.Rollback()
-			return err
-		}
-		if err := tx.Commit(); err != nil {
-			return err
-		}
-	}
-	// Old DBs have shape without the mirror bookkeeping columns.
-	for _, col := range []string{"mirror_path", "mirror_sig"} {
-		var has int
-		_ = s.db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('shape') WHERE name = ?`, col).Scan(&has)
-		if has == 0 {
-			if _, err := s.db.Exec(`ALTER TABLE shape ADD COLUMN ` + col + ` TEXT NOT NULL DEFAULT ''`); err != nil {
-				return err
-			}
-		}
-	}
-
-	// Old DBs have zox_meta without sig.
-	var zoxHasSig int
-	_ = s.db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('zox_meta') WHERE name='sig'`).Scan(&zoxHasSig)
-	if zoxHasSig == 0 {
-		if _, err := s.db.Exec(`ALTER TABLE zox_meta ADD COLUMN sig TEXT NOT NULL DEFAULT ''`); err != nil {
-			return err
-		}
-	}
-	if _, err = s.db.Exec(`
-CREATE TABLE IF NOT EXISTS placement (
-  shape_id TEXT NOT NULL,
-  pattern  TEXT NOT NULL,
-  n        INTEGER NOT NULL DEFAULT 0,
-  last     INTEGER NOT NULL DEFAULT 0,
-  PRIMARY KEY (shape_id, pattern)
-);`); err != nil {
-		return err
-	}
-	// fork: window-level essence units learned from freeze/sticky (silent).
-	// key = paneCount|split|tools - same key = same reusable unit.
-	if _, err = s.db.Exec(`
-CREATE TABLE IF NOT EXISTS fork (
-  key      TEXT PRIMARY KEY,
-  body     TEXT NOT NULL DEFAULT '',
-  n        INTEGER NOT NULL DEFAULT 0,
-  last     INTEGER NOT NULL DEFAULT 0
-);`); err != nil {
-		return err
-	}
-	// Schema 4: class-based fork keys (editor,shell) replace hashed keys (2942bbbd…);
-	// old fork data is stale — clear it. Reset mirror metadata so reconcileConfigShapes
-	// re-writes all files with new JSON format (class fields + class-based fork keys).
-	if _, err = s.db.Exec(`
-CREATE TABLE IF NOT EXISTS baseline (
-  name       TEXT PRIMARY KEY,
-  body       TEXT NOT NULL,
-  updated_at INTEGER NOT NULL,
-  logical_id TEXT NOT NULL DEFAULT ''
-);`); err != nil {
-		return err
-	}
-	var baselineHasLogicalID int
-	_ = s.db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('baseline') WHERE name='logical_id'`).Scan(&baselineHasLogicalID)
-	if baselineHasLogicalID == 0 {
-		if _, err := s.db.Exec(`ALTER TABLE baseline ADD COLUMN logical_id TEXT NOT NULL DEFAULT ''`); err != nil {
-			return err
-		}
-	}
-	if _, err := s.db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_baseline_logical_id ON baseline(logical_id) WHERE logical_id <> ''`); err != nil {
-		return err
-	}
-	if _, err := s.db.Exec(`
-CREATE TABLE IF NOT EXISTS reconcile_journal (
-  id                 TEXT PRIMARY KEY,
-  session_key        TEXT NOT NULL,
-  session_name       TEXT NOT NULL,
-  session_logical_id TEXT NOT NULL DEFAULT '',
-  policy             TEXT NOT NULL,
-  status             TEXT NOT NULL,
-  plan_json          TEXT NOT NULL,
-  completed_step     INTEGER NOT NULL DEFAULT 0,
-  last_error         TEXT NOT NULL DEFAULT '',
-  created_at         INTEGER NOT NULL,
-  updated_at         INTEGER NOT NULL
-);`); err != nil {
-		return err
-	}
-	if _, err := s.db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_reconcile_active_session ON reconcile_journal(session_key) WHERE status IN ('planned','running','needs_attention')`); err != nil {
-		return err
-	}
-	_, _ = s.db.Exec(`DELETE FROM fork`)
-	_, _ = s.db.Exec(`UPDATE shape SET mirror_path = '', mirror_sig = ''`)
-	_, err = s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_session_last_used ON session(last_used DESC)`)
-	return err
-}
+const schemaVersion = currentSchemaVersion

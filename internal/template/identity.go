@@ -16,6 +16,16 @@ type IdentityOps interface {
 }
 
 func EnsureLiveIdentities(ctx context.Context, ops IdentityOps, targetName string) (*model.Session, error) {
+	return ensureLiveIdentities(ctx, ops, targetName, nil)
+}
+
+// EnsureLiveIdentitiesFromPreset preserves the persisted session and slot IDs
+// while assigning them to the exact runtime objects created from that preset.
+func EnsureLiveIdentitiesFromPreset(ctx context.Context, ops IdentityOps, targetName string, preferred *model.Session) (*model.Session, error) {
+	return ensureLiveIdentities(ctx, ops, targetName, preferred)
+}
+
+func ensureLiveIdentities(ctx context.Context, ops IdentityOps, targetName string, preferred *model.Session) (*model.Session, error) {
 	if ops == nil {
 		return nil, fmt.Errorf("identity assignment: nil tmux identity port")
 	}
@@ -26,9 +36,35 @@ func EnsureLiveIdentities(ctx context.Context, ops IdentityOps, targetName strin
 	if err := validateIdentitySnapshot(snapshot, targetName); err != nil {
 		return nil, err
 	}
+	if preferred != nil {
+		if preferred.Name != targetName || len(preferred.Windows) != len(snapshot.Target.Windows) {
+			return nil, fmt.Errorf("preset identity tree does not match loaded session topology")
+		}
+		for i := range preferred.Windows {
+			if len(preferred.Windows[i].Panes) != len(snapshot.Target.Windows[i].Panes) {
+				return nil, fmt.Errorf("preset identity tree window %d does not match loaded pane topology", i)
+			}
+		}
+	}
 	seen := logicalIDOwners(snapshot.Objects)
-	assign := func(kind tmux.IdentityKind, runtimeID, current string) error {
+	assign := func(kind tmux.IdentityKind, runtimeID, current, preferredID string) error {
 		if current != "" {
+			if preferredID != "" && current != preferredID {
+				return fmt.Errorf("loaded %s %s has logical ID %s, preset requires %s", kind, runtimeID, current, preferredID)
+			}
+			return nil
+		}
+		if preferredID != "" {
+			if err := identity.Validate(preferredID); err != nil {
+				return fmt.Errorf("preset contains malformed %s identity: %w", kind, err)
+			}
+			if owner, exists := seen[preferredID]; exists {
+				return fmt.Errorf("preset %s identity %s is already owned by %s", kind, preferredID, owner)
+			}
+			if err := ops.SetStableID(ctx, kind, runtimeID, preferredID); err != nil {
+				return fmt.Errorf("assign preset %s identity to %s: %w", kind, runtimeID, err)
+			}
+			seen[preferredID] = objectKey(kind, runtimeID)
 			return nil
 		}
 		id, err := newUniqueID(seen)
@@ -41,15 +77,27 @@ func EnsureLiveIdentities(ctx context.Context, ops IdentityOps, targetName strin
 		seen[id] = objectKey(kind, runtimeID)
 		return nil
 	}
-	if err := assign(tmux.IdentitySession, snapshot.Target.TmuxID, snapshot.Target.LogicalID); err != nil {
+	preferredSessionID := ""
+	if preferred != nil {
+		preferredSessionID = preferred.LogicalID
+	}
+	if err := assign(tmux.IdentitySession, snapshot.Target.TmuxID, snapshot.Target.LogicalID, preferredSessionID); err != nil {
 		return nil, fmt.Errorf("identity assignment may be partial; rerun to resume: %w", err)
 	}
-	for _, window := range snapshot.Target.Windows {
-		if err := assign(tmux.IdentityWindow, window.TmuxID, window.SlotID); err != nil {
+	for wi, window := range snapshot.Target.Windows {
+		preferredWindowID := ""
+		if preferred != nil {
+			preferredWindowID = preferred.Windows[wi].SlotID
+		}
+		if err := assign(tmux.IdentityWindow, window.TmuxID, window.SlotID, preferredWindowID); err != nil {
 			return nil, fmt.Errorf("identity assignment may be partial; rerun to resume: %w", err)
 		}
-		for _, pane := range window.Panes {
-			if err := assign(tmux.IdentityPane, pane.TmuxID, pane.SlotID); err != nil {
+		for pi, pane := range window.Panes {
+			preferredPaneID := ""
+			if preferred != nil {
+				preferredPaneID = preferred.Windows[wi].Panes[pi].SlotID
+			}
+			if err := assign(tmux.IdentityPane, pane.TmuxID, pane.SlotID, preferredPaneID); err != nil {
 				return nil, fmt.Errorf("identity assignment may be partial; rerun to resume: %w", err)
 			}
 		}

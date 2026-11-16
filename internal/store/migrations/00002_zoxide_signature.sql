@@ -1,0 +1,2 @@
+-- +goose Up
+ALTER TABLE zox_meta ADD COLUMN sig TEXT NOT NULL DEFAULT '';

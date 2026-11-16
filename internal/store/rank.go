@@ -4,6 +4,8 @@ import (
 	"log"
 	"strings"
 	"time"
+
+	"github.com/fm39hz/gotomux/internal/store/dbgen"
 )
 
 // Usage is per-session connect/kill stats for frecency ranking.
@@ -21,13 +23,7 @@ func (s *Store) RecordOpen(name string) error {
 		return nil
 	}
 	now := time.Now().Unix()
-	_, err := s.db.Exec(`
-INSERT INTO usage(name, opens, kills, last_open, last_kill) VALUES(?, 1, 0, ?, 0)
-ON CONFLICT(name) DO UPDATE SET
-  opens = opens + 1,
-  last_open = excluded.last_open
-`, name, now)
-	return err
+	return s.q.RecordOpen(storeContext, dbgen.RecordOpenParams{Name: name, LastOpen: now})
 }
 
 // RecordKill increments kill count (ctrl-x / explicit kill).
@@ -36,31 +32,20 @@ func (s *Store) RecordKill(name string) error {
 		return nil
 	}
 	now := time.Now().Unix()
-	_, err := s.db.Exec(`
-INSERT INTO usage(name, opens, kills, last_open, last_kill) VALUES(?, 0, 1, 0, ?)
-ON CONFLICT(name) DO UPDATE SET
-  kills = kills + 1,
-  last_kill = excluded.last_kill
-`, name, now)
-	return err
+	return s.q.RecordKill(storeContext, dbgen.RecordKillParams{Name: name, LastKill: now})
 }
 
 // AllUsage returns name -> usage for ranking merge.
 func (s *Store) AllUsage() (map[string]Usage, error) {
-	rows, err := s.db.Query(`SELECT name, opens, kills, last_open, last_kill FROM usage`)
+	rows, err := s.q.AllUsage(storeContext)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
 	out := map[string]Usage{}
-	for rows.Next() {
-		var u Usage
-		if err := rows.Scan(&u.Name, &u.Opens, &u.Kills, &u.LastOpen, &u.LastKill); err != nil {
-			return nil, err
-		}
-		out[u.Name] = u
+	for _, row := range rows {
+		out[row.Name] = Usage{Name: row.Name, Opens: row.Opens, Kills: row.Kills, LastOpen: row.LastOpen, LastKill: row.LastKill}
 	}
-	return out, rows.Err()
+	return out, nil
 }
 
 // RecordPair bumps undirected co-occurrence (a,b) with day-decay friendly counters.
@@ -74,13 +59,7 @@ func (s *Store) RecordPair(a, b string) error {
 		a, b = b, a
 	}
 	now := time.Now().Unix()
-	_, err := s.db.Exec(`
-INSERT INTO pair(a, b, n, last) VALUES(?, ?, 1, ?)
-ON CONFLICT(a, b) DO UPDATE SET
-  n = n + 1,
-  last = excluded.last
-`, a, b, now)
-	return err
+	return s.q.RecordPair(storeContext, dbgen.RecordPairParams{A: a, B: b, Last: now})
 }
 
 // RecordPairsWithLive records pairs between name and every other live session.
@@ -102,34 +81,27 @@ func (s *Store) PairScores(ctx string, now int64) (map[string]int64, error) {
 	if now <= 0 {
 		now = time.Now().Unix()
 	}
-	rows, err := s.db.Query(`
-SELECT a, b, n, last FROM pair WHERE a = ? OR b = ?
-`, ctx, ctx)
+	rows, err := s.q.PairRowsForSession(storeContext, dbgen.PairRowsForSessionParams{A: ctx, B: ctx})
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
 	out := map[string]int64{}
-	for rows.Next() {
-		var a, b string
-		var n, last int64
-		if err := rows.Scan(&a, &b, &n, &last); err != nil {
-			return nil, err
-		}
-		other := b
-		if a != ctx {
-			other = a
+	for _, row := range rows {
+		other := row.B
+		if row.A != ctx {
+			other = row.A
 		}
 		age := int64(0)
-		if last > 0 && now >= last {
-			age = (now - last) / 86400
+		if row.Last > 0 && now >= row.Last {
+			age = (now - row.Last) / 86400
 		}
+		n := row.N
 		if n > 10_000 {
 			n = 10_000
 		}
 		out[other] = n * 1000 / (1 + age)
 	}
-	return out, rows.Err()
+	return out, nil
 }
 
 // RecordTransition bumps directed prev->next frequency. Unlike pair (undirected
@@ -141,13 +113,7 @@ func (s *Store) RecordTransition(from, to string) error {
 		return nil
 	}
 	now := time.Now().Unix()
-	_, err := s.db.Exec(`
-INSERT INTO transition(prev, next, n, last) VALUES(?, ?, 1, ?)
-ON CONFLICT(prev, next) DO UPDATE SET
-  n = n + 1,
-  last = excluded.last
-`, from, to, now)
-	return err
+	return s.q.RecordTransition(storeContext, dbgen.RecordTransitionParams{Prev: from, Next: to, Last: now})
 }
 
 // TransitionScores returns map[nextName]decayedScore for switches INTO next
@@ -161,28 +127,21 @@ func (s *Store) TransitionScores(ctx string, now int64) (map[string]int64, error
 	if now <= 0 {
 		now = time.Now().Unix()
 	}
-	rows, err := s.db.Query(`
-SELECT next, n, last FROM transition WHERE prev = ?
-`, ctx)
+	rows, err := s.q.TransitionRowsFrom(storeContext, ctx)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
 	out := map[string]int64{}
-	for rows.Next() {
-		var next string
-		var n, last int64
-		if err := rows.Scan(&next, &n, &last); err != nil {
-			return nil, err
-		}
+	for _, row := range rows {
 		age := int64(0)
-		if last > 0 && now >= last {
-			age = (now - last) / 86400
+		if row.Last > 0 && now >= row.Last {
+			age = (now - row.Last) / 86400
 		}
+		next, n := row.Next, row.N
 		if n > 10_000 {
 			n = 10_000
 		}
 		out[next] = n * 1000 / (1 + age)
 	}
-	return out, rows.Err()
+	return out, nil
 }

@@ -1,0 +1,75 @@
+-- +goose Up
+CREATE TABLE session (
+  name TEXT PRIMARY KEY,
+  cwd TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  last_used INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE window (
+  id INTEGER PRIMARY KEY,
+  session TEXT NOT NULL REFERENCES session(name) ON DELETE CASCADE,
+  idx INTEGER NOT NULL,
+  name TEXT NOT NULL DEFAULT '',
+  cwd TEXT NOT NULL DEFAULT '',
+  layout TEXT,
+  UNIQUE(session, idx)
+);
+CREATE TABLE pane (
+  id INTEGER PRIMARY KEY,
+  window_id INTEGER NOT NULL REFERENCES window(id) ON DELETE CASCADE,
+  idx INTEGER NOT NULL,
+  cwd TEXT,
+  cmd TEXT,
+  UNIQUE(window_id, idx)
+);
+CREATE TABLE usage (
+  name TEXT PRIMARY KEY,
+  opens INTEGER NOT NULL DEFAULT 0,
+  kills INTEGER NOT NULL DEFAULT 0,
+  last_open INTEGER NOT NULL DEFAULT 0,
+  last_kill INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE pair (
+  a TEXT NOT NULL,
+  b TEXT NOT NULL,
+  n INTEGER NOT NULL DEFAULT 0,
+  last INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (a, b)
+);
+CREATE TABLE zox_meta (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  updated INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE zox_item (
+  ord INTEGER PRIMARY KEY,
+  name TEXT NOT NULL,
+  path TEXT NOT NULL,
+  title TEXT NOT NULL DEFAULT '',
+  desc TEXT NOT NULL DEFAULT '',
+  recency INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE shape (
+  id TEXT PRIMARY KEY,
+  key TEXT NOT NULL UNIQUE,
+  body TEXT NOT NULL,
+  created_at INTEGER NOT NULL DEFAULT 0,
+  updated_at INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE sticky (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  shape_id TEXT NOT NULL DEFAULT 'default'
+);
+CREATE TABLE placement (
+  shape_id TEXT NOT NULL,
+  pattern TEXT NOT NULL,
+  n INTEGER NOT NULL DEFAULT 0,
+  last INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (shape_id, pattern)
+);
+CREATE TABLE fork (
+  key TEXT PRIMARY KEY,
+  body TEXT NOT NULL DEFAULT '',
+  n INTEGER NOT NULL DEFAULT 0,
+  last INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX idx_session_last_used ON session(last_used DESC);

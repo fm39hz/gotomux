@@ -3,6 +3,8 @@ package store
 import (
 	"strings"
 	"time"
+
+	"github.com/fm39hz/gotomux/internal/store/dbgen"
 )
 
 // Prune drops learned rows that can no longer affect a bake.
@@ -21,16 +23,10 @@ func (s *Store) Prune() {
 		dur = s.cfg.PruneCutoff
 	}
 	cutoff := time.Now().Add(-dur).Unix()
-	_, _ = s.db.Exec(`
-DELETE FROM placement
-WHERE n < 2 AND last < ?
-  AND EXISTS (
-    SELECT 1 FROM placement p2
-    WHERE p2.shape_id = placement.shape_id AND p2.n > placement.n
-  )`, cutoff)
+	_ = s.q.PrunePlacement(storeContext, cutoff)
 	// fork rows are currently write-only (nothing reads fork.body, and ForkHits
 	// has no production caller), so the plain age rule is harmless here.
-	_, _ = s.db.Exec(`DELETE FROM fork WHERE n < 2 AND last < ?`, cutoff)
+	_ = s.q.PruneFork(storeContext, cutoff)
 }
 
 func (s *Store) RecordPlacement(shapeID, pattern string) error {
@@ -39,13 +35,7 @@ func (s *Store) RecordPlacement(shapeID, pattern string) error {
 		return nil
 	}
 	now := time.Now().Unix()
-	_, err := s.db.Exec(`
-INSERT INTO placement(shape_id, pattern, n, last) VALUES(?, ?, 1, ?)
-ON CONFLICT(shape_id, pattern) DO UPDATE SET
-  n = n + 1,
-  last = excluded.last
-`, shapeID, pattern, now)
-	return err
+	return s.q.RecordPlacement(storeContext, dbgen.RecordPlacementParams{ShapeID: shapeID, Pattern: pattern, Last: now})
 }
 
 // BestPlacement returns the highest-count pattern for a shape (tie -> newest
@@ -59,15 +49,11 @@ func (s *Store) BestPlacement(shapeID string) (pattern string, ok bool) {
 	if shapeID == "" {
 		return "", false
 	}
-	err := s.db.QueryRow(`
-SELECT pattern FROM placement
-WHERE shape_id = ?
-ORDER BY n DESC, last DESC
-LIMIT 1
-`, shapeID).Scan(&pattern)
-	if err != nil || pattern == "" {
+	got, err := s.q.BestPlacement(storeContext, shapeID)
+	if err != nil || got == "" {
 		return "", false
 	}
+	pattern = got
 	return pattern, true
 }
 
@@ -79,14 +65,7 @@ func (s *Store) RecordFork(key, body string) error {
 		return nil
 	}
 	now := time.Now().Unix()
-	_, err := s.db.Exec(`
-INSERT INTO fork(key, body, n, last) VALUES(?, ?, 1, ?)
-ON CONFLICT(key) DO UPDATE SET
-  n = n + 1,
-  last = excluded.last,
-  body = CASE WHEN excluded.body != '' THEN excluded.body ELSE body END
-`, key, body, now)
-	return err
+	return s.q.RecordFork(storeContext, dbgen.RecordForkParams{Key: key, Body: body, Last: now})
 }
 
 // ForkHits returns how often a window key has been observed (0 if unknown).
@@ -95,7 +74,6 @@ func (s *Store) ForkHits(key string) int64 {
 	if key == "" {
 		return 0
 	}
-	var n int64
-	_ = s.db.QueryRow(`SELECT n FROM fork WHERE key = ?`, key).Scan(&n)
+	n, _ := s.q.ForkHits(storeContext, key)
 	return n
 }

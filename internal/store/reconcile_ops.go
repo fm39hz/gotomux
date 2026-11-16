@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/fm39hz/gotomux/internal/model"
+	"github.com/fm39hz/gotomux/internal/store/dbgen"
 )
 
 func (s *Store) StartReconcile(journal model.ReconcileJournal) error {
@@ -28,10 +29,12 @@ func (s *Store) StartReconcile(journal model.ReconcileJournal) error {
 		journal.CreatedAt = now
 	}
 	journal.UpdatedAt = now
-	_, err := s.db.Exec(`INSERT INTO reconcile_journal
-		(id, session_key, session_name, session_logical_id, policy, status, plan_json, completed_step, last_error, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		journal.ID, journal.SessionKey, journal.SessionName, journal.SessionLogicalID, journal.Policy, journal.Status, journal.PlanJSON, journal.CompletedStep, journal.LastError, journal.CreatedAt, journal.UpdatedAt)
+	err := s.q.InsertReconcileJournal(storeContext, dbgen.InsertReconcileJournalParams{
+		ID: journal.ID, SessionKey: journal.SessionKey, SessionName: journal.SessionName,
+		SessionLogicalID: journal.SessionLogicalID, Policy: journal.Policy, Status: string(journal.Status),
+		PlanJson: journal.PlanJSON, CompletedStep: int64(journal.CompletedStep), LastError: journal.LastError,
+		CreatedAt: journal.CreatedAt, UpdatedAt: journal.UpdatedAt,
+	})
 	if err != nil {
 		return fmt.Errorf("start reconcile journal: %w", err)
 	}
@@ -50,21 +53,22 @@ func (s *Store) UpdateReconcile(id string, status model.ReconcileJournalStatus, 
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
-	var old model.ReconcileJournalStatus
-	var oldStep int
-	if err := tx.QueryRow(`SELECT status, completed_step FROM reconcile_journal WHERE id = ?`, id).Scan(&old, &oldStep); err != nil {
+	q := s.q.WithTx(tx)
+	row, err := q.ReconcileStatusAndStep(storeContext, id)
+	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return fmt.Errorf("update reconcile journal: unknown operation %q", id)
 		}
 		return err
 	}
-	if completedStep < oldStep {
+	if completedStep < int(row.CompletedStep) {
 		return fmt.Errorf("update reconcile journal: completed step cannot move backwards")
 	}
+	old := model.ReconcileJournalStatus(row.Status)
 	if !validJournalTransition(old, status) {
 		return fmt.Errorf("update reconcile journal: invalid transition %s -> %s", old, status)
 	}
-	if _, err := tx.Exec(`UPDATE reconcile_journal SET status = ?, completed_step = ?, last_error = ?, updated_at = ? WHERE id = ?`, status, completedStep, lastError, time.Now().Unix(), id); err != nil {
+	if err := q.UpdateReconcileJournal(storeContext, dbgen.UpdateReconcileJournalParams{Status: string(status), CompletedStep: int64(completedStep), LastError: lastError, UpdatedAt: time.Now().Unix(), ID: id}); err != nil {
 		return fmt.Errorf("update reconcile journal: %w", err)
 	}
 	return tx.Commit()
@@ -74,32 +78,26 @@ func (s *Store) GetReconcile(id string) (*model.ReconcileJournal, error) {
 	if id == "" {
 		return nil, nil
 	}
-	return scanReconcile(s.db.QueryRow(`SELECT id, session_key, session_name, session_logical_id, policy, status, plan_json, completed_step, last_error, created_at, updated_at FROM reconcile_journal WHERE id = ?`, id))
+	row, err := s.q.ReconcileJournalByID(storeContext, id)
+	return reconcileFromDB(row, err)
 }
 
 func (s *Store) GetActiveReconcile(sessionKey string) (*model.ReconcileJournal, error) {
 	if sessionKey == "" {
 		return nil, nil
 	}
-	return scanReconcile(s.db.QueryRow(`SELECT id, session_key, session_name, session_logical_id, policy, status, plan_json, completed_step, last_error, created_at, updated_at FROM reconcile_journal WHERE session_key = ? AND status IN ('planned','running','needs_attention')`, sessionKey))
+	row, err := s.q.ActiveReconcileBySessionKey(storeContext, sessionKey)
+	return reconcileFromDB(dbgen.ReconcileJournal(row), err)
 }
 
 func (s *Store) ListActiveReconciles() ([]model.ReconcileJournal, error) {
-	rows, err := s.db.Query(`SELECT id, session_key, session_name, session_logical_id, policy, status, plan_json, completed_step, last_error, created_at, updated_at FROM reconcile_journal WHERE status IN ('planned','running','needs_attention') ORDER BY created_at, id`)
+	rows, err := s.q.ActiveReconciles(storeContext)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-	var journals []model.ReconcileJournal
-	for rows.Next() {
-		var j model.ReconcileJournal
-		if err := rows.Scan(&j.ID, &j.SessionKey, &j.SessionName, &j.SessionLogicalID, &j.Policy, &j.Status, &j.PlanJSON, &j.CompletedStep, &j.LastError, &j.CreatedAt, &j.UpdatedAt); err != nil {
-			return nil, err
-		}
-		journals = append(journals, j)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
+	journals := make([]model.ReconcileJournal, 0, len(rows))
+	for _, row := range rows {
+		journals = append(journals, *toReconcile(row))
 	}
 	return journals, nil
 }
@@ -113,27 +111,27 @@ func (s *Store) CommitReconcile(sess *model.Session, journalID string) error {
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
-	var sessionKey, sessionLogicalID string
-	var status model.ReconcileJournalStatus
-	if err := tx.QueryRow(`SELECT session_key, session_logical_id, status FROM reconcile_journal WHERE id = ?`, journalID).Scan(&sessionKey, &sessionLogicalID, &status); err != nil {
+	q := s.q.WithTx(tx)
+	row, err := q.ReconcileIdentityAndStatus(storeContext, journalID)
+	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return fmt.Errorf("commit reconcile: unknown journal %q", journalID)
 		}
 		return err
 	}
-	if status != model.JournalRunning {
-		return fmt.Errorf("commit reconcile: journal %q is %s, expected running", journalID, status)
+	if model.ReconcileJournalStatus(row.Status) != model.JournalRunning {
+		return fmt.Errorf("commit reconcile: journal %q is %s, expected running", journalID, row.Status)
 	}
-	if sessionLogicalID == "" || sess.LogicalID != sessionLogicalID {
+	if row.SessionLogicalID == "" || sess.LogicalID != row.SessionLogicalID {
 		return fmt.Errorf("commit reconcile: baseline logical session ID does not match journal")
 	}
-	if sessionKey != sessionLogicalID {
+	if row.SessionKey != row.SessionLogicalID {
 		return fmt.Errorf("commit reconcile: journal session key does not match its logical identity")
 	}
 	if err := saveBaselineTx(tx, sess, false); err != nil {
 		return err
 	}
-	if _, err := tx.Exec(`UPDATE reconcile_journal SET status = ?, last_error = '', updated_at = ? WHERE id = ? AND status = ?`, model.JournalComplete, time.Now().Unix(), journalID, model.JournalRunning); err != nil {
+	if err := q.CompleteReconcileJournal(storeContext, dbgen.CompleteReconcileJournalParams{Status: string(model.JournalComplete), UpdatedAt: time.Now().Unix(), ID: journalID, Status_2: string(model.JournalRunning)}); err != nil {
 		return fmt.Errorf("complete reconcile journal: %w", err)
 	}
 	return tx.Commit()
@@ -152,14 +150,22 @@ func validJournalTransition(old, next model.ReconcileJournalStatus) bool {
 	}
 }
 
-func scanReconcile(row interface{ Scan(...any) error }) (*model.ReconcileJournal, error) {
-	var journal model.ReconcileJournal
-	err := row.Scan(&journal.ID, &journal.SessionKey, &journal.SessionName, &journal.SessionLogicalID, &journal.Policy, &journal.Status, &journal.PlanJSON, &journal.CompletedStep, &journal.LastError, &journal.CreatedAt, &journal.UpdatedAt)
+func reconcileFromDB(row dbgen.ReconcileJournal, err error) (*model.ReconcileJournal, error) {
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
 	if err != nil {
 		return nil, err
 	}
-	return &journal, nil
+	return toReconcile(row), nil
+}
+
+func toReconcile(row dbgen.ReconcileJournal) *model.ReconcileJournal {
+	return &model.ReconcileJournal{
+		ID: row.ID, SessionKey: row.SessionKey, SessionName: row.SessionName,
+		SessionLogicalID: row.SessionLogicalID, Policy: row.Policy,
+		Status: model.ReconcileJournalStatus(row.Status), PlanJSON: row.PlanJson,
+		CompletedStep: int(row.CompletedStep), LastError: row.LastError,
+		CreatedAt: row.CreatedAt, UpdatedAt: row.UpdatedAt,
+	}
 }

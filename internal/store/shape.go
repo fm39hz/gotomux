@@ -7,6 +7,7 @@ import (
 
 	"github.com/fm39hz/gotomux/internal/model"
 	"github.com/fm39hz/gotomux/internal/project"
+	"github.com/fm39hz/gotomux/internal/store/dbgen"
 )
 
 // ShapeRow is a pure shape blob (JSON body) keyed for dedupe.
@@ -104,22 +105,18 @@ func setStickyTx(tx *sql.Tx, shapeID string) error {
 	if shapeID == "" {
 		shapeID = "default"
 	}
-	_, err := tx.Exec(`
-INSERT INTO sticky(id, shape_id) VALUES(1, ?)
-ON CONFLICT(id) DO UPDATE SET shape_id = excluded.shape_id
-`, shapeID)
-	return err
+	return dbgen.New(tx).SetStickyShape(storeContext, shapeID)
 }
 
 func putShapeTx(tx *sql.Tx, id, key, body string) (outID string, created bool, err error) {
 	if key == "" || body == "" {
 		return "", false, fmt.Errorf("shape needs key and body")
 	}
-	var exist string
-	err = tx.QueryRow(`SELECT id FROM shape WHERE key = ?`, key).Scan(&exist)
+	q := dbgen.New(tx)
+	exist, err := q.ShapeIDByKey(storeContext, key)
 	if err == nil && exist != "" {
 		now := time.Now().Unix()
-		_, _ = tx.Exec(`UPDATE shape SET body = ?, updated_at = ? WHERE id = ?`, body, now, exist)
+		_ = q.UpdateShapeBodyByID(storeContext, dbgen.UpdateShapeBodyByIDParams{Body: body, UpdatedAt: now, ID: exist})
 		return exist, false, nil
 	}
 	if id == "" {
@@ -129,16 +126,16 @@ func putShapeTx(tx *sql.Tx, id, key, body string) (outID string, created bool, e
 		}
 	}
 	now := time.Now().Unix()
-	_, err = tx.Exec(`INSERT INTO shape(id, key, body, created_at, updated_at) VALUES(?,?,?,?,?)`, id, key, body, now, now)
+	err = q.InsertShape(storeContext, dbgen.InsertShapeParams{ID: id, Key: key, Body: body, CreatedAt: now, UpdatedAt: now})
 	if err != nil {
-		if e2 := tx.QueryRow(`SELECT id FROM shape WHERE key = ?`, key).Scan(&exist); e2 == nil && exist != "" {
-			return exist, false, nil
+		if existing, e2 := q.ShapeIDByKey(storeContext, key); e2 == nil && existing != "" {
+			return existing, false, nil
 		}
 		id2 := id + "-" + key[:min6(key)]
-		_, err = tx.Exec(`INSERT INTO shape(id, key, body, created_at, updated_at) VALUES(?,?,?,?,?)`, id2, key, body, now, now)
+		err = q.InsertShape(storeContext, dbgen.InsertShapeParams{ID: id2, Key: key, Body: body, CreatedAt: now, UpdatedAt: now})
 		if err != nil {
-			if e2 := tx.QueryRow(`SELECT id FROM shape WHERE key = ?`, key).Scan(&exist); e2 == nil && exist != "" {
-				return exist, false, nil
+			if existing, e2 := q.ShapeIDByKey(storeContext, key); e2 == nil && existing != "" {
+				return existing, false, nil
 			}
 			return "", false, err
 		}
@@ -159,10 +156,8 @@ func savePresetTx(tx *sql.Tx, sess *model.Session) error {
 	if err := deleteSessionsForSave(tx, sess.Name, sess.Cwd); err != nil {
 		return err
 	}
-	if _, err := tx.Exec(
-		`INSERT INTO session(name, cwd, created_at, last_used) VALUES(?,?,?,?)`,
-		sess.Name, sess.Cwd, now, now,
-	); err != nil {
+	q := dbgen.New(tx)
+	if err := q.InsertSession(storeContext, dbgen.InsertSessionParams{Name: sess.Name, Cwd: sess.Cwd, CreatedAt: now, LastUsed: now, LogicalID: sess.LogicalID}); err != nil {
 		return err
 	}
 	for i, w := range sess.Windows {
@@ -170,10 +165,7 @@ func savePresetTx(tx *sql.Tx, sess *model.Session) error {
 		if widx == 0 {
 			widx = i
 		}
-		res, err := tx.Exec(
-			`INSERT INTO window(session, idx, name, cwd, layout) VALUES(?,?,?,?,?)`,
-			sess.Name, widx, w.Name, w.Cwd, w.Layout,
-		)
+		res, err := q.InsertWindow(storeContext, dbgen.InsertWindowParams{Session: sess.Name, Idx: int64(widx), Name: w.Name, Cwd: w.Cwd, Layout: sql.NullString{String: w.Layout, Valid: true}, SlotID: w.SlotID})
 		if err != nil {
 			return err
 		}
@@ -186,10 +178,7 @@ func savePresetTx(tx *sql.Tx, sess *model.Session) error {
 			if pidx == 0 {
 				pidx = j
 			}
-			if _, err := tx.Exec(
-				`INSERT INTO pane(window_id, idx, cwd, cmd, cmd_path) VALUES(?,?,?,?,?)`,
-				wid, pidx, pn.Cwd, pn.Cmd, pn.CmdPath,
-			); err != nil {
+			if err := q.InsertPane(storeContext, dbgen.InsertPaneParams{WindowID: wid, Idx: int64(pidx), Cwd: sql.NullString{String: pn.Cwd, Valid: true}, Cmd: sql.NullString{String: pn.Cmd, Valid: true}, CmdPath: pn.CmdPath, SlotID: pn.SlotID}); err != nil {
 				return err
 			}
 		}
@@ -202,7 +191,10 @@ func (s *Store) GetShapeByKey(key string) (id, body string, ok bool) {
 	if key == "" {
 		return "", "", false
 	}
-	err := s.db.QueryRow(`SELECT id, body FROM shape WHERE key = ?`, key).Scan(&id, &body)
+	row, err := s.q.ShapeByKey(storeContext, key)
+	if err == nil {
+		id, body = row.ID, row.Body
+	}
 	return id, body, err == nil && id != ""
 }
 
@@ -224,11 +216,8 @@ func (s *Store) GetShapeMeta(id string) (ShapeMeta, bool) {
 	if id == "" {
 		return ShapeMeta{}, false
 	}
-	var m ShapeMeta
-	err := s.db.QueryRow(`
-SELECT body, COALESCE(updated_at, created_at, 0),
-       COALESCE(mirror_path, ''), COALESCE(mirror_sig, '')
-FROM shape WHERE id = ?`, id).Scan(&m.Body, &m.UpdatedAt, &m.MirrorPath, &m.MirrorSig)
+	row, err := s.q.ShapeMetaByID(storeContext, id)
+	m := ShapeMeta{Body: row.Body, UpdatedAt: row.UpdatedAt, MirrorPath: row.MirrorPath, MirrorSig: row.MirrorSig}
 	return m, err == nil && m.Body != ""
 }
 
@@ -238,8 +227,7 @@ func (s *Store) SetShapeMirror(id, path, sig string) error {
 	if id == "" {
 		return nil
 	}
-	_, err := s.db.Exec(`UPDATE shape SET mirror_path = ?, mirror_sig = ? WHERE id = ?`, path, sig, id)
-	return err
+	return s.q.UpdateShapeMirror(storeContext, dbgen.UpdateShapeMirrorParams{MirrorPath: path, MirrorSig: sig, ID: id})
 }
 
 // GetShape returns body by id.
@@ -247,7 +235,7 @@ func (s *Store) GetShape(id string) (body string, ok bool) {
 	if id == "" {
 		return "", false
 	}
-	err := s.db.QueryRow(`SELECT body FROM shape WHERE id = ?`, id).Scan(&body)
+	body, err := s.q.ShapeBodyByID(storeContext, id)
 	return body, err == nil && body != ""
 }
 
@@ -267,19 +255,13 @@ func (s *Store) PutShape(id, key, body string) (outID string, created bool, err 
 		}
 	}
 	now := time.Now().Unix()
-	_, err = s.db.Exec(
-		`INSERT INTO shape(id, key, body, created_at, updated_at) VALUES(?,?,?,?,?)`,
-		id, key, body, now, now,
-	)
+	err = s.q.InsertShape(storeContext, dbgen.InsertShapeParams{ID: id, Key: key, Body: body, CreatedAt: now, UpdatedAt: now})
 	if err != nil {
 		if exist, _, ok := s.GetShapeByKey(key); ok {
 			return exist, false, nil
 		}
 		id2 := id + "-" + key[:6]
-		_, err = s.db.Exec(
-			`INSERT INTO shape(id, key, body, created_at, updated_at) VALUES(?,?,?,?,?)`,
-			id2, key, body, now, now,
-		)
+		err = s.q.InsertShape(storeContext, dbgen.InsertShapeParams{ID: id2, Key: key, Body: body, CreatedAt: now, UpdatedAt: now})
 		if err != nil {
 			if exist, _, ok := s.GetShapeByKey(key); ok {
 				return exist, false, nil
@@ -304,45 +286,24 @@ func (s *Store) UpsertShapeByID(id, key, body string) error {
 	now := time.Now().Unix()
 	if exist, _, ok := s.GetShapeByKey(key); ok && exist != id {
 		// same essence under two ids -> keep exist, merge pointers, delete id
-		_, _ = s.db.Exec(`UPDATE shape SET body = ?, updated_at = ? WHERE id = ?`, body, now, exist)
-		_, _ = s.db.Exec(`UPDATE sticky SET shape_id = ? WHERE shape_id = ?`, exist, id)
+		_ = s.q.UpdateShapeBodyAndTime(storeContext, dbgen.UpdateShapeBodyAndTimeParams{Body: body, UpdatedAt: now, ID: exist})
+		_ = s.q.RebindStickyShape(storeContext, dbgen.RebindStickyShapeParams{ShapeID: exist, ShapeID_2: id})
 		// drop placement rows for duplicate id (patterns may already exist under exist)
-		_, _ = s.db.Exec(`DELETE FROM placement WHERE shape_id = ?`, id)
-		_, _ = s.db.Exec(`DELETE FROM shape WHERE id = ?`, id)
+		_ = s.q.DeletePlacementForShape(storeContext, id)
+		_ = s.q.DeleteShape(storeContext, id)
 		return nil
 	}
-	_, err := s.db.Exec(`
-INSERT INTO shape(id, key, body, created_at, updated_at) VALUES(?,?,?,?,?)
-ON CONFLICT(id) DO UPDATE SET
-  key = excluded.key,
-  body = excluded.body,
-  updated_at = excluded.updated_at
-`, id, key, body, now, now)
-	return err
+	return s.q.UpsertShapeByID(storeContext, dbgen.UpsertShapeByIDParams{ID: id, Key: key, Body: body, CreatedAt: now, UpdatedAt: now})
 }
 
 // ListShapes returns all shape ids (for export).
 func (s *Store) ListShapes() ([]string, error) {
-	rows, err := s.db.Query(`SELECT id FROM shape ORDER BY id`)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var out []string
-	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
-			return nil, err
-		}
-		out = append(out, id)
-	}
-	return out, rows.Err()
+	return s.q.ListShapeIDs(storeContext)
 }
 
 // StickyID returns sticky shape id (default if unset).
 func (s *Store) StickyID() string {
-	var id string
-	err := s.db.QueryRow(`SELECT shape_id FROM sticky WHERE id = 1`).Scan(&id)
+	id, err := s.q.StickyShapeID(storeContext)
 	if err != nil || id == "" {
 		return "default"
 	}
@@ -354,11 +315,7 @@ func (s *Store) SetSticky(shapeID string) error {
 	if shapeID == "" {
 		shapeID = "default"
 	}
-	_, err := s.db.Exec(`
-INSERT INTO sticky(id, shape_id) VALUES(1, ?)
-ON CONFLICT(id) DO UPDATE SET shape_id = excluded.shape_id
-`, shapeID)
-	return err
+	return s.q.SetStickyShape(storeContext, shapeID)
 }
 
 func (s *Store) String() string {

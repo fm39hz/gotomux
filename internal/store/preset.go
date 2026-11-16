@@ -2,12 +2,14 @@ package store
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
 
 	"github.com/fm39hz/gotomux/internal/model"
 	"github.com/fm39hz/gotomux/internal/project"
+	"github.com/fm39hz/gotomux/internal/store/dbgen"
 )
 
 func (s *Store) ListNames() ([]string, error) {
@@ -33,80 +35,35 @@ type PresetMeta struct {
 }
 
 func (s *Store) ListMeta() ([]PresetMeta, error) {
-	rows, err := s.db.Query(`SELECT name, cwd, last_used FROM session ORDER BY last_used DESC, name`)
+	rows, err := s.q.ListPresetMeta(storeContext)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-	var out []PresetMeta
-	for rows.Next() {
-		var m PresetMeta
-		if err := rows.Scan(&m.Name, &m.Cwd, &m.LastUsed); err != nil {
-			return nil, err
-		}
-		out = append(out, m)
+	out := make([]PresetMeta, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, PresetMeta{Name: row.Name, Cwd: row.Cwd, LastUsed: row.LastUsed})
 	}
-	return out, rows.Err()
+	return out, nil
 }
 
 func (s *Store) Get(name string) (*model.Session, error) {
-	var sessName, cwd string
-	err := s.db.QueryRow(`SELECT name, cwd FROM session WHERE name = ?`, name).Scan(&sessName, &cwd)
+	row, err := s.q.PresetByName(storeContext, name)
 	if err != nil {
 		return nil, err
 	}
-	sess := &model.Session{Name: sessName, Cwd: cwd}
-
-	type winRow struct {
-		id     int64
-		idx    int
-		name   string
-		cwd    string
-		layout string
-	}
-	wrows, err := s.db.Query(
-		`SELECT id, idx, name, COALESCE(cwd,''), COALESCE(layout,'') FROM window WHERE session = ? ORDER BY idx`,
-		name,
-	)
+	sess := &model.Session{Name: row.Name, Cwd: row.Cwd, LogicalID: row.LogicalID}
+	wins, err := s.q.PresetWindows(storeContext, name)
 	if err != nil {
 		return nil, err
 	}
-	var wins []winRow
-	for wrows.Next() {
-		var w winRow
-		if err := wrows.Scan(&w.id, &w.idx, &w.name, &w.cwd, &w.layout); err != nil {
-			wrows.Close()
-			return nil, err
-		}
-		wins = append(wins, w)
-	}
-	if err := wrows.Err(); err != nil {
-		wrows.Close()
-		return nil, err
-	}
-	wrows.Close()
-
 	for _, wr := range wins {
-		w := model.Window{Idx: wr.idx, Name: wr.name, Cwd: wr.cwd, Layout: wr.layout}
-		prows, err := s.db.Query(
-			`SELECT idx, COALESCE(cwd,''), COALESCE(cmd,''), COALESCE(cmd_path,'') FROM pane WHERE window_id = ? ORDER BY idx`,
-			wr.id,
-		)
+		w := model.Window{Idx: int(wr.Idx), Name: wr.Name, Cwd: wr.Cwd, Layout: wr.Layout, SlotID: wr.SlotID}
+		panes, err := s.q.PresetPanes(storeContext, wr.ID)
 		if err != nil {
 			return nil, err
 		}
-		for prows.Next() {
-			var pn model.Pane
-			if err := prows.Scan(&pn.Idx, &pn.Cwd, &pn.Cmd, &pn.CmdPath); err != nil {
-				prows.Close()
-				return nil, err
-			}
-			w.Panes = append(w.Panes, pn)
-		}
-		err = prows.Err()
-		prows.Close()
-		if err != nil {
-			return nil, err
+		for _, pane := range panes {
+			w.Panes = append(w.Panes, model.Pane{Idx: int(pane.Idx), Cwd: pane.Cwd, Cmd: pane.Cmd, CmdPath: pane.CmdPath, SlotID: pane.SlotID})
 		}
 		sess.Windows = append(sess.Windows, w)
 	}
@@ -133,13 +90,14 @@ func (s *Store) Save(sess *model.Session) error {
 
 // deleteSessionsForSave removes presets that this Save should replace.
 func deleteSessionsForSave(tx *sql.Tx, name, cwd string) error {
+	q := dbgen.New(tx)
 	// exact name
-	if _, err := tx.Exec(`DELETE FROM session WHERE name = ?`, name); err != nil {
+	if err := q.DeleteSession(storeContext, name); err != nil {
 		return err
 	}
 	// same project root -> one preset per project path
 	if cwd != "" {
-		if _, err := tx.Exec(`DELETE FROM session WHERE cwd = ? AND name != ?`, cwd, name); err != nil {
+		if err := q.DeleteSessionsByCwdExcept(storeContext, dbgen.DeleteSessionsByCwdExceptParams{Cwd: cwd, Name: name}); err != nil {
 			return err
 		}
 	}
@@ -148,29 +106,99 @@ func deleteSessionsForSave(tx *sql.Tx, name, cwd string) error {
 	if key == "" {
 		return nil
 	}
-	rows, err := tx.Query(`SELECT name FROM session`)
+	rows, err := q.SessionNames(storeContext)
 	if err != nil {
 		return err
 	}
 	var victims []string
-	for rows.Next() {
-		var n string
-		if err := rows.Scan(&n); err != nil {
-			rows.Close()
-			return err
-		}
+	for _, n := range rows {
 		if n != name && sessionAliasKey(n) == key {
 			victims = append(victims, n)
 		}
 	}
-	if err := rows.Err(); err != nil {
-		rows.Close()
+	for _, n := range victims {
+		if err := q.DeleteSession(storeContext, n); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// bindPresetIdentityTx stores the stable IDs observed while loading an existing
+// preset. It only binds an exact persisted shape; a same-name but changed tree
+// must be explicitly frozen before it can replace an existing baseline.
+func bindPresetIdentityTx(tx *sql.Tx, sess *model.Session) error {
+	if sess == nil || sess.LogicalID == "" {
+		return fmt.Errorf("preset identity requires a session logical ID")
+	}
+	q := dbgen.New(tx)
+	stored, err := q.PresetByName(storeContext, sess.Name)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
 		return err
 	}
-	rows.Close()
-	for _, n := range victims {
-		if _, err := tx.Exec(`DELETE FROM session WHERE name = ?`, n); err != nil {
+	if stored.LogicalID != "" && stored.LogicalID != sess.LogicalID {
+		return fmt.Errorf("preset %q already belongs to logical session %s", sess.Name, stored.LogicalID)
+	}
+	if stored.Cwd != sess.Cwd {
+		return fmt.Errorf("preset %q project path changed while binding identity", sess.Name)
+	}
+	windows, err := q.PresetWindows(storeContext, sess.Name)
+	if err != nil {
+		return err
+	}
+	if len(windows) != len(sess.Windows) {
+		return fmt.Errorf("preset %q window count changed while binding identity", sess.Name)
+	}
+	for i, want := range sess.Windows {
+		got := windows[i]
+		if got.Name != want.Name || got.Cwd != want.Cwd || got.Layout != want.Layout {
+			return fmt.Errorf("preset %q window %d no longer matches the baseline", sess.Name, i)
+		}
+		if got.SlotID != "" && got.SlotID != want.SlotID {
+			return fmt.Errorf("preset %q window %d already has a different stable identity", sess.Name, i)
+		}
+		panes, err := q.PresetPanes(storeContext, got.ID)
+		if err != nil {
 			return err
+		}
+		if len(panes) != len(want.Panes) {
+			return fmt.Errorf("preset %q window %d pane count changed while binding identity", sess.Name, i)
+		}
+		for j, pane := range want.Panes {
+			storedPane := panes[j]
+			if storedPane.Cwd != pane.Cwd || storedPane.Cmd != pane.Cmd || storedPane.CmdPath != pane.CmdPath {
+				return fmt.Errorf("preset %q window %d pane %d no longer matches the baseline", sess.Name, i, j)
+			}
+			if storedPane.SlotID != "" && storedPane.SlotID != pane.SlotID {
+				return fmt.Errorf("preset %q window %d pane %d already has a different stable identity", sess.Name, i, j)
+			}
+		}
+	}
+	if err := q.UpdatePresetLogicalID(storeContext, dbgen.UpdatePresetLogicalIDParams{
+		LogicalID: sess.LogicalID, Name: sess.Name, LogicalID_2: sess.LogicalID,
+	}); err != nil {
+		return err
+	}
+	for i, window := range windows {
+		want := sess.Windows[i]
+		if err := q.UpdatePresetWindowSlot(storeContext, dbgen.UpdatePresetWindowSlotParams{
+			SlotID: want.SlotID, ID: window.ID, SlotID_2: want.SlotID,
+		}); err != nil {
+			return err
+		}
+		panes, err := q.PresetPanes(storeContext, window.ID)
+		if err != nil {
+			return err
+		}
+		for j, pane := range panes {
+			if err := q.UpdatePresetPaneSlot(storeContext, dbgen.UpdatePresetPaneSlotParams{
+				SlotID: want.Panes[j].SlotID, ID: pane.ID, SlotID_2: want.Panes[j].SlotID,
+			}); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
@@ -191,13 +219,11 @@ func sessionAliasKey(name string) string {
 }
 
 func (s *Store) Touch(name string) error {
-	_, err := s.db.Exec(`UPDATE session SET last_used = ? WHERE name = ?`, time.Now().Unix(), name)
-	return err
+	return s.q.TouchSession(storeContext, dbgen.TouchSessionParams{LastUsed: time.Now().Unix(), Name: name})
 }
 
 func (s *Store) Delete(name string) error {
-	_, err := s.db.Exec(`DELETE FROM session WHERE name = ?`, name)
-	return err
+	return s.q.DeleteSession(storeContext, name)
 }
 
 // RebindName moves ranking telemetry old->new after preset rename.
@@ -213,31 +239,23 @@ func (s *Store) RebindName(old, newName string) error {
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
+	q := s.q.WithTx(tx)
 
 	// usage: merge into new, drop old
-	var oOpens, oKills, oLastOpen, oLastKill int64
-	err = tx.QueryRow(
-		`SELECT opens, kills, last_open, last_kill FROM usage WHERE name = ?`, old,
-	).Scan(&oOpens, &oKills, &oLastOpen, &oLastKill)
+	u, err := q.UsageByName(storeContext, old)
 	if err == nil {
-		_, err = tx.Exec(`
-INSERT INTO usage(name, opens, kills, last_open, last_kill) VALUES(?, ?, ?, ?, ?)
-ON CONFLICT(name) DO UPDATE SET
-  opens = opens + excluded.opens,
-  kills = kills + excluded.kills,
-  last_open = MAX(last_open, excluded.last_open),
-  last_kill = MAX(last_kill, excluded.last_kill)
-`, newName, oOpens, oKills, oLastOpen, oLastKill)
-		if err != nil {
+		if err := q.MergeUsage(storeContext, dbgen.MergeUsageParams{Name: newName, Opens: u.Opens, Kills: u.Kills, LastOpen: u.LastOpen, LastKill: u.LastKill}); err != nil {
 			return err
 		}
-		if _, err = tx.Exec(`DELETE FROM usage WHERE name = ?`, old); err != nil {
+		if err := q.DeleteUsageByName(storeContext, old); err != nil {
 			return err
 		}
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return err
 	}
 
 	// pair: rewrite endpoints; undirected canonical a < b
-	rows, err := tx.Query(`SELECT a, b, n, last FROM pair WHERE a = ? OR b = ?`, old, old)
+	rows, err := q.PairRowsForRename(storeContext, dbgen.PairRowsForRenameParams{A: old, B: old})
 	if err != nil {
 		return err
 	}
@@ -246,20 +264,11 @@ ON CONFLICT(name) DO UPDATE SET
 		n, last int64
 	}
 	var found []pr
-	for rows.Next() {
-		var r pr
-		if err := rows.Scan(&r.a, &r.b, &r.n, &r.last); err != nil {
-			rows.Close()
-			return err
-		}
-		found = append(found, r)
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
-		return err
+	for _, row := range rows {
+		found = append(found, pr{a: row.A, b: row.B, n: row.N, last: row.Last})
 	}
 	for _, r := range found {
-		if _, err := tx.Exec(`DELETE FROM pair WHERE a = ? AND b = ?`, r.a, r.b); err != nil {
+		if err := q.DeletePair(storeContext, dbgen.DeletePairParams{A: r.a, B: r.b}); err != nil {
 			return err
 		}
 		a, b := r.a, r.b
@@ -275,19 +284,13 @@ ON CONFLICT(name) DO UPDATE SET
 		if a > b {
 			a, b = b, a
 		}
-		_, err = tx.Exec(`
-INSERT INTO pair(a, b, n, last) VALUES(?, ?, ?, ?)
-ON CONFLICT(a, b) DO UPDATE SET
-  n = n + excluded.n,
-  last = MAX(last, excluded.last)
-`, a, b, r.n, r.last)
-		if err != nil {
+		if err := q.MergePair(storeContext, dbgen.MergePairParams{A: a, B: b, N: r.n, Last: r.last}); err != nil {
 			return err
 		}
 	}
 
 	// transition: directed prev->next; rewrite both endpoints, drop self-loops
-	trows, err := tx.Query(`SELECT prev, next, n, last FROM transition WHERE prev = ? OR next = ?`, old, old)
+	trows, err := q.TransitionRowsForRename(storeContext, dbgen.TransitionRowsForRenameParams{Prev: old, Next: old})
 	if err != nil {
 		return err
 	}
@@ -296,20 +299,11 @@ ON CONFLICT(a, b) DO UPDATE SET
 		n, last    int64
 	}
 	var tfound []tr
-	for trows.Next() {
-		var r tr
-		if err := trows.Scan(&r.prev, &r.next, &r.n, &r.last); err != nil {
-			trows.Close()
-			return err
-		}
-		tfound = append(tfound, r)
-	}
-	trows.Close()
-	if err := trows.Err(); err != nil {
-		return err
+	for _, row := range trows {
+		tfound = append(tfound, tr{prev: row.Prev, next: row.Next, n: row.N, last: row.Last})
 	}
 	for _, r := range tfound {
-		if _, err := tx.Exec(`DELETE FROM transition WHERE prev = ? AND next = ?`, r.prev, r.next); err != nil {
+		if err := q.DeleteTransition(storeContext, dbgen.DeleteTransitionParams{Prev: r.prev, Next: r.next}); err != nil {
 			return err
 		}
 		prev, next := r.prev, r.next
@@ -322,13 +316,7 @@ ON CONFLICT(a, b) DO UPDATE SET
 		if prev == next {
 			continue // self-transition after rename - drop
 		}
-		_, err = tx.Exec(`
-INSERT INTO transition(prev, next, n, last) VALUES(?, ?, ?, ?)
-ON CONFLICT(prev, next) DO UPDATE SET
-  n = n + excluded.n,
-  last = MAX(last, excluded.last)
-`, prev, next, r.n, r.last)
-		if err != nil {
+		if err := q.MergeTransition(storeContext, dbgen.MergeTransitionParams{Prev: prev, Next: next, N: r.n, Last: r.last}); err != nil {
 			return err
 		}
 	}

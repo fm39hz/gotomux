@@ -1,0 +1,3 @@
+-- +goose Up
+ALTER TABLE shape ADD COLUMN mirror_path TEXT NOT NULL DEFAULT '';
+ALTER TABLE shape ADD COLUMN mirror_sig TEXT NOT NULL DEFAULT '';

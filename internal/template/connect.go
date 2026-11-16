@@ -2,6 +2,8 @@ package template
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"fmt"
 
 	"github.com/fm39hz/gotomux/internal/classify"
@@ -234,19 +236,64 @@ func ConnectPreset(ctl tmux.Connector, st store.Storer, p *model.Session) error 
 		return fmt.Errorf("connect preset: tmux adapter does not support logical identity metadata")
 	}
 	instance := cloneSession(p)
-	instance.LogicalID, instance.TmuxID, instance.ServerKey = "", "", ""
+	if st != nil {
+		storedPreset, err := st.Get(p.Name)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("connect preset %q identity lookup: %w", p.Name, err)
+		}
+		storedBaseline, err := st.GetBaseline(p.Name)
+		if err != nil {
+			return fmt.Errorf("connect preset %q baseline identity: %w", p.Name, err)
+		}
+		if storedPreset != nil {
+			if !samePersistedPreset(p, storedPreset) {
+				return fmt.Errorf("preset %q changed since it was selected; reload it before connecting", p.Name)
+			}
+			if storedPreset.LogicalID != "" {
+				if p.LogicalID != "" && p.LogicalID != storedPreset.LogicalID {
+					return fmt.Errorf("preset %q selection has a different logical identity than its stored instance", p.Name)
+				}
+				if storedBaseline != nil && storedBaseline.LogicalID != storedPreset.LogicalID {
+					return fmt.Errorf("preset %q belongs to logical session %s but its baseline belongs to %s; freeze the intended replacement before loading", p.Name, storedPreset.LogicalID, storedBaseline.LogicalID)
+				}
+				if err := copyPresetStableIDs(instance, storedPreset); err != nil {
+					return err
+				}
+				if !completePresetStableIDs(instance) && storedBaseline != nil && samePersistedPreset(instance, storedBaseline) {
+					if err := fillMissingPresetStableIDs(instance, storedBaseline); err != nil {
+						return err
+					}
+				}
+				if !completePresetStableIDs(instance) {
+					return fmt.Errorf("preset %q has incomplete stable identities; freeze it before loading", p.Name)
+				}
+			} else {
+				clearPresetStableIDs(instance)
+				if err := restorePresetIdentity(instance, storedBaseline); err != nil {
+					return err
+				}
+			}
+		} else {
+			// A transient template is a new instance. Its IDs are not authoritative.
+			clearPresetStableIDs(instance)
+			if err := restorePresetIdentity(instance, storedBaseline); err != nil {
+				return err
+			}
+		}
+	} else {
+		clearPresetStableIDs(instance)
+	}
+	instance.TmuxID, instance.ServerKey = "", ""
 	for wi := range instance.Windows {
-		instance.Windows[wi].SlotID = ""
 		instance.Windows[wi].TmuxID = ""
 		for pi := range instance.Windows[wi].Panes {
-			instance.Windows[wi].Panes[pi].SlotID = ""
 			instance.Windows[wi].Panes[pi].TmuxID = ""
 		}
 	}
 	if err := ctl.Load(ctx, instance); err != nil {
 		return fmt.Errorf("load preset %q: %w", p.Name, err)
 	}
-	observed, err := EnsureLiveIdentities(ctx, ops, p.Name)
+	observed, err := EnsureLiveIdentitiesFromPreset(ctx, ops, p.Name, instance)
 	if err != nil {
 		return fmt.Errorf("load preset %q identity: %w", p.Name, err)
 	}
@@ -260,6 +307,143 @@ func ConnectPreset(ctl tmux.Connector, st store.Storer, p *model.Session) error 
 		}
 	}
 	return ctl.Connect(ctx, instance.Name, instance.Cwd)
+}
+
+func restorePresetIdentity(preset, baseline *model.Session) error {
+	if baseline == nil {
+		return nil
+	}
+	if baseline.LogicalID == "" {
+		return fmt.Errorf("preset %q has a baseline without logical identity; freeze it before loading", preset.Name)
+	}
+	if preset.LogicalID != "" && preset.LogicalID != baseline.LogicalID {
+		return fmt.Errorf("preset %q belongs to logical session %s but its baseline belongs to %s; freeze the intended replacement before loading", preset.Name, preset.LogicalID, baseline.LogicalID)
+	}
+	if preset.LogicalID == "" && !samePersistedPreset(preset, baseline) {
+		return fmt.Errorf("preset %q does not structurally match baseline logical session %s; freeze the intended replacement before loading", preset.Name, baseline.LogicalID)
+	}
+	if preset.LogicalID == "" {
+		preset.LogicalID = baseline.LogicalID
+	}
+	if len(preset.Windows) != len(baseline.Windows) {
+		return fmt.Errorf("preset %q and baseline identity tree have different window counts", preset.Name)
+	}
+	for wi := range preset.Windows {
+		pw, bw := &preset.Windows[wi], baseline.Windows[wi]
+		if pw.SlotID != "" && pw.SlotID != bw.SlotID {
+			return fmt.Errorf("preset %q window %d identity conflicts with baseline", preset.Name, wi)
+		}
+		pw.SlotID = bw.SlotID
+		if len(pw.Panes) != len(bw.Panes) {
+			return fmt.Errorf("preset %q window %d and baseline identity tree have different pane counts", preset.Name, wi)
+		}
+		for pi := range pw.Panes {
+			if pw.Panes[pi].SlotID != "" && pw.Panes[pi].SlotID != bw.Panes[pi].SlotID {
+				return fmt.Errorf("preset %q window %d pane %d identity conflicts with baseline", preset.Name, wi, pi)
+			}
+			pw.Panes[pi].SlotID = bw.Panes[pi].SlotID
+		}
+	}
+	return nil
+}
+
+func copyPresetStableIDs(target, source *model.Session) error {
+	if target == nil || source == nil || target.Name != source.Name || len(target.Windows) != len(source.Windows) {
+		return fmt.Errorf("preset instance identity tree changed")
+	}
+	if target.LogicalID != "" && target.LogicalID != source.LogicalID {
+		return fmt.Errorf("preset %q selection has a conflicting logical identity", target.Name)
+	}
+	target.LogicalID = source.LogicalID
+	for wi := range target.Windows {
+		tw, sw := &target.Windows[wi], source.Windows[wi]
+		if len(tw.Panes) != len(sw.Panes) {
+			return fmt.Errorf("preset %q window %d identity tree changed", target.Name, wi)
+		}
+		if tw.SlotID != "" && tw.SlotID != sw.SlotID {
+			return fmt.Errorf("preset %q window %d has a conflicting stable identity", target.Name, wi)
+		}
+		tw.SlotID = sw.SlotID
+		for pi := range tw.Panes {
+			if tw.Panes[pi].SlotID != "" && tw.Panes[pi].SlotID != sw.Panes[pi].SlotID {
+				return fmt.Errorf("preset %q window %d pane %d has a conflicting stable identity", target.Name, wi, pi)
+			}
+			tw.Panes[pi].SlotID = sw.Panes[pi].SlotID
+		}
+	}
+	return nil
+}
+
+func fillMissingPresetStableIDs(target, source *model.Session) error {
+	if target == nil || source == nil || len(target.Windows) != len(source.Windows) {
+		return fmt.Errorf("preset stable identity tree does not match baseline")
+	}
+	for wi := range target.Windows {
+		if target.Windows[wi].SlotID == "" {
+			target.Windows[wi].SlotID = source.Windows[wi].SlotID
+		}
+		if len(target.Windows[wi].Panes) != len(source.Windows[wi].Panes) {
+			return fmt.Errorf("preset window %d stable identity tree does not match baseline", wi)
+		}
+		for pi := range target.Windows[wi].Panes {
+			if target.Windows[wi].Panes[pi].SlotID == "" {
+				target.Windows[wi].Panes[pi].SlotID = source.Windows[wi].Panes[pi].SlotID
+			}
+		}
+	}
+	return nil
+}
+
+func completePresetStableIDs(preset *model.Session) bool {
+	if preset == nil || preset.LogicalID == "" || len(preset.Windows) == 0 {
+		return false
+	}
+	for _, window := range preset.Windows {
+		if window.SlotID == "" || len(window.Panes) == 0 {
+			return false
+		}
+		for _, pane := range window.Panes {
+			if pane.SlotID == "" {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func clearPresetStableIDs(preset *model.Session) {
+	if preset == nil {
+		return
+	}
+	preset.LogicalID = ""
+	for wi := range preset.Windows {
+		preset.Windows[wi].SlotID = ""
+		for pi := range preset.Windows[wi].Panes {
+			preset.Windows[wi].Panes[pi].SlotID = ""
+		}
+	}
+}
+
+// Old preset rows did not persist logical IDs. Reuse baseline IDs only when
+// every persisted instance field agrees in the same ordered tree; names alone
+// are insufficient to infer ownership.
+func samePersistedPreset(preset, baseline *model.Session) bool {
+	if preset == nil || baseline == nil || preset.Name != baseline.Name || preset.Cwd != baseline.Cwd || len(preset.Windows) != len(baseline.Windows) {
+		return false
+	}
+	for wi := range preset.Windows {
+		pw, bw := preset.Windows[wi], baseline.Windows[wi]
+		if pw.Idx != bw.Idx || pw.Name != bw.Name || pw.Cwd != bw.Cwd || pw.Layout != bw.Layout || len(pw.Panes) != len(bw.Panes) {
+			return false
+		}
+		for pi := range pw.Panes {
+			pp, bp := pw.Panes[pi], bw.Panes[pi]
+			if pp.Idx != bp.Idx || pp.Cwd != bp.Cwd || pp.Cmd != bp.Cmd || pp.CmdPath != bp.CmdPath {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 func stampSemanticMetadata(s *model.Session) {

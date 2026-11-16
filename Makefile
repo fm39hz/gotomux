@@ -10,8 +10,9 @@ VERSION := $(shell git describe --tags --long --dirty --match 'v*' 2>/dev/null |
 LDFLAGS := -s -w $(if $(VERSION),-X main.version=$(VERSION))
 REMOTE  := origin
 BRANCH  := master
+SQLC    ?= go run github.com/sqlc-dev/sqlc/cmd/sqlc@v1.31.1
 
-.PHONY: help build build-all run test test-v bench schema install install-all clean fmt vet pkg pkg-install
+.PHONY: help build build-all run test test-v bench schema install install-all clean fmt vet pkg pkg-install sqlc-generate sqlc-check migrations-check db-check
 
 help: ## list targets
 	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN{FS=":.*?## "}; {printf "  %-12s %s\n", $$1, $$2}'
@@ -36,6 +37,20 @@ bench: ## microbenchmarks
 
 schema: ## regenerate schema/config.json
 	GOTOMUX_UPDATE_SCHEMA=1 go test ./internal/config/ -run TestConfigSchemaGolden
+
+sqlc-generate: ## regenerate typed database access code
+	$(SQLC) generate
+
+sqlc-check: sqlc-generate ## verify generated database access code is current
+	git diff --exit-code -- internal/store/dbgen
+
+migrations-check: ## verify embedded Goose migration files are immutable and ordered
+	cd internal/store/migrations && sha256sum -c SHA256SUMS
+	cd internal/store/migrations && test "$$(find . -maxdepth 1 -type f -name '[0-9][0-9][0-9][0-9][0-9]_*.sql' -printf '%f\n' | sort)" = "$$(cut -d ' ' -f 3 SHA256SUMS | sort)"
+	./scripts/check_migration_versions.sh
+	./scripts/check_migrations_immutable.sh
+
+db-check: sqlc-check migrations-check ## verify database migrations and generated access
 
 install: ## go install CLI
 	go install -ldflags='$(LDFLAGS)' .

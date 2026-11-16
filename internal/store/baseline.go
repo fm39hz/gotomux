@@ -9,6 +9,7 @@ import (
 
 	"github.com/fm39hz/gotomux/internal/identity"
 	"github.com/fm39hz/gotomux/internal/model"
+	"github.com/fm39hz/gotomux/internal/store/dbgen"
 )
 
 // Baseline: the recorded starting layout of a live session, stored as a full
@@ -31,6 +32,9 @@ func (s *Store) SaveBaseline(sess *model.Session) error {
 	if err := saveBaselineTx(tx, sess, false); err != nil {
 		return err
 	}
+	if err := bindPresetIdentityTx(tx, sess); err != nil {
+		return fmt.Errorf("save baseline preset identity: %w", err)
+	}
 	return tx.Commit()
 }
 
@@ -48,21 +52,21 @@ func saveBaselineTx(tx *sql.Tx, sess *model.Session, allowSessionReplacement boo
 	if err := validateBaselineIdentityTree(copy); err != nil {
 		return fmt.Errorf("save baseline: %w", err)
 	}
+	q := dbgen.New(tx)
 	body, err := json.Marshal(&copy)
 	if err != nil {
 		return fmt.Errorf("save baseline: %w", err)
 	}
 	var oldName string
 	if copy.LogicalID != "" {
-		err = tx.QueryRow(`SELECT name FROM baseline WHERE logical_id = ?`, copy.LogicalID).Scan(&oldName)
+		oldName, err = q.BaselineNameByLogicalID(storeContext, copy.LogicalID)
 		if err != nil && !errors.Is(err, sql.ErrNoRows) {
 			return fmt.Errorf("save baseline lookup by logical ID: %w", err)
 		}
 	}
 	if oldName != "" {
 		if oldName != copy.Name {
-			var occupyingID string
-			err := tx.QueryRow(`SELECT logical_id FROM baseline WHERE name = ?`, copy.Name).Scan(&occupyingID)
+			_, err := q.BaselineLogicalIDByName(storeContext, copy.Name)
 			if err == nil {
 				return fmt.Errorf("save baseline: name %q already belongs to another baseline", copy.Name)
 			}
@@ -70,15 +74,16 @@ func saveBaselineTx(tx *sql.Tx, sess *model.Session, allowSessionReplacement boo
 				return fmt.Errorf("save baseline name check: %w", err)
 			}
 		}
-		_, err = tx.Exec(`UPDATE baseline SET name = ?, body = ?, updated_at = ?, logical_id = ? WHERE logical_id = ?`,
-			copy.Name, body, time.Now().Unix(), copy.LogicalID, copy.LogicalID)
+		err = q.UpdateBaselineByLogicalID(storeContext, dbgen.UpdateBaselineByLogicalIDParams{
+			Name: copy.Name, Body: string(body), UpdatedAt: time.Now().Unix(), LogicalID: copy.LogicalID, LogicalID_2: copy.LogicalID,
+		})
 		if err != nil {
 			return fmt.Errorf("save baseline: %w", err)
 		}
 		return nil
 	}
 	var existingID string
-	err = tx.QueryRow(`SELECT logical_id FROM baseline WHERE name = ?`, copy.Name).Scan(&existingID)
+	existingID, err = q.BaselineLogicalIDByName(storeContext, copy.Name)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return fmt.Errorf("save baseline lookup by name: %w", err)
 	}
@@ -86,9 +91,9 @@ func saveBaselineTx(tx *sql.Tx, sess *model.Session, allowSessionReplacement boo
 		if existingID != "" && existingID != copy.LogicalID && !allowSessionReplacement {
 			return fmt.Errorf("save baseline: session name %q belongs to logical session %s; freeze the intended replacement before saving", copy.Name, existingID)
 		}
-		_, err = tx.Exec(`UPDATE baseline SET body = ?, updated_at = ?, logical_id = ? WHERE name = ?`, body, time.Now().Unix(), copy.LogicalID, copy.Name)
+		err = q.UpdateBaselineByName(storeContext, dbgen.UpdateBaselineByNameParams{Body: string(body), UpdatedAt: time.Now().Unix(), LogicalID: copy.LogicalID, Name: copy.Name})
 	} else {
-		_, err = tx.Exec(`INSERT INTO baseline (name, body, updated_at, logical_id) VALUES (?, ?, ?, ?)`, copy.Name, body, time.Now().Unix(), copy.LogicalID)
+		err = q.InsertBaseline(storeContext, dbgen.InsertBaselineParams{Name: copy.Name, Body: string(body), UpdatedAt: time.Now().Unix(), LogicalID: copy.LogicalID})
 	}
 	if err != nil {
 		return fmt.Errorf("save baseline: %w", err)
@@ -139,8 +144,7 @@ func validateBaselineIdentityTree(session model.Session) error {
 // GetBaseline returns the recorded baseline for a session, or (nil, nil) when
 // none has been recorded yet.
 func (s *Store) GetBaseline(name string) (*model.Session, error) {
-	var body string
-	err := s.db.QueryRow(`SELECT body FROM baseline WHERE name = ?`, name).Scan(&body)
+	body, err := s.q.BaselineByName(storeContext, name)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -158,8 +162,7 @@ func (s *Store) GetBaselineByLogicalID(id string) (*model.Session, error) {
 	if id == "" {
 		return nil, nil
 	}
-	var body string
-	err := s.db.QueryRow(`SELECT body FROM baseline WHERE logical_id = ?`, id).Scan(&body)
+	body, err := s.q.BaselineByLogicalID(storeContext, id)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}

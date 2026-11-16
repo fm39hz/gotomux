@@ -1,13 +1,16 @@
 package store
 
 import (
+	"context"
 	"database/sql"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"testing"
 
 	"github.com/fm39hz/gotomux/internal/config"
 	"github.com/fm39hz/gotomux/internal/model"
+	"github.com/pressly/goose/v3"
 )
 
 func TestSaveOverwritesAliasAndCwd(t *testing.T) {
@@ -167,36 +170,19 @@ func TestMigrateVersion7AddsBaselineLogicalID(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Pre-cmd_path pane schema (window.cwd present — that ship sailed long ago).
-	if _, err := db.Exec(`
-CREATE TABLE session (
-  name       TEXT PRIMARY KEY,
-  cwd        TEXT NOT NULL,
-  created_at INTEGER NOT NULL,
-  last_used  INTEGER NOT NULL DEFAULT 0
-);
-CREATE TABLE window (
-  id      INTEGER PRIMARY KEY,
-  session TEXT NOT NULL REFERENCES session(name) ON DELETE CASCADE,
-  idx     INTEGER NOT NULL,
-  name    TEXT NOT NULL DEFAULT '',
-  cwd     TEXT NOT NULL DEFAULT '',
-  layout  TEXT,
-  UNIQUE(session, idx)
-);
-CREATE TABLE pane (
-  id        INTEGER PRIMARY KEY,
-  window_id INTEGER NOT NULL REFERENCES window(id) ON DELETE CASCADE,
-  idx       INTEGER NOT NULL,
-  cwd       TEXT,
-  cmd       TEXT,
-  UNIQUE(window_id, idx)
-);
-CREATE TABLE baseline (
-  name       TEXT PRIMARY KEY,
-  body       TEXT NOT NULL,
-  updated_at INTEGER NOT NULL
-);
+	migrationFS, err := fs.Sub(migrationFiles, "migrations")
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider, err := goose.NewProvider(goose.DialectSQLite3, db, migrationFS,
+		goose.WithDisableGlobalRegistry(true), goose.WithLogger(goose.NopLogger()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := provider.UpTo(context.Background(), 7); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`DROP TABLE goose_db_version;
 INSERT INTO baseline(name, body, updated_at) VALUES ('old-session', '{"Name":"old-session"}', 1);
 PRAGMA user_version = 7;`); err != nil {
 		t.Fatal(err)
