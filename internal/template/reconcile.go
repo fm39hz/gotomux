@@ -63,10 +63,19 @@ func ReconcileSession(ctx context.Context, ctl ReconcileOps, st store.Storer, na
 		if err := json.Unmarshal([]byte(active.PlanJSON), &plan); err != nil {
 			return "", fmt.Errorf("reconcile journal %q has invalid plan JSON: %w", active.ID, err)
 		}
-		if plan.Policy != policy {
-			return "", fmt.Errorf("reconcile journal %q uses policy %q; resume it with the same policy", active.ID, plan.Policy)
+		if plan.Status == core.PlanNoop && active.Status == model.JournalNeedsAttention {
+			// A no-op journal has no tmux mutations to recover. If its verification
+			// failed, its plan is stale by definition; release the claim and resolve
+			// the current snapshot again instead of trapping the session behind it.
+			if err := st.UpdateReconcile(active.ID, model.JournalAborted, active.CompletedStep, "stale no-op plan failed verification; recomputing from current snapshot"); err != nil {
+				return "", fmt.Errorf("abort stale no-op reconcile journal %q: %w", active.ID, err)
+			}
+		} else {
+			if plan.Policy != policy {
+				return "", fmt.Errorf("reconcile journal %q uses policy %q; resume it with the same policy", active.ID, plan.Policy)
+			}
+			return executeAndCommit(ctx, ctl, st, name, active.ID, plan)
 		}
-		return executeAndCommit(ctx, ctl, st, name, active.ID, plan)
 	}
 
 	desired := core.DesiredState{Session: *base}
@@ -346,7 +355,7 @@ func reconcileReport(plan core.PlanResult) string {
 			if groupNote != "" {
 				return "already aligned" + groupNote
 			}
-			return ""
+			return "already aligned"
 		}
 		return fmt.Sprintf("already aligned; preserved %d extra window(s) and %d extra pane(s)%s", len(plan.PreservedWindows), len(plan.PreservedPanes), groupNote)
 	}

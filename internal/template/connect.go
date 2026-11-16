@@ -11,6 +11,7 @@ import (
 	"github.com/fm39hz/gotomux/internal/model"
 	"github.com/fm39hz/gotomux/internal/store"
 	"github.com/fm39hz/gotomux/internal/tmux"
+	"github.com/fm39hz/gotomux/internal/tmuxlayout"
 )
 
 var globalBus *event.Bus
@@ -299,7 +300,9 @@ func ConnectPreset(ctl tmux.Connector, st store.Storer, p *model.Session) error 
 	}
 	if st != nil {
 		baseline := cloneSession(instance)
-		bindLoadedIDs(baseline, observed)
+		if err := bindLoadedIDs(baseline, observed); err != nil {
+			return fmt.Errorf("load preset %q layout identity: %w", p.Name, err)
+		}
 		baseline.SchemaVersion = model.CurrentBaselineSchemaVersion
 		stampSemanticMetadata(baseline)
 		if err := st.SaveBaseline(baseline); err != nil {
@@ -433,7 +436,11 @@ func samePersistedPreset(preset, baseline *model.Session) bool {
 	}
 	for wi := range preset.Windows {
 		pw, bw := preset.Windows[wi], baseline.Windows[wi]
-		if pw.Idx != bw.Idx || pw.Name != bw.Name || pw.Cwd != bw.Cwd || pw.Layout != bw.Layout || len(pw.Panes) != len(bw.Panes) {
+		layoutEqual := pw.Layout == bw.Layout
+		if !layoutEqual {
+			layoutEqual, _ = tmuxlayout.Compare(pw.Layout, len(pw.Panes), bw.Layout, len(bw.Panes))
+		}
+		if pw.Idx != bw.Idx || pw.Name != bw.Name || pw.Cwd != bw.Cwd || !layoutEqual || len(pw.Panes) != len(bw.Panes) {
 			return false
 		}
 		for pi := range pw.Panes {
@@ -471,19 +478,48 @@ func cloneSession(p *model.Session) *model.Session {
 	return &copy
 }
 
-func bindLoadedIDs(target, observed *model.Session) {
+func bindLoadedIDs(target, observed *model.Session) error {
 	if target == nil || observed == nil {
-		return
+		return fmt.Errorf("missing loaded or observed session")
+	}
+	if len(target.Windows) != len(observed.Windows) {
+		return fmt.Errorf("loaded session has %d windows; observation has %d", len(target.Windows), len(observed.Windows))
 	}
 	target.LogicalID, target.TmuxID = observed.LogicalID, observed.TmuxID
 	target.ServerKey = observed.ServerKey
-	for wi := 0; wi < len(target.Windows) && wi < len(observed.Windows); wi++ {
-		tw, ow := &target.Windows[wi], observed.Windows[wi]
+	for wi := range target.Windows {
+		tw, ow := &target.Windows[wi], &observed.Windows[wi]
+		if len(tw.Panes) != len(ow.Panes) {
+			return fmt.Errorf("loaded window %d has %d panes; observation has %d", wi, len(tw.Panes), len(ow.Panes))
+		}
+		if ow.Layout != "" {
+			tw.Layout = ow.Layout
+			bindings, err := tmuxlayout.PaneBindings(tw.Layout)
+			if err != nil {
+				return fmt.Errorf("inspect window %d layout: %w", wi, err)
+			}
+			if len(bindings) != 0 {
+				paneIDsByIndex := make(map[int]string, len(ow.Panes))
+				paneIndexes := make(map[int]int, len(ow.Panes))
+				for _, pane := range ow.Panes {
+					if pane.TmuxID == "" || pane.SlotID == "" {
+						return fmt.Errorf("loaded window %d pane index %d has incomplete runtime/slot identity", wi, pane.Idx)
+					}
+					paneIDsByIndex[pane.Idx] = pane.SlotID
+					paneIndexes[pane.Idx] = pane.Idx
+				}
+				tw.Layout, err = tmuxlayout.RemapPaneBindingsByIndex(tw.Layout, paneIDsByIndex, paneIndexes)
+				if err != nil {
+					return fmt.Errorf("normalize loaded window %d layout IDs to stable pane slots: %w", wi, err)
+				}
+			}
+		}
 		tw.Idx, tw.TmuxID, tw.SlotID = ow.Idx, ow.TmuxID, ow.SlotID
-		for pi := 0; pi < len(tw.Panes) && pi < len(ow.Panes); pi++ {
+		for pi := range tw.Panes {
 			tw.Panes[pi].Idx = ow.Panes[pi].Idx
 			tw.Panes[pi].TmuxID = ow.Panes[pi].TmuxID
 			tw.Panes[pi].SlotID = ow.Panes[pi].SlotID
 		}
 	}
+	return nil
 }

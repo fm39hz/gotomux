@@ -30,12 +30,31 @@ func Plan(desired DesiredState, live model.Snapshot, resolution Resolution, poli
 		return result
 	}
 	base := desired.Session
-	if policy == PolicyPreserve {
-		result.FinalActiveWindowID = live.ActiveWindowID
-	}
 	if err := validateDesiredIdentities(base); err != nil {
 		result.BlockedReason = err.Error()
 		return result
+	}
+	if policy == PolicyPreserve {
+		for _, match := range resolution.Windows {
+			if match.Match.OutsideTarget || match.Match.BaselineIndex < 0 || match.Match.BaselineIndex >= len(base.Windows) {
+				continue
+			}
+			want := base.Windows[match.Match.BaselineIndex]
+			wantRole := semanticWindowRole(base, want)
+			if wantRole == "" {
+				continue
+			}
+			got, ok := targetWindowByID(live.Target, match.Match.LiveRuntimeID)
+			if !ok {
+				result.BlockedReason = fmt.Sprintf("cannot verify the semantic role of identified window %s", match.Match.LiveRuntimeID)
+				return result
+			}
+			gotRole := semanticWindowRole(live.Target, got)
+			if gotRole != wantRole && !hasDurableIdentity(match.Match) {
+				result.BlockedReason = fmt.Sprintf("identified window %s has semantic role %q; baseline requires %q; preserve cannot safely replace its live panes", got.TmuxID, gotRole, wantRole)
+				return result
+			}
+		}
 	}
 	if len(resolution.Windows)+len(resolution.Missing) != len(base.Windows) {
 		result.BlockedReason = "resolution does not cover every baseline window exactly once"
@@ -350,12 +369,13 @@ func appendLayoutOperation(operations []Operation, desired DesiredState, live mo
 		return operations
 	}
 	equal, known := tmuxlayout.Compare(want.Layout, len(want.Panes), window.Layout, len(window.Panes))
-	if known && equal {
+	paneOrderMatches, paneOrderKnown := paneSlotLayoutMatches(want, window, match.Panes)
+	if known && equal && (!paneOrderKnown || paneOrderMatches) {
 		return operations
 	}
 	operations = append(operations, Operation{
 		Kind: OperationApplyLayout, Target: target, TargetIdentityID: match.Match.LiveIdentityID, ExpectedServerKey: live.ServerKey, ExpectedSessionID: live.TargetSessionID,
-		ExpectedPaneCount: len(want.Panes), Window: model.Window{Layout: want.Layout},
+		ExpectedPaneCount: len(want.Panes), Window: model.Window{Layout: want.Layout, Panes: append([]model.Pane(nil), want.Panes...)},
 		Reason: "restore baseline split topology without replacing surviving pane processes",
 	})
 	return operations
@@ -376,12 +396,16 @@ func exactStateMatches(desired DesiredState, live model.Snapshot, resolution Res
 			return false
 		}
 		wantRole, gotRole := semanticWindowRole(base, want), semanticWindowRole(live.Target, got)
-		if wantRole != "" && gotRole != "" && wantRole != gotRole {
+		if wantRole != "" && wantRole != gotRole {
 			return false
 		}
 		if want.Layout != "" {
 			equal, known := tmuxlayout.Compare(want.Layout, len(want.Panes), got.Layout, len(got.Panes))
 			if !known || !equal {
+				return false
+			}
+			paneOrderMatches, paneOrderKnown := paneSlotLayoutMatches(want, got, match.Panes)
+			if paneOrderKnown && !paneOrderMatches {
 				return false
 			}
 		}

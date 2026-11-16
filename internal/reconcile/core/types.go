@@ -205,7 +205,6 @@ type PlanResult struct {
 	ClassifierVersion        int
 	BlockedReason            string
 	StartSnapshotFingerprint string
-	FinalActiveWindowID      string
 	FinalActiveSlotID        string
 	Operations               []Operation
 	PreservedWindows         []string

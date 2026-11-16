@@ -2,6 +2,8 @@ package template
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -44,18 +46,81 @@ type baselineTestStore struct {
 	store.Storer
 	baseline *model.Session
 	started  bool
+	active   *model.ReconcileJournal
+	journals map[string]model.ReconcileJournal
 }
 
 func (s *baselineTestStore) GetBaselineByLogicalID(string) (*model.Session, error) {
 	return s.baseline, nil
 }
 
-func (*baselineTestStore) GetActiveReconcile(string) (*model.ReconcileJournal, error) {
-	return nil, nil
+func (s *baselineTestStore) GetActiveReconcile(key string) (*model.ReconcileJournal, error) {
+	if s.active == nil || s.active.SessionKey != key || s.active.Status == model.JournalAborted || s.active.Status == model.JournalComplete {
+		return nil, nil
+	}
+	copy := *s.active
+	return &copy, nil
 }
 
-func (s *baselineTestStore) StartReconcile(model.ReconcileJournal) error {
+func (s *baselineTestStore) ListActiveReconciles() ([]model.ReconcileJournal, error) {
+	if s.active == nil || s.active.Status == model.JournalAborted || s.active.Status == model.JournalComplete {
+		return nil, nil
+	}
+	return []model.ReconcileJournal{*s.active}, nil
+}
+
+func (s *baselineTestStore) StartReconcile(journal model.ReconcileJournal) error {
 	s.started = true
+	if s.journals == nil {
+		s.journals = make(map[string]model.ReconcileJournal)
+	}
+	s.journals[journal.ID] = journal
+	s.active = &journal
+	return nil
+}
+
+func (s *baselineTestStore) GetReconcile(id string) (*model.ReconcileJournal, error) {
+	journal, ok := s.journals[id]
+	if !ok {
+		return nil, nil
+	}
+	copy := journal
+	return &copy, nil
+}
+
+func (s *baselineTestStore) UpdateReconcile(id string, status model.ReconcileJournalStatus, step int, lastError string) error {
+	journal, ok := s.journals[id]
+	if !ok && s.active != nil && s.active.ID == id {
+		journal, ok = *s.active, true
+	}
+	if !ok {
+		return fmt.Errorf("unknown journal %q", id)
+	}
+	journal.Status, journal.CompletedStep, journal.LastError = status, step, lastError
+	if s.journals == nil {
+		s.journals = make(map[string]model.ReconcileJournal)
+	}
+	s.journals[id] = journal
+	s.active = &journal
+	return nil
+}
+
+func (s *baselineTestStore) CommitReconcile(session *model.Session, journalID string) error {
+	if session == nil {
+		return fmt.Errorf("nil baseline")
+	}
+	journal, ok := s.journals[journalID]
+	if !ok {
+		return fmt.Errorf("unknown journal %q", journalID)
+	}
+	var plan core.PlanResult
+	if err := json.Unmarshal([]byte(journal.PlanJSON), &plan); err != nil {
+		return err
+	}
+	if err := s.UpdateReconcile(journalID, model.JournalComplete, len(plan.Operations), ""); err != nil {
+		return err
+	}
+	s.baseline = session
 	return nil
 }
 
@@ -100,6 +165,87 @@ func TestReconcileRejectsUnidentifiedBaselineBeforeMutation(t *testing.T) {
 	}
 }
 
+func TestReconcileReplansAfterNoopJournalNeedsAttention(t *testing.T) {
+	baseline := model.Session{
+		Name: "work", LogicalID: "00000000-0000-4000-8000-000000000001", TmuxID: "$1", ServerKey: "server-a",
+		SchemaVersion: model.CurrentBaselineSchemaVersion, ClassifierVersion: 1,
+		Windows: []model.Window{{Idx: 1, Name: "yazi", Role: "files", Cwd: "/work", SlotID: "00000000-0000-4000-8000-000000000002", TmuxID: "@1", Panes: []model.Pane{{Idx: 1, Cmd: "yazi", Cwd: "/work", SlotID: "00000000-0000-4000-8000-000000000003", TmuxID: "%1"}}}},
+	}
+	snapshot := model.Snapshot{
+		ServerKey: "server-a", Complete: true, Target: baseline, TargetSessionID: "$1", ActiveWindowID: "@1",
+		Sessions:    []model.SessionIdentity{{Name: "work", LogicalID: baseline.LogicalID, RuntimeID: "$1"}},
+		Objects:     []model.ObjectIdentity{{Kind: model.ObjectSession, LogicalID: baseline.LogicalID, RuntimeID: "$1"}, {Kind: model.ObjectWindow, SlotID: baseline.Windows[0].SlotID, RuntimeID: "@1", PaneCount: 1}, {Kind: model.ObjectPane, SlotID: baseline.Windows[0].Panes[0].SlotID, RuntimeID: "%1", ParentID: "@1"}},
+		Memberships: []model.WindowMembership{{SessionID: "$1", WindowID: "@1", Index: 1}},
+	}
+	desired := core.DesiredState{Session: baseline, ClassifierVersion: 1}
+	plan := core.Plan(desired, snapshot, core.Resolve(desired, snapshot), core.PolicyPreserve)
+	if plan.Status != core.PlanNoop {
+		t.Fatalf("fixture plan = %+v; want noop", plan)
+	}
+	planJSON, err := json.Marshal(plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := model.ReconcileJournal{ID: "old-noop", SessionKey: baseline.LogicalID, SessionName: baseline.Name, SessionLogicalID: baseline.LogicalID, Policy: string(core.PolicyPreserve), Status: model.JournalNeedsAttention, PlanJSON: string(planJSON)}
+	st := &baselineTestStore{baseline: &baseline, active: &old, journals: map[string]model.ReconcileJournal{old.ID: old}}
+	ops := &identifiedTestOps{snapshot: snapshot}
+	_, err = ReconcileSession(context.Background(), ops, st, baseline.Name, false)
+	if err != nil {
+		t.Fatalf("reconcile after stale no-op journal: %v", err)
+	}
+	if st.journals[old.ID].Status != model.JournalAborted {
+		t.Fatalf("stale no-op journal status = %s, want aborted", st.journals[old.ID].Status)
+	}
+	if st.active == nil || st.active.ID == old.ID || st.active.Status != model.JournalComplete {
+		t.Fatalf("replacement journal = %+v, want a newly completed journal", st.active)
+	}
+}
+
+func TestNeedsAttentionNoopJournalReplansCurrentTaggedLiveState(t *testing.T) {
+	baseline := model.Session{
+		Name: "work", LogicalID: "00000000-0000-4000-8000-000000000001", TmuxID: "$1", ServerKey: "server-a",
+		SchemaVersion: model.CurrentBaselineSchemaVersion, ClassifierVersion: 1,
+		Windows: []model.Window{{Idx: 1, Name: "yazi", Role: "files", Cwd: "/work", SlotID: "00000000-0000-4000-8000-000000000002", TmuxID: "@1", Panes: []model.Pane{{Idx: 1, Cmd: "yazi", Cwd: "/work", SlotID: "00000000-0000-4000-8000-000000000003", TmuxID: "%1"}}}},
+	}
+	oldSnapshot := model.Snapshot{
+		ServerKey: "server-a", Complete: true, Target: baseline, TargetSessionID: "$1", ActiveWindowID: "@1",
+		Sessions:    []model.SessionIdentity{{Name: "work", LogicalID: baseline.LogicalID, RuntimeID: "$1"}},
+		Objects:     []model.ObjectIdentity{{Kind: model.ObjectSession, LogicalID: baseline.LogicalID, RuntimeID: "$1"}, {Kind: model.ObjectWindow, SlotID: baseline.Windows[0].SlotID, RuntimeID: "@1", PaneCount: 1}, {Kind: model.ObjectPane, SlotID: baseline.Windows[0].Panes[0].SlotID, RuntimeID: "%1", ParentID: "@1"}},
+		Memberships: []model.WindowMembership{{SessionID: "$1", WindowID: "@1", Index: 1}},
+	}
+	desired := core.DesiredState{Session: baseline, ClassifierVersion: 1}
+	oldPlan := core.Plan(desired, oldSnapshot, core.Resolve(desired, oldSnapshot), core.PolicyPreserve)
+	if oldPlan.Status != core.PlanNoop {
+		t.Fatalf("old plan = %+v; want noop", oldPlan)
+	}
+	planJSON, err := json.Marshal(oldPlan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := model.ReconcileJournal{ID: "stale-noop", SessionKey: baseline.LogicalID, SessionName: baseline.Name, SessionLogicalID: baseline.LogicalID, Policy: string(core.PolicyPreserve), Status: model.JournalNeedsAttention, PlanJSON: string(planJSON)}
+	st := &baselineTestStore{baseline: &baseline, active: &old, journals: map[string]model.ReconcileJournal{old.ID: old}}
+	current := oldSnapshot
+	current.Target.Windows = append([]model.Window(nil), oldSnapshot.Target.Windows...)
+	current.Target.Windows[0].Name = "fish"
+	current.Target.Windows[0].Role = ""
+	current.Target.Windows[0].Panes = append([]model.Pane(nil), oldSnapshot.Target.Windows[0].Panes...)
+	current.Target.Windows[0].Panes[0].Cmd = "fish"
+	ops := &identifiedTestOps{snapshot: current}
+	_, err = ReconcileSession(context.Background(), ops, st, baseline.Name, false)
+	if err != nil {
+		t.Fatalf("reconcile after stale no-op journal: %v", err)
+	}
+	if st.journals[old.ID].Status != model.JournalAborted {
+		t.Fatalf("stale no-op journal status = %s, want aborted", st.journals[old.ID].Status)
+	}
+	if !st.started || st.active == nil || st.active.ID == old.ID || st.active.Status != model.JournalComplete {
+		t.Fatalf("fresh plan was not started and completed after role drift: started=%v active=%+v", st.started, st.active)
+	}
+	if st.baseline.Windows[0].Role != "files" {
+		t.Fatalf("preserve refresh replaced frozen role with live role %q", st.baseline.Windows[0].Role)
+	}
+}
+
 func TestReconcileRejectsHiddenDaemonSession(t *testing.T) {
 	dir := t.TempDir()
 	st, err := store.OpenWithConfig(&config.Config{DataDir: filepath.Join(dir, "data")})
@@ -122,6 +268,9 @@ func TestReconcileReportsIncludeRuntimeIDsAndPolicyOutcome(t *testing.T) {
 	noop := reconcileReport(core.PlanResult{Status: core.PlanNoop, Policy: core.PolicyPreserve, PreservedWindows: []string{"@9"}, PreservedPanes: []string{"%20"}})
 	if !strings.Contains(noop, "already aligned") || !strings.Contains(noop, "preserved 1 extra window") {
 		t.Fatalf("preserve no-op report = %q", noop)
+	}
+	if got := reconcileReport(core.PlanResult{Status: core.PlanNoop, Policy: core.PolicyPreserve}); got != "already aligned" {
+		t.Fatalf("plain no-op report = %q, want explicit confirmation", got)
 	}
 	exact := reconcileReport(core.PlanResult{Status: core.PlanReady, Policy: core.PolicyExact, DesiredSession: model.Session{Windows: []model.Window{{}, {}}}})
 	if !strings.Contains(exact, "hard reconciled") || !strings.Contains(exact, "2 window(s)") {

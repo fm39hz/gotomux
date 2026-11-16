@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/fm39hz/gotomux/internal/model"
+	"github.com/fm39hz/gotomux/internal/tmuxlayout"
 )
 
 func (c *Ctl) CreateWindowWithOperation(ctx context.Context, sessionID string, idx int, want model.Window, sessionCwd, operationID string) (string, error) {
@@ -139,7 +140,19 @@ func (c *Ctl) createWindowWithOperation(ctx context.Context, sessionID string, i
 		}
 	}
 	if want.Layout != "" {
-		if err := c.ApplyLayoutAt(ctx, sessionID, windowID, idx, want.Layout); err != nil {
+		current, err := c.Observe(ctx, sessionName)
+		if err != nil {
+			return "", fmt.Errorf("observe panes before applying layout: %w", err)
+		}
+		liveWindow, ok := findDetailedWindow(current, windowID)
+		if !ok {
+			return "", fmt.Errorf("window %s disappeared before applying layout", windowID)
+		}
+		layout, err := layoutForLivePaneSlots(want.Layout, want.Panes, liveWindow.Panes)
+		if err != nil {
+			return "", fmt.Errorf("bind saved layout to current pane IDs: %w", err)
+		}
+		if err := c.ApplyLayoutAt(ctx, sessionID, windowID, idx, layout); err != nil {
 			return "", fmt.Errorf("apply created window layout: %w", err)
 		}
 	}
@@ -169,6 +182,29 @@ func (c *Ctl) createWindowWithOperation(ctx context.Context, sessionID string, i
 		return "", fmt.Errorf("created window %s lost operation marker %q during construction", windowID, operationID)
 	}
 	return windowID, nil
+}
+
+func layoutForLivePaneSlots(layout string, desired, live []model.Pane) (string, error) {
+	if !strings.HasPrefix(strings.TrimSpace(layout), "{") {
+		return layout, nil
+	}
+	liveBySlot := make(map[string]model.Pane, len(live))
+	for _, pane := range live {
+		if pane.SlotID != "" {
+			liveBySlot[pane.SlotID] = pane
+		}
+	}
+	remap := make(map[int]string, len(desired))
+	indexRemap := make(map[int]int, len(desired))
+	for _, pane := range desired {
+		livePane, ok := liveBySlot[pane.SlotID]
+		if !ok || livePane.TmuxID == "" {
+			return "", fmt.Errorf("layout pane slot %s has incomplete frozen/live runtime binding", pane.SlotID)
+		}
+		remap[pane.Idx] = livePane.TmuxID
+		indexRemap[pane.Idx] = livePane.Idx
+	}
+	return tmuxlayout.RemapPaneBindingsByIndex(layout, remap, indexRemap)
 }
 
 func operationMarkerForObject(objects []model.ObjectIdentity, kind IdentityKind, runtimeID, operationID string) bool {

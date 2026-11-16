@@ -10,6 +10,7 @@ import (
 	"github.com/fm39hz/gotomux/internal/model"
 	"github.com/fm39hz/gotomux/internal/project"
 	"github.com/fm39hz/gotomux/internal/store/dbgen"
+	"github.com/fm39hz/gotomux/internal/tmuxlayout"
 )
 
 func (s *Store) ListNames() ([]string, error) {
@@ -154,7 +155,11 @@ func bindPresetIdentityTx(tx *sql.Tx, sess *model.Session) error {
 	}
 	for i, want := range sess.Windows {
 		got := windows[i]
-		if got.Name != want.Name || got.Cwd != want.Cwd || got.Layout != want.Layout {
+		layoutEqual := got.Layout == want.Layout
+		if !layoutEqual {
+			layoutEqual, _ = tmuxlayout.Compare(got.Layout, len(want.Panes), want.Layout, len(want.Panes))
+		}
+		if got.Name != want.Name || got.Cwd != want.Cwd || !layoutEqual {
 			return fmt.Errorf("preset %q window %d no longer matches the baseline", sess.Name, i)
 		}
 		if got.SlotID != "" && got.SlotID != want.SlotID {

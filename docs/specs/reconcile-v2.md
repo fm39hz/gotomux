@@ -49,7 +49,7 @@ Gotomux stores the session `LogicalID` and assigned window/pane `SlotID`s in ver
 
 ### Desired state and live snapshot
 
-The baseline is a desired-state document. It must contain the session logical ID and a slot ID for every required window and pane, along with versioned semantic roles (`Window.Role` plus `Session.ClassifierVersion`), required topology, replay data for missing objects, and schema version. Runtime IDs and server generation are cached observations, not the definition of desired state. Session baseline rows remain addressable by logical ID across session rename; the stored name is a locator/display value.
+The baseline is a desired-state document. It must contain the session logical ID and a slot ID for every required window and pane, along with versioned semantic roles (`Window.Role` plus `Session.ClassifierVersion`), required topology, replay data for missing objects, and schema version. A pane slot's leaf in a frozen tmux layout is part of the desired topology: matching pane count and split-tree shape alone is insufficient. Runtime IDs and server generation are cached observations, not the definition of desired state. Session baseline rows remain addressable by logical ID across session rename; the stored name is a locator/display value.
 
 A live snapshot contains server generation; session logical/runtime identity; window and pane logical/runtime identities; session membership; semantic classification; pane command evidence; working directories; and topology. The adapter marks incomplete observations as errors rather than returning a partial snapshot that looks complete.
 
@@ -74,6 +74,7 @@ Session logical-ID and window/pane slot-tag matches are accepted only when uniqu
 - `preserve` is the default: restore required baseline topology where safe, preserve unclassified/extra live objects, and report them.
 - `exact` is the existing `--hard` policy: rebuild the session to match the frozen baseline exactly and terminate the pane processes it replaces. It requires explicit confirmation unless the user supplies `--force`.
 - Name normalization and semantic-classifier version are persisted. A classifier-version change triggers re-resolution; it does not silently rewrite identity.
+- In preserve mode, a durable window slot/runtime identity remains authoritative if its process-derived role changes; the live process is preserved and the frozen role remains in the baseline. A semantic-only match still must satisfy the role contract. Exact mode always verifies the frozen role.
 
 The existing `--hard` flag maps to `exact`. `--force` skips only the interactive confirmation; it never skips identity checks, conflict checks, preconditions, or verification.
 
@@ -93,6 +94,8 @@ The planner never emits an operation for an ambiguous or conflicting identity. W
 
 An exact-rebuild operation records the complete original runtime window set. It creates replacement windows at deterministic staging indices with operation-scoped temporary slot IDs, and markers remain on each new window and pane until the whole exact result verifies. After every replacement verifies, it removes originals, promotes temporary slots to baseline slots, and places windows at their frozen indices. This keeps a valid window in the session throughout and makes every interrupted phase recoverable from slot and operation IDs.
 
+When applying a JSON tmux layout, the executor maps each frozen layout leaf to its pane `SlotID`, then rewrites both the pane runtime ID and tmux pane index for the current live pane. It verifies that live pane slots occupy the same leaf order as the baseline. The committed baseline refreshes those runtime IDs and indexes while retaining the slot-to-leaf mapping, so a repeated reconcile cannot drift.
+
 Planning is pure and deterministic for identical inputs. The plan is inspectable and can be rendered as a concise explanation before mutation.
 
 ## Executor and recovery
@@ -104,6 +107,7 @@ Tmux mutations are not globally atomic. Therefore:
 - New objects receive a unique operation marker at creation and their baseline slot ID as early as possible. Exact rebuild retains its markers through final verification and clears them afterward; a slot tag without the matching operation marker is not accepted as proof that a window belongs to an interrupted exact run.
 - A durable operation journal records plan ID, completed operations, and observed object IDs. Recovery first observes tmux and advances the journal from facts; it does not blindly replay completed work.
 - An operation whose outcome cannot be determined becomes `needs_attention`; it is not retried by creating another object.
+- A `needs_attention` journal containing a no-op plan has no tmux mutations to recover. The next reconcile aborts that stale journal and plans from a fresh observation instead of retrying or blocking on its old result.
 - Kill operations require a final exact runtime-ID and membership precondition immediately before execution.
 - Exact rebuild records the original runtime window set and stages uniquely tagged replacements before removing originals. Retries identify staged windows and panes through operation markers, never through names or copied baseline slot tags.
 - Exact rebuild stops before mutation if a target window is linked into another session; it never kills a shared tmux window as a side effect.
@@ -156,10 +160,11 @@ Both standalone and daemon-mediated paths must use the same semantics. Reconcile
 6. A successful reconcile is idempotent on immediate repetition.
 7. A retry after partial execution does not create duplicate windows/panes.
 8. Preserve mode does not kill user processes.
-9. Exact/force never bypass identity or safety invariants.
-10. Same-server linked-window membership is modeled rather than mistaken for object deletion.
-11. SQLite changes remain additive. Old baselines without required IDs are rejected without mutation and can be replaced by a fresh freeze.
-12. Reports distinguish completed, preserved-extra, ambiguous, conflict, partial/recoverable, and failed states.
+9. Pane slot placement as well as split-tree topology is restored and verified; two surviving panes cannot silently swap to different layout leaves. Repeated reconcile is stable.
+10. Exact/force never bypass identity or safety invariants.
+11. Same-server linked-window membership is modeled rather than mistaken for object deletion.
+12. SQLite changes remain additive. Old baselines without required IDs are rejected without mutation and can be replaced by a fresh freeze.
+13. Reports distinguish completed, preserved-extra, ambiguous, conflict, partial/recoverable, and failed states.
 
 ## Acceptance scenarios
 
@@ -177,6 +182,9 @@ Both standalone and daemon-mediated paths must use the same semantics. Reconcile
 - Interrupt after each mutation boundary and retry: recover or report `needs_attention`, never blindly duplicate completed work.
 - Run preserve and exact (`--hard`) policies: preserve process IDs in the former; terminate/rebuild the exact baseline in the latter only after confirmation and complete identity validation.
 - Freeze `files` with a running `yazi` pane, rename the live window to `yazi`, then reconcile: the `files` semantic role verifies without renaming the live window.
+- Freeze a four-pane two-row window, kill the two top-row panes, and reconcile: the surviving bottom-row pane slots stay in the bottom leaves, recreated top-row slots return above them, and a second reconcile leaves every slot in the same leaf.
+- Leave a previously frozen durable window slot running a different shell/process, then remove another baseline window: preserve retains the identified live process, restores the missing window, and keeps the frozen role for a later exact rebuild.
+- Leave a no-op journal in `needs_attention`, then change the live session: reconcile aborts the stale no-op journal and plans from the new observation.
 
 ## Rollout
 

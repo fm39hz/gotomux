@@ -2,6 +2,7 @@ package template
 
 import (
 	"context"
+	"encoding/json"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -10,6 +11,7 @@ import (
 
 	"github.com/fm39hz/gotomux/internal/config"
 	"github.com/fm39hz/gotomux/internal/model"
+	core "github.com/fm39hz/gotomux/internal/reconcile/core"
 	"github.com/fm39hz/gotomux/internal/store"
 	"github.com/fm39hz/gotomux/internal/tmux"
 	"github.com/fm39hz/gotomux/internal/tmuxtest"
@@ -146,8 +148,70 @@ func TestReconcileSessionRebuildsDeadWindowAndKeepsProcesses(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if report != "" {
-		t.Errorf("third run report = %q, want empty (already at baseline)", report)
+	if report != "already aligned" {
+		t.Errorf("third run report = %q, want explicit already-aligned result", report)
+	}
+}
+
+func TestNeedsAttentionNoopJournalReplansAfterWindowDisappears(t *testing.T) {
+	root := tmuxtest.Isolate(t)
+	st, err := store.OpenWithConfig(&config.Config{DataDir: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	ctl, err := tmux.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	preset := &model.Session{Name: "stale-noop", Cwd: "/tmp", Windows: []model.Window{
+		{Name: "editor", Cwd: "/tmp", Panes: []model.Pane{{Cmd: "sleep 340", Cwd: "/tmp"}}},
+		{Name: "command", Cwd: "/tmp", Panes: []model.Pane{{Cmd: "sleep 341", Cwd: "/tmp"}}},
+	}}
+	if err := ctl.Load(context.Background(), preset); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(250 * time.Millisecond)
+	if _, _, err := FreezeRemember(ctl, st, preset.Name); err != nil {
+		t.Fatal(err)
+	}
+	baseline, err := st.GetBaseline(preset.Name)
+	if err != nil || baseline == nil {
+		t.Fatalf("frozen baseline = %+v err=%v", baseline, err)
+	}
+	snapshot, err := ctl.Observe(context.Background(), preset.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	desired := core.DesiredState{Session: *baseline, ClassifierVersion: baseline.ClassifierVersion}
+	plan := core.Plan(desired, *snapshot, core.Resolve(desired, *snapshot), core.PolicyPreserve)
+	if plan.Status != core.PlanNoop {
+		t.Fatalf("initial no-op plan = %+v", plan)
+	}
+	planJSON, err := json.Marshal(plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	journal := model.ReconcileJournal{ID: "stale-noop", SessionKey: baseline.LogicalID, SessionName: baseline.Name, SessionLogicalID: baseline.LogicalID, Policy: string(core.PolicyPreserve), Status: model.JournalPlanned, PlanJSON: string(planJSON)}
+	if err := st.StartReconcile(journal); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpdateReconcile(journal.ID, model.JournalNeedsAttention, 0, "simulated verification failure after noop"); err != nil {
+		t.Fatal(err)
+	}
+	if err := ctl.KillWindowAt(context.Background(), snapshot.TargetSessionID, baseline.Windows[1].TmuxID, baseline.Windows[1].Idx); err != nil {
+		t.Fatal(err)
+	}
+	if report, err := ReconcileSession(context.Background(), ctl, st, preset.Name, false); err != nil || !strings.Contains(report, "1 recreated") {
+		t.Fatalf("reconcile after stale noop journal = report %q err=%v", report, err)
+	}
+	old, err := st.GetReconcile(journal.ID)
+	if err != nil || old == nil || old.Status != model.JournalAborted {
+		t.Fatalf("stale noop journal = %+v err=%v, want aborted", old, err)
+	}
+	live, err := ctl.Observe(context.Background(), preset.Name)
+	if err != nil || len(live.Target.Windows) != 2 {
+		t.Fatalf("live session after replanning = %+v err=%v; want both baseline windows", live, err)
 	}
 }
 
@@ -273,6 +337,140 @@ func TestSoftReconcileRestoresSplitTreeAndPreservesPaneProcesses(t *testing.T) {
 	}
 }
 
+func TestSoftReconcileRestoresPaneSlotsToTheirFrozenRows(t *testing.T) {
+	root := tmuxtest.Isolate(t)
+	st, err := store.OpenWithConfig(&config.Config{DataDir: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	ctl, err := tmux.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := &model.Session{Name: "pane-rows", Cwd: "/tmp", Windows: []model.Window{{
+		Name: "command", Cwd: "/tmp", Layout: "tiled", Panes: []model.Pane{
+			{Cwd: "/tmp", Cmd: "sleep 320"}, {Cwd: "/tmp", Cmd: "sleep 321"},
+			{Cwd: "/tmp", Cmd: "sleep 322"}, {Cwd: "/tmp", Cmd: "sleep 323"},
+		},
+	}}}
+	if err := ctl.Load(context.Background(), base); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(350 * time.Millisecond)
+	if _, _, err := FreezeRemember(ctl, st, base.Name); err != nil {
+		t.Fatal(err)
+	}
+	frozen, err := st.GetBaseline(base.Name)
+	if err != nil || frozen == nil || len(frozen.Windows) != 1 || len(frozen.Windows[0].Panes) != 4 {
+		t.Fatalf("frozen pane baseline = %+v, err=%v", frozen, err)
+	}
+	windowID := frozen.Windows[0].TmuxID
+	initialTops := paneTops(t, windowID)
+	type panePosition struct {
+		slot string
+		top  int
+		id   string
+	}
+	positions := make([]panePosition, 0, len(frozen.Windows[0].Panes))
+	for _, pane := range frozen.Windows[0].Panes {
+		top, ok := initialTops[pane.TmuxID]
+		if !ok {
+			t.Fatalf("baseline pane %s missing from initial geometry %v", pane.TmuxID, initialTops)
+		}
+		positions = append(positions, panePosition{slot: pane.SlotID, top: top, id: pane.TmuxID})
+	}
+	if positions[0].top != positions[1].top || positions[2].top != positions[3].top || positions[0].top == positions[2].top {
+		t.Fatalf("tiled layout did not produce two pane rows: %+v", positions)
+	}
+	topRow := positions[0].top
+	bottomRow := positions[0].top
+	for _, pane := range positions[1:] {
+		if pane.top < topRow {
+			topRow = pane.top
+		}
+		if pane.top > bottomRow {
+			bottomRow = pane.top
+		}
+	}
+	if topRow == bottomRow {
+		t.Fatalf("tiled layout has only one pane row: %+v", positions)
+	}
+	var survivors, missing []panePosition
+	for _, pane := range positions {
+		if pane.top == topRow {
+			missing = append(missing, pane)
+		} else {
+			survivors = append(survivors, pane)
+		}
+	}
+	if len(survivors) != 2 || len(missing) != 2 {
+		t.Fatalf("wanted two top-row panes to remove, survivors=%+v missing=%+v", survivors, missing)
+	}
+	for _, pane := range missing {
+		tmuxOut(t, "kill-pane", "-t", pane.id)
+	}
+	if _, err := ReconcileSession(context.Background(), ctl, st, base.Name, false); err != nil {
+		current, observeErr := ctl.Freeze(context.Background(), base.Name)
+		layout := tmuxOut(t, "display-message", "-p", "-t", windowID, "#{window_layout}")
+		t.Fatalf("reconcile: %v (observe err=%v, panes=%+v layout=%s)", err, observeErr, current.Windows[0].Panes, layout)
+	}
+	final, err := ctl.Freeze(context.Background(), base.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	finalTops := paneTops(t, windowID)
+	topsBySlot := make(map[string]int, len(final.Windows[0].Panes))
+	for _, pane := range final.Windows[0].Panes {
+		top, ok := finalTops[pane.TmuxID]
+		if !ok {
+			t.Fatalf("final pane %s missing from geometry %v", pane.TmuxID, finalTops)
+		}
+		topsBySlot[pane.SlotID] = top
+	}
+	for _, pane := range survivors {
+		if got := topsBySlot[pane.slot]; got != bottomRow {
+			t.Fatalf("surviving lower-row pane slot %s moved from top=%d to top=%d; geometry=%v", pane.slot, bottomRow, got, topsBySlot)
+		}
+	}
+	for _, pane := range missing {
+		if got := topsBySlot[pane.slot]; got >= bottomRow {
+			t.Fatalf("restored top-row pane slot %s landed at top=%d, want above surviving row top=%d; geometry=%v", pane.slot, got, bottomRow, topsBySlot)
+		}
+	}
+	if _, err := ReconcileSession(context.Background(), ctl, st, base.Name, false); err != nil {
+		t.Fatalf("second reconcile after runtime binding refresh: %v", err)
+	}
+	second, err := ctl.Freeze(context.Background(), base.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondTops := paneTops(t, windowID)
+	for _, pane := range second.Windows[0].Panes {
+		if secondTops[pane.TmuxID] != topsBySlot[pane.SlotID] {
+			t.Fatalf("pane slot %s moved on repeated reconcile: first top=%d second top=%d", pane.SlotID, topsBySlot[pane.SlotID], secondTops[pane.TmuxID])
+		}
+	}
+}
+
+func paneTops(t *testing.T, windowID string) map[string]int {
+	t.Helper()
+	lines := strings.Split(tmuxOut(t, "list-panes", "-t", windowID, "-F", "#{pane_id}|#{pane_top}"), "\n")
+	tops := make(map[string]int, len(lines))
+	for _, line := range lines {
+		parts := strings.SplitN(line, "|", 2)
+		if len(parts) != 2 {
+			t.Fatalf("invalid pane geometry row %q", line)
+		}
+		top, err := strconv.Atoi(parts[1])
+		if err != nil {
+			t.Fatalf("invalid pane top in %q: %v", line, err)
+		}
+		tops[parts[0]] = top
+	}
+	return tops
+}
+
 func TestCodexNoDuplicate(t *testing.T) {
 	root := tmuxtest.Isolate(t)
 	st, err := store.OpenWithConfig(&config.Config{DataDir: root})
@@ -384,7 +582,7 @@ func TestReconcileLooksUpBaselineBySessionLogicalIDAfterRename(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reconcile renamed session: %v", err)
 	}
-	if report != "" {
+	if report != "already aligned" {
 		t.Fatalf("aligned renamed session report = %q", report)
 	}
 	if old, err := st.GetBaseline("rename-old"); err != nil || old != nil {
@@ -477,7 +675,7 @@ func TestEquivalentUntaggedWindowsKeepProcesses(t *testing.T) {
 	if err != nil {
 		t.Fatalf("second grouped reconcile: %v", err)
 	}
-	if second != "" || len(strings.Split(tmuxOut(t, "list-windows", "-t", "="+name, "-F", "#{window_id}"), "\n")) != len(afterIDs) {
+	if second != "already aligned" || len(strings.Split(tmuxOut(t, "list-windows", "-t", "="+name, "-F", "#{window_id}"), "\n")) != len(afterIDs) {
 		t.Fatalf("second reconcile was not idempotent: report=%q", second)
 	}
 }

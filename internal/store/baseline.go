@@ -10,6 +10,7 @@ import (
 	"github.com/fm39hz/gotomux/internal/identity"
 	"github.com/fm39hz/gotomux/internal/model"
 	"github.com/fm39hz/gotomux/internal/store/dbgen"
+	"github.com/fm39hz/gotomux/internal/tmuxlayout"
 )
 
 // Baseline: the recorded starting layout of a live session, stored as a full
@@ -46,11 +47,18 @@ func saveBaselineTx(tx *sql.Tx, sess *model.Session, allowSessionReplacement boo
 		return fmt.Errorf("save baseline: empty session name")
 	}
 	copy := *sess
+	copy.Windows = append([]model.Window(nil), sess.Windows...)
+	for i := range copy.Windows {
+		copy.Windows[i].Panes = append([]model.Pane(nil), sess.Windows[i].Panes...)
+	}
 	if copy.SchemaVersion == 0 {
 		copy.SchemaVersion = model.CurrentBaselineSchemaVersion
 	}
 	if err := validateBaselineIdentityTree(copy); err != nil {
 		return fmt.Errorf("save baseline: %w", err)
+	}
+	if err := normalizeBaselineLayouts(&copy); err != nil {
+		return fmt.Errorf("save baseline layout: %w", err)
 	}
 	q := dbgen.New(tx)
 	body, err := json.Marshal(&copy)
@@ -155,6 +163,9 @@ func (s *Store) GetBaseline(name string) (*model.Session, error) {
 	if err := json.Unmarshal([]byte(body), &sess); err != nil {
 		return nil, fmt.Errorf("get baseline: corrupt baseline for %q: %w", name, err)
 	}
+	if err := normalizeBaselineLayouts(&sess); err != nil {
+		return nil, fmt.Errorf("get baseline: invalid layout binding for %q: %w", name, err)
+	}
 	return &sess, nil
 }
 
@@ -173,5 +184,45 @@ func (s *Store) GetBaselineByLogicalID(id string) (*model.Session, error) {
 	if err := json.Unmarshal([]byte(body), &sess); err != nil {
 		return nil, fmt.Errorf("get baseline by logical ID: corrupt body: %w", err)
 	}
+	if err := normalizeBaselineLayouts(&sess); err != nil {
+		return nil, fmt.Errorf("get baseline by logical ID: invalid layout binding: %w", err)
+	}
 	return &sess, nil
+}
+
+func normalizeBaselineLayouts(sess *model.Session) error {
+	if sess == nil {
+		return nil
+	}
+	for wi := range sess.Windows {
+		window := &sess.Windows[wi]
+		bindings, err := tmuxlayout.PaneBindings(window.Layout)
+		if err != nil {
+			return fmt.Errorf("window %d: %w", wi, err)
+		}
+		if len(bindings) == 0 {
+			continue
+		}
+		if len(bindings) != len(window.Panes) {
+			return fmt.Errorf("window %d JSON layout has %d pane leaves for %d panes", wi, len(bindings), len(window.Panes))
+		}
+		paneIDsByIndex := make(map[int]string, len(window.Panes))
+		paneIndexes := make(map[int]int, len(window.Panes))
+		for _, pane := range window.Panes {
+			if pane.SlotID == "" {
+				return fmt.Errorf("window %d pane index %d has no stable slot ID", wi, pane.Idx)
+			}
+			if _, duplicate := paneIDsByIndex[pane.Idx]; duplicate {
+				return fmt.Errorf("window %d has duplicate pane index %d", wi, pane.Idx)
+			}
+			paneIDsByIndex[pane.Idx] = pane.SlotID
+			paneIndexes[pane.Idx] = pane.Idx
+		}
+		layout, err := tmuxlayout.RemapPaneBindingsByIndex(window.Layout, paneIDsByIndex, paneIndexes)
+		if err != nil {
+			return fmt.Errorf("window %d: %w", wi, err)
+		}
+		window.Layout = layout
+	}
+	return nil
 }

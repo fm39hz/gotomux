@@ -2,6 +2,7 @@
 package tmuxlayout
 
 import (
+	"encoding/json"
 	"fmt"
 	"strconv"
 	"strings"
@@ -27,6 +28,9 @@ func Topology(layout string) string {
 	if !IsDump(layout) {
 		return ""
 	}
+	if strings.HasPrefix(strings.TrimSpace(layout), "{") {
+		return jsonTopology(layout)
+	}
 	checksumEnd := strings.IndexByte(layout, ',')
 	body := layout[checksumEnd+1:]
 	p := layoutTreeParser{src: body}
@@ -42,6 +46,52 @@ func Topology(layout string) string {
 		}
 	}
 	return fallback.String()
+}
+
+func jsonTopology(layout string) string {
+	var root map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(layout), &root); err != nil {
+		return ""
+	}
+	rawTree, ok := root["L"]
+	if !ok {
+		return ""
+	}
+	var nodeTopology func(json.RawMessage) (string, bool)
+	nodeTopology = func(raw json.RawMessage) (string, bool) {
+		var node map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &node); err != nil {
+			return "", false
+		}
+		var nodeType string
+		if err := json.Unmarshal(node["t"], &nodeType); err != nil {
+			return "", false
+		}
+		if nodeType == "p" {
+			return "_", true
+		}
+		if nodeType != "h" && nodeType != "v" {
+			return "", false
+		}
+		var children []json.RawMessage
+		if err := json.Unmarshal(node["c"], &children); err != nil || len(children) < 2 {
+			return "", false
+		}
+		parts := make([]string, 0, len(children))
+		for _, child := range children {
+			part, ok := nodeTopology(child)
+			if !ok {
+				return "", false
+			}
+			parts = append(parts, part)
+		}
+		return nodeType + "(" + strings.Join(parts, ",") + ")", true
+	}
+	topology, ok := nodeTopology(rawTree)
+	if !ok {
+		return ""
+	}
+	return topology
 }
 
 func ForStore(layout string, nPanes int) string {
@@ -103,6 +153,221 @@ func Compare(a string, aPanes int, b string, bPanes int) (equal, known bool) {
 func Equivalent(a string, aPanes int, b string, bPanes int) bool {
 	equal, known := Compare(a, aPanes, b, bPanes)
 	return equal && known
+}
+
+// PaneBinding identifies the pane identifier and pane index stored on one JSON
+// layout leaf. The identifier can be a tmux runtime ID or a durable slot ID.
+type PaneBinding struct {
+	RuntimeID string
+	Index     int
+}
+
+// PaneBindings returns pane identifiers and indexes in left-to-right,
+// top-to-bottom layout leaf order. Layout formats without embedded IDs return
+// a nil slice.
+func PaneBindings(layout string) ([]PaneBinding, error) {
+	trimmed := strings.TrimSpace(layout)
+	if !strings.HasPrefix(trimmed, "{") {
+		return nil, nil
+	}
+	var root map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(trimmed), &root); err != nil {
+		return nil, fmt.Errorf("parse tmux JSON layout: %w", err)
+	}
+	rawTree, ok := root["L"]
+	if !ok {
+		return nil, fmt.Errorf("tmux JSON layout has no root tree")
+	}
+	var bindings []PaneBinding
+	var visit func(json.RawMessage) error
+	visit = func(raw json.RawMessage) error {
+		var node map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &node); err != nil {
+			return fmt.Errorf("parse tmux JSON layout node: %w", err)
+		}
+		var nodeType string
+		if err := json.Unmarshal(node["t"], &nodeType); err != nil {
+			return fmt.Errorf("tmux JSON layout node has no type: %w", err)
+		}
+		if nodeType == "p" {
+			var id string
+			if err := json.Unmarshal(node["I"], &id); err != nil || id == "" {
+				return fmt.Errorf("tmux JSON pane leaf has no runtime ID")
+			}
+			var index int
+			if err := json.Unmarshal(node["i"], &index); err != nil {
+				return fmt.Errorf("tmux JSON pane leaf has no pane index: %w", err)
+			}
+			bindings = append(bindings, PaneBinding{RuntimeID: id, Index: index})
+			return nil
+		}
+		var children []json.RawMessage
+		if err := json.Unmarshal(node["c"], &children); err != nil || len(children) == 0 {
+			return fmt.Errorf("tmux JSON split node has no children")
+		}
+		for _, child := range children {
+			if err := visit(child); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	if err := visit(rawTree); err != nil {
+		return nil, err
+	}
+	return bindings, nil
+}
+
+// PaneIDs returns pane identifiers in layout leaf order.
+func PaneIDs(layout string) ([]string, error) {
+	bindings, err := PaneBindings(layout)
+	if err != nil || bindings == nil {
+		return nil, err
+	}
+	ids := make([]string, 0, len(bindings))
+	for _, binding := range bindings {
+		ids = append(ids, binding.RuntimeID)
+	}
+	return ids, nil
+}
+
+// RemapPaneIDs rewrites pane identifiers embedded in tmux's JSON layout format.
+// Legacy checksum layouts and named layouts contain no runtime pane IDs and
+// are returned unchanged. A JSON leaf without an explicit replacement is an
+// error: applying a partly stale dump can place surviving panes in wrong slots.
+func RemapPaneIDs(layout string, paneIDs map[string]string) (string, error) {
+	return RemapPaneBindings(layout, paneIDs, nil)
+}
+
+// RemapPaneIndexes rewrites the pane-index field on tmux JSON layout leaves.
+// tmux uses these indices to place panes when applying a saved layout; pane
+// runtime IDs alone do not preserve slot-to-position association.
+func RemapPaneIndexes(layout string, paneIndexes map[int]int) (string, error) {
+	return RemapPaneBindings(layout, nil, paneIndexes)
+}
+
+// RemapPaneBindings rewrites both runtime pane IDs and pane indexes embedded
+// in tmux JSON layout leaves. Supplying nil for either map leaves that field
+// unchanged. Layout formats without embedded runtime pane IDs are returned
+// unchanged.
+func RemapPaneBindings(layout string, paneIDs map[string]string, paneIndexes map[int]int) (string, error) {
+	trimmed := strings.TrimSpace(layout)
+	if !strings.HasPrefix(trimmed, "{") {
+		return layout, nil
+	}
+	var root map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(trimmed), &root); err != nil {
+		return "", fmt.Errorf("parse tmux JSON layout: %w", err)
+	}
+	rawTree, ok := root["L"]
+	if !ok {
+		return "", fmt.Errorf("tmux JSON layout has no root tree")
+	}
+	var remapNode func(json.RawMessage) (json.RawMessage, error)
+	remapNode = func(raw json.RawMessage) (json.RawMessage, error) {
+		var node map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &node); err != nil {
+			return nil, fmt.Errorf("parse tmux JSON layout node: %w", err)
+		}
+		var nodeType string
+		if err := json.Unmarshal(node["t"], &nodeType); err != nil {
+			return nil, fmt.Errorf("tmux JSON layout node has no type: %w", err)
+		}
+		if nodeType == "p" {
+			if paneIDs != nil {
+				var oldID string
+				if err := json.Unmarshal(node["I"], &oldID); err != nil || oldID == "" {
+					return nil, fmt.Errorf("tmux JSON pane leaf has no runtime ID")
+				}
+				newID, exists := paneIDs[oldID]
+				if !exists || newID == "" {
+					return nil, fmt.Errorf("tmux JSON layout pane %s has no live slot binding", oldID)
+				}
+				encoded, err := json.Marshal(newID)
+				if err != nil {
+					return nil, err
+				}
+				node["I"] = encoded
+			}
+			if paneIndexes != nil {
+				var oldIndex int
+				if err := json.Unmarshal(node["i"], &oldIndex); err != nil {
+					return nil, fmt.Errorf("tmux JSON pane leaf has no pane index: %w", err)
+				}
+				newIndex, exists := paneIndexes[oldIndex]
+				if !exists {
+					return nil, fmt.Errorf("tmux JSON layout pane index %d has no live slot binding", oldIndex)
+				}
+				encoded, err := json.Marshal(newIndex)
+				if err != nil {
+					return nil, err
+				}
+				node["i"] = encoded
+			}
+		} else if rawChildren, exists := node["c"]; exists {
+			var children []json.RawMessage
+			if err := json.Unmarshal(rawChildren, &children); err != nil {
+				return nil, fmt.Errorf("parse tmux JSON layout children: %w", err)
+			}
+			for i := range children {
+				child, err := remapNode(children[i])
+				if err != nil {
+					return nil, err
+				}
+				children[i] = child
+			}
+			encoded, err := json.Marshal(children)
+			if err != nil {
+				return nil, err
+			}
+			node["c"] = encoded
+		}
+		encoded, err := json.Marshal(node)
+		if err != nil {
+			return nil, err
+		}
+		return encoded, nil
+	}
+	tree, err := remapNode(rawTree)
+	if err != nil {
+		return "", err
+	}
+	root["L"] = tree
+	encoded, err := json.Marshal(root)
+	if err != nil {
+		return "", err
+	}
+	return string(encoded), nil
+}
+
+// RemapPaneBindingsByIndex binds JSON layout leaves to a stable model tree by
+// each leaf's recorded pane index. This repairs old JSON dumps whose embedded
+// runtime IDs belong to a tmux session that has since been recreated.
+func RemapPaneBindingsByIndex(layout string, paneIDsByIndex map[int]string, paneIndexes map[int]int) (string, error) {
+	bindings, err := PaneBindings(layout)
+	if err != nil || bindings == nil {
+		return layout, err
+	}
+	ids := make(map[string]string, len(bindings))
+	var indexes map[int]int
+	if paneIndexes != nil {
+		indexes = make(map[int]int, len(bindings))
+	}
+	for _, binding := range bindings {
+		id, ok := paneIDsByIndex[binding.Index]
+		if !ok || id == "" {
+			return "", fmt.Errorf("tmux JSON layout pane %s at index %d has no stable slot binding", binding.RuntimeID, binding.Index)
+		}
+		ids[binding.RuntimeID] = id
+		if indexes != nil {
+			index, ok := paneIndexes[binding.Index]
+			if !ok {
+				return "", fmt.Errorf("tmux JSON layout pane index %d has no live index binding", binding.Index)
+			}
+			indexes[binding.Index] = index
+		}
+	}
+	return RemapPaneBindings(layout, ids, indexes)
 }
 
 func classifyDump(dump string) string {

@@ -123,6 +123,46 @@ func TestPlanBlocksAllMutationOnAmbiguityOrConflict(t *testing.T) {
 	}
 }
 
+func TestPreserveKeepsDurableWindowIdentityAcrossRoleDrift(t *testing.T) {
+	base, live := identityFixture(
+		[]model.Window{{Idx: 1, Name: "yazi", Role: "files", Cwd: "/work", TmuxID: "@1", Panes: []model.Pane{{Idx: 0, Cmd: "yazi", Cwd: "/work", TmuxID: "%1"}}}},
+		[]model.Window{{Idx: 1, Name: "yazi", Cwd: "/work", TmuxID: "@1", Panes: []model.Pane{{Idx: 0, Cmd: "yazi", Cwd: "/work", TmuxID: "%1"}}}},
+	)
+	base.ClassifierVersion = 1
+	live.Target.Windows[0].SlotID = base.Windows[0].SlotID
+	live.Target.Windows[0].Panes[0].SlotID = base.Windows[0].Panes[0].SlotID
+	for i := range live.Objects {
+		switch live.Objects[i].Kind {
+		case ObjectWindow:
+			live.Objects[i].SlotID = base.Windows[0].SlotID
+		case ObjectPane:
+			live.Objects[i].SlotID = base.Windows[0].Panes[0].SlotID
+		}
+	}
+	live.Target.Windows[0].Name = "fish"
+	live.Target.Windows[0].Panes[0].Cmd = "fish"
+	desired := DesiredState{Session: base, ClassifierVersion: 1}
+	resolution := Resolve(desired, live)
+	if resolution.Status != ResolutionReady {
+		t.Fatalf("identity resolution = %+v", resolution)
+	}
+	plan := Plan(desired, live, resolution, PolicyPreserve)
+	if plan.Status != PlanNoop || len(plan.Operations) != 0 {
+		t.Fatalf("preserve plan should keep the identified live pane process: %+v", plan)
+	}
+	if err := Verify(desired, live, resolution, PolicyPreserve, plan); err != nil {
+		t.Fatalf("preserve verification rejected durable identity with live role drift: %v", err)
+	}
+	updated, err := RefreshBindings(base, live, resolution)
+	if err != nil || updated.Windows[0].Role != "files" {
+		t.Fatalf("preserve binding refresh overwrote the frozen role: role=%q err=%v", updated.Windows[0].Role, err)
+	}
+	exact := Plan(desired, live, resolution, PolicyExact)
+	if exact.Status != PlanReady || len(exact.Operations) != 1 || exact.Operations[0].Kind != OperationExactRebuild {
+		t.Fatalf("exact policy should rebuild the frozen role: %+v", exact)
+	}
+}
+
 func TestPlanLinksExistingWindowBackFromAnotherSessionByIdentity(t *testing.T) {
 	baselineWindow := model.Window{Idx: 1, Name: "editor", Role: "editor", SlotID: "00000000-0000-4000-8000-000000000002", TmuxID: "@1", Cwd: "/work", Panes: []model.Pane{{Idx: 0, Cmd: "nvim", Cwd: "/work", SlotID: "00000000-0000-4000-8000-000000000003", TmuxID: "%1"}}}
 	desiredSession := model.Session{Name: "target", LogicalID: "00000000-0000-4000-8000-000000000001", SchemaVersion: model.CurrentBaselineSchemaVersion, TmuxID: "$1", ServerKey: "server-a", Cwd: "/work", ClassifierVersion: 1, Windows: []model.Window{baselineWindow}}

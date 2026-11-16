@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/fm39hz/gotomux/internal/model"
 	core "github.com/fm39hz/gotomux/internal/reconcile/core"
@@ -138,6 +139,12 @@ func (r Runner) Execute(ctx context.Context, sessionName, journalID string, plan
 
 	for step := journal.CompletedStep; step < len(plan.Operations); step++ {
 		op := plan.Operations[step]
+		if op.Kind == core.OperationApplyLayout && len(op.Window.Panes) == 0 {
+			op, err = hydrateLayoutOperation(plan, op)
+			if err != nil {
+				return r.needsAttention(journalID, step, err)
+			}
+		}
 		snapshot, err = r.Tmux.Observe(ctx, sessionName)
 		if err != nil {
 			return r.needsAttention(journalID, step, fmt.Errorf("observe before operation %s: %w", op.ID, err))
@@ -202,7 +209,15 @@ func (r Runner) apply(ctx context.Context, session string, op core.Operation, sn
 		_, err := r.Tmux.AddPaneWithOperation(ctx, snapshot.TargetSessionID, op.Target.ID, op.ExpectedPaneCount, op.ExpectedPaneIDs, op.ExpectedPaneSlotIDs, op.Pane, op.ID)
 		return err
 	case core.OperationApplyLayout:
-		return r.Tmux.ApplyLayoutAt(ctx, snapshot.TargetSessionID, op.Target.ID, op.Index, op.Window.Layout)
+		window, ok := targetWindow(snapshot, op.Target.ID)
+		if !ok {
+			return fmt.Errorf("layout target window %s is not in the observed session", op.Target.ID)
+		}
+		layout, err := layoutForLivePaneSlots(op.Window.Layout, op.Window.Panes, window.Panes)
+		if err != nil {
+			return err
+		}
+		return r.Tmux.ApplyLayoutAt(ctx, snapshot.TargetSessionID, op.Target.ID, op.Index, layout)
 	case core.OperationSelectWindow:
 		return r.Tmux.SelectWindowByID(ctx, snapshot.TargetSessionID, op.Target.ID)
 	case core.OperationBindIdentity:
@@ -212,6 +227,64 @@ func (r Runner) apply(ctx context.Context, session string, op core.Operation, sn
 	default:
 		return fmt.Errorf("unknown reconcile operation kind %q", op.Kind)
 	}
+}
+
+func layoutForLivePaneSlots(layout string, desired, live []model.Pane) (string, error) {
+	if !strings.HasPrefix(strings.TrimSpace(layout), "{") {
+		return layout, nil
+	}
+	liveBySlot := make(map[string]model.Pane, len(live))
+	for _, pane := range live {
+		if pane.SlotID != "" {
+			liveBySlot[pane.SlotID] = pane
+		}
+	}
+	remap := make(map[int]string, len(desired))
+	indexRemap := make(map[int]int, len(desired))
+	for _, pane := range desired {
+		livePane, ok := liveBySlot[pane.SlotID]
+		if !ok || livePane.TmuxID == "" {
+			return "", fmt.Errorf("layout pane slot %s has no live pane binding", pane.SlotID)
+		}
+		remap[pane.Idx] = livePane.TmuxID
+		indexRemap[pane.Idx] = livePane.Idx
+	}
+	return tmuxlayout.RemapPaneBindingsByIndex(layout, remap, indexRemap)
+}
+
+// hydrateLayoutOperation upgrades persisted plans created before layout
+// operations carried their desired pane-slot list. The target runtime window
+// is resolved through the plan's identity lineage, never through its name or
+// index.
+func hydrateLayoutOperation(plan core.PlanResult, op core.Operation) (core.Operation, error) {
+	var desired *model.Window
+	for _, match := range plan.Resolution.Windows {
+		if match.Match.LiveRuntimeID != op.Target.ID {
+			continue
+		}
+		if match.Match.BaselineIndex < 0 || match.Match.BaselineIndex >= len(plan.DesiredSession.Windows) {
+			return op, fmt.Errorf("layout operation %s has an invalid baseline window mapping", op.ID)
+		}
+		if desired != nil {
+			return op, fmt.Errorf("layout operation %s has ambiguous baseline window mapping", op.ID)
+		}
+		want := plan.DesiredSession.Windows[match.Match.BaselineIndex]
+		desired = &want
+	}
+	if desired == nil {
+		return op, fmt.Errorf("layout operation %s has no identity-resolved desired window", op.ID)
+	}
+	if op.ExpectedPaneCount != 0 && len(desired.Panes) != op.ExpectedPaneCount {
+		return op, fmt.Errorf("layout operation %s expects %d panes but its desired window has %d", op.ID, op.ExpectedPaneCount, len(desired.Panes))
+	}
+	if op.Window.Layout != "" {
+		equal, known := tmuxlayout.Compare(op.Window.Layout, len(desired.Panes), desired.Layout, len(desired.Panes))
+		if !known || !equal {
+			return op, fmt.Errorf("layout operation %s no longer matches its desired baseline topology", op.ID)
+		}
+	}
+	op.Window.Panes = append([]model.Pane(nil), desired.Panes...)
+	return op, nil
 }
 
 func (r Runner) needsAttention(id string, step int, cause error) error {
@@ -408,7 +481,22 @@ func operationSatisfied(op core.Operation, snapshot model.Snapshot) bool {
 			return false
 		}
 		equal, known := tmuxlayout.Compare(op.Window.Layout, len(window.Panes), window.Layout, len(window.Panes))
-		return known && equal
+		if !known || !equal {
+			return false
+		}
+		expectedLayout, err := layoutForLivePaneSlots(op.Window.Layout, op.Window.Panes, window.Panes)
+		if err != nil {
+			return false
+		}
+		expectedPaneIDs, err := tmuxlayout.PaneIDs(expectedLayout)
+		if err != nil {
+			return false
+		}
+		actualPaneIDs, err := tmuxlayout.PaneIDs(window.Layout)
+		if err != nil {
+			return false
+		}
+		return len(expectedPaneIDs) == 0 || strings.Join(expectedPaneIDs, ",") == strings.Join(actualPaneIDs, ",")
 	case core.OperationSelectWindow:
 		return snapshot.ActiveWindowID == op.Target.ID
 	case core.OperationExactRebuild:

@@ -2,6 +2,7 @@ package reconcile
 
 import (
 	"fmt"
+	"reflect"
 
 	"github.com/fm39hz/gotomux/internal/classify"
 	"github.com/fm39hz/gotomux/internal/model"
@@ -58,7 +59,7 @@ func Verify(desired DesiredState, live model.Snapshot, resolution Resolution, po
 			return fmt.Errorf("identified window %s has slot ID %q; baseline requires %q", got.TmuxID, got.SlotID, want.SlotID)
 		}
 		wantRole, gotRole := semanticWindowRole(desired.Session, want), semanticWindowRole(live.Target, got)
-		if wantRole != "" && gotRole != wantRole {
+		if wantRole != "" && gotRole != wantRole && (policy == PolicyExact || !hasDurableIdentity(match)) {
 			return fmt.Errorf("window %s has semantic role %q; baseline requires %q", got.TmuxID, gotRole, wantRole)
 		}
 		if len(windowResolution.Panes.Missing) != 0 {
@@ -87,6 +88,10 @@ func Verify(desired DesiredState, live model.Snapshot, resolution Resolution, po
 			if !known || !equal {
 				return fmt.Errorf("window %s split topology does not match baseline", got.TmuxID)
 			}
+			paneOrderMatches, paneOrderKnown := paneSlotLayoutMatches(want, got, windowResolution.Panes)
+			if paneOrderKnown && !paneOrderMatches {
+				return fmt.Errorf("window %s pane slots do not occupy their frozen layout positions", got.TmuxID)
+			}
 		}
 	}
 	if policy == PolicyExact && len(live.Target.Windows) != len(desired.Session.Windows) {
@@ -97,10 +102,70 @@ func Verify(desired DesiredState, live model.Snapshot, resolution Resolution, po
 		if active == nil || active.SlotID != plan.FinalActiveSlotID {
 			return fmt.Errorf("active window does not match the planned baseline slot")
 		}
-	} else if plan.FinalActiveWindowID != "" && live.ActiveWindowID != "" && live.ActiveWindowID != plan.FinalActiveWindowID {
-		return fmt.Errorf("active window identity changed")
 	}
 	return nil
+}
+
+func hasDurableIdentity(match ObjectMatch) bool {
+	for _, evidence := range match.Evidence {
+		if evidence.Class == EvidenceRuntime || evidence.Class == EvidenceLogical {
+			return true
+		}
+	}
+	return false
+}
+
+func paneSlotLayoutMatches(want, got model.Window, resolution PaneResolution) (matches, known bool) {
+	wantBindings, err := tmuxlayout.PaneBindings(want.Layout)
+	if err != nil {
+		return false, true
+	}
+	if len(wantBindings) == 0 {
+		return true, false
+	}
+	gotBindings, err := tmuxlayout.PaneBindings(got.Layout)
+	if err != nil || len(gotBindings) != len(wantBindings) {
+		return false, true
+	}
+	baselineSlotByRuntime := make(map[string]string, len(want.Panes))
+	baselineSlotByIndex := make(map[int]string, len(want.Panes))
+	for _, pane := range want.Panes {
+		if pane.SlotID == "" {
+			return false, true
+		}
+		if pane.TmuxID != "" {
+			baselineSlotByRuntime[pane.TmuxID] = pane.SlotID
+		}
+		baselineSlotByRuntime[pane.SlotID] = pane.SlotID
+		baselineSlotByIndex[pane.Idx] = pane.SlotID
+	}
+	liveSlotByRuntime := make(map[string]string, len(resolution.Matches))
+	for _, match := range resolution.Matches {
+		if match.BaselineIndex < 0 || match.BaselineIndex >= len(want.Panes) || match.LiveRuntimeID == "" {
+			return false, true
+		}
+		liveSlotByRuntime[match.LiveRuntimeID] = want.Panes[match.BaselineIndex].SlotID
+	}
+	wantSlots := make([]string, 0, len(wantBindings))
+	gotSlots := make([]string, 0, len(gotBindings))
+	for _, binding := range wantBindings {
+		slotID := baselineSlotByRuntime[binding.RuntimeID]
+		if slotID == "" {
+			slotID = baselineSlotByIndex[binding.Index]
+		}
+		if slotID == "" {
+			return false, true
+		}
+		wantSlots = append(wantSlots, slotID)
+	}
+	for _, binding := range gotBindings {
+		slotID := liveSlotByRuntime[binding.RuntimeID]
+		if slotID == "" {
+			return false, true
+		}
+		gotSlots = append(gotSlots, slotID)
+	}
+	return reflect.DeepEqual(wantSlots, gotSlots), true
 }
 
 // RefreshBindings carries verified runtime IDs into the baseline using the
@@ -134,8 +199,23 @@ func RefreshBindings(desired model.Session, live model.Snapshot, resolution Reso
 		}
 		baseWindow := &updated.Windows[match.BaselineIndex]
 		baseWindow.TmuxID = liveWindow.TmuxID
-		baseWindow.Role = semanticWindowRole(live.Target, liveWindow)
+		if baseWindow.Role == "" {
+			baseWindow.Role = semanticWindowRole(live.Target, liveWindow)
+		}
 		paneSeen := map[int]bool{}
+		layoutPaneIDs := make(map[string]string, len(baseWindow.Panes))
+		layoutPaneIndexes := make(map[int]int, len(baseWindow.Panes))
+		baselinePaneByIndex := make(map[int]int, len(baseWindow.Panes))
+		baselinePaneByRuntime := make(map[string]int, len(baseWindow.Panes))
+		for paneIndex, pane := range baseWindow.Panes {
+			if _, duplicate := baselinePaneByIndex[pane.Idx]; duplicate {
+				return model.Session{}, fmt.Errorf("window %s has duplicate baseline pane index %d", liveWindow.TmuxID, pane.Idx)
+			}
+			baselinePaneByIndex[pane.Idx] = paneIndex
+			if pane.TmuxID != "" {
+				baselinePaneByRuntime[pane.TmuxID] = paneIndex
+			}
+		}
 		for _, paneMatch := range windowResolution.Panes.Matches {
 			if paneMatch.BaselineIndex < 0 || paneMatch.BaselineIndex >= len(baseWindow.Panes) || paneSeen[paneMatch.BaselineIndex] {
 				return model.Session{}, fmt.Errorf("window %s has an invalid pane binding map", liveWindow.TmuxID)
@@ -145,11 +225,45 @@ func RefreshBindings(desired model.Session, live model.Snapshot, resolution Reso
 			if livePane == nil || livePane.SlotID != baseWindow.Panes[paneMatch.BaselineIndex].SlotID {
 				return model.Session{}, fmt.Errorf("pane mapping failed identity verification")
 			}
+			basePane := baseWindow.Panes[paneMatch.BaselineIndex]
+			if basePane.TmuxID != "" {
+				layoutPaneIDs[basePane.TmuxID] = basePane.SlotID
+			}
+			layoutPaneIDs[basePane.SlotID] = basePane.SlotID
+			layoutPaneIndexes[basePane.Idx] = livePane.Idx
 			baseWindow.Panes[paneMatch.BaselineIndex].TmuxID = livePane.TmuxID
+			baseWindow.Panes[paneMatch.BaselineIndex].Idx = livePane.Idx
 		}
 		if len(paneSeen) != len(baseWindow.Panes) {
 			return model.Session{}, fmt.Errorf("window %s is missing verified pane bindings", liveWindow.TmuxID)
 		}
+		layoutBindings, err := tmuxlayout.PaneBindings(baseWindow.Layout)
+		if err != nil {
+			return model.Session{}, fmt.Errorf("window %s layout pane inspection: %w", liveWindow.TmuxID, err)
+		}
+		if len(layoutBindings) != 0 && len(layoutBindings) != len(baseWindow.Panes) {
+			return model.Session{}, fmt.Errorf("window %s JSON layout has %d pane leaves for %d baseline panes", liveWindow.TmuxID, len(layoutBindings), len(baseWindow.Panes))
+		}
+		for _, binding := range layoutBindings {
+			baselineIndex, ok := baselinePaneByIndex[binding.Index]
+			if !ok {
+				baselineIndex, ok = baselinePaneByRuntime[binding.RuntimeID]
+			}
+			if !ok {
+				return model.Session{}, fmt.Errorf("window %s layout pane %s at index %d has no baseline slot binding", liveWindow.TmuxID, binding.RuntimeID, binding.Index)
+			}
+			basePane := baseWindow.Panes[baselineIndex]
+			if !paneSeen[baselineIndex] || basePane.SlotID == "" {
+				return model.Session{}, fmt.Errorf("window %s layout pane %s has no verified live slot binding", liveWindow.TmuxID, binding.RuntimeID)
+			}
+			layoutPaneIDs[binding.RuntimeID] = basePane.SlotID
+			layoutPaneIndexes[binding.Index] = basePane.Idx
+		}
+		layout, err := tmuxlayout.RemapPaneBindings(baseWindow.Layout, layoutPaneIDs, layoutPaneIndexes)
+		if err != nil {
+			return model.Session{}, fmt.Errorf("window %s layout pane binding refresh: %w", liveWindow.TmuxID, err)
+		}
+		baseWindow.Layout = layout
 	}
 	if len(seenWindows) != len(updated.Windows) {
 		return model.Session{}, fmt.Errorf("baseline is missing verified window bindings")

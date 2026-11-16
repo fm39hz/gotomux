@@ -185,8 +185,8 @@
 - Orchestrator performs observe → resolve → plan → execute/recover → fresh observe → verify → transactional commit.
 - Baseline is not changed on ambiguity, conflict, partial execution, or failed verification.
 
-- [x] Test verify does not bind by index or raw name and accepts semantic aliases under the same classifier version.
-- [x] Test successful repeated reconcile is a no-op and partial execution does not create duplicates on retry.
+- [x] Test verify does not bind by index or raw name, checks pane-slot-to-layout-leaf placement, accepts semantic aliases, and preserves a durable live slot whose process role changed.
+- [x] Test successful repeated reconcile is a no-op, partial execution does not create duplicates on retry, and a stale no-op journal replans after a window disappears.
 - [x] Add the `kho-cong` regression shape: mismatched agent tool intent, preserved Codex extra, files/yazi role alias, and two repeated runs.
 - [x] Test materially ambiguous candidates execute no operation; interchangeable untagged groups preserve processes and bind as a set.
 
@@ -206,6 +206,7 @@
 
 - [x] Test argument parsing and confirmation paths for preserve/exact and invalid flag combinations.
 - [x] Test report states for aligned, changed, preserved extras, ambiguous, conflict, partial/recoverable, and failure.
+- [x] Test that a stale `needs_attention` no-op journal is aborted and current state is replanned.
 - [x] Verify help/docs use “reconcile” consistently and never describe force as bypassing safety checks.
 
 ### Task 10: Remove obsolete reconciliation paths and finish verification
@@ -218,7 +219,7 @@
 
 - [x] Verify any baseline missing required IDs is rejected without tagging or topology mutation; verify a fresh freeze creates a complete baseline.
 - [x] Verify exact rebuild resumes after staged replacement creation, original-window removal, and partial slot promotion; reject slot-tag-only copies.
-- [x] Compare preserve/exact behavior against the documented acceptance cases, including `kho-cong` and repeated reconciliation.
+- [x] Compare preserve/exact behavior against the documented acceptance cases, including `kho-cong`, repeated reconciliation, and restoring pane slots to their frozen layout leaves.
 - [x] Remove obsolete score/match/refresh code after callers moved to resolver → planner → executor → verifier.
 - [x] Run `go test ./... -count=1`, `go vet ./...`, and build both binaries; record exact results.
 - [x] Inspect final diff and confirm tests used isolated tmux servers and redirected XDG state.
