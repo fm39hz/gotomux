@@ -41,6 +41,14 @@ func (m *mockStorer) SaveBaseline(s *model.Session) error {
 	return nil
 }
 
+func (m *mockStorer) BindPresetIdentity(s *model.Session) error {
+	if m.presets == nil {
+		m.presets = map[string]*model.Session{}
+	}
+	m.presets[s.Name] = cloneMockSession(s)
+	return nil
+}
+
 func (m *mockStorer) GetBaseline(name string) (*model.Session, error) {
 	return m.baseline[name], nil
 }

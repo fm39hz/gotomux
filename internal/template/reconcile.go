@@ -59,22 +59,42 @@ func ReconcileSession(ctx context.Context, ctl ReconcileOps, st store.Storer, na
 		return "", err
 	}
 	if active != nil {
-		var plan core.PlanResult
-		if err := json.Unmarshal([]byte(active.PlanJSON), &plan); err != nil {
-			return "", fmt.Errorf("reconcile journal %q has invalid plan JSON: %w", active.ID, err)
+		plan, decodeErr := decodeJournalPlan(st, active)
+		if decodeErr != nil {
+			return "", decodeErr
 		}
-		if plan.Status == core.PlanNoop && active.Status == model.JournalNeedsAttention {
+		if plan == nil {
+			active = nil // safe legacy/unsupported plan was aborted before mutation
+		} else if plan.Policy != policy {
+			return "", fmt.Errorf("reconcile journal %q uses policy %q; resume it with the same policy", active.ID, plan.Policy)
+		} else if active.Status == model.JournalNeedsAttention && active.CompletedStep == len(plan.Operations) {
+			// The cursor proves every operation's postcondition was observed. A
+			// repeated terminal verification must not execute that operation list
+			// again. Commit if the current complete observation now verifies;
+			// otherwise only preserve may replan, and only after operation markers
+			// prove there is no staged/uncertain object to recover.
+			desired := core.DesiredState{Session: plan.DesiredSession, ClassifierVersion: plan.ClassifierVersion}
+			resolution := core.Resolve(desired, *live)
+			verifyErr := core.Verify(desired, *live, resolution, plan.Policy, *plan)
+			if verifyErr == nil {
+				return executeAndCommit(ctx, ctl, st, name, active.ID, *plan)
+			}
+			if plan.Policy != core.PolicyPreserve || hasTargetOperationMarkers(*live) {
+				return "", fmt.Errorf("reconcile journal %q is at terminal verification with no safe automatic recovery: %w; journal remains needs_attention", active.ID, verifyErr)
+			}
+			if err := st.UpdateReconcile(active.ID, model.JournalAborted, active.CompletedStep, "terminal verification failed; no operation markers remain; replanning from a fresh snapshot: "+verifyErr.Error()); err != nil {
+				return "", fmt.Errorf("abort terminal reconcile journal %q before replanning: %w", active.ID, err)
+			}
+			active = nil
+		} else if plan.Status == core.PlanNoop && active.Status == model.JournalNeedsAttention {
 			// A no-op journal has no tmux mutations to recover. If its verification
 			// failed, its plan is stale by definition; release the claim and resolve
 			// the current snapshot again instead of trapping the session behind it.
 			if err := st.UpdateReconcile(active.ID, model.JournalAborted, active.CompletedStep, "stale no-op plan failed verification; recomputing from current snapshot"); err != nil {
 				return "", fmt.Errorf("abort stale no-op reconcile journal %q: %w", active.ID, err)
 			}
-		} else {
-			if plan.Policy != policy {
-				return "", fmt.Errorf("reconcile journal %q uses policy %q; resume it with the same policy", active.ID, plan.Policy)
-			}
-			return executeAndCommit(ctx, ctl, st, name, active.ID, plan)
+		} else if active != nil {
+			return executeAndCommit(ctx, ctl, st, name, active.ID, *plan)
 		}
 	}
 
@@ -119,12 +139,105 @@ func ReconcileSession(ctx context.Context, ctl ReconcileOps, st store.Storer, na
 	return executeAndCommit(ctx, ctl, st, name, journalID, plan)
 }
 
+// decodeJournalPlan is the only entry point for persisted plans. Version zero
+// predates stable layout-slot bindings. It is safe to discard only a journal
+// that has not started; cursor zero on a running/attention journal is
+// ambiguous because tmux may have changed before its cursor was persisted.
+func decodeJournalPlan(st store.Storer, journal *model.ReconcileJournal) (*core.PlanResult, error) {
+	var plan core.PlanResult
+	if err := json.Unmarshal([]byte(journal.PlanJSON), &plan); err != nil {
+		return nil, fmt.Errorf("reconcile journal %q has invalid plan JSON at cursor %d: %w", journal.ID, journal.CompletedStep, err)
+	}
+	if plan.PlanSchemaVersion == core.CurrentPlanSchemaVersion {
+		if plan.ID == "" || plan.Policy.Validate() != nil || plan.DesiredSession.LogicalID != journal.SessionLogicalID || plan.Resolution.ServerKey == "" || plan.Resolution.TargetSession.LiveRuntimeID == "" {
+			return nil, quarantineJournal(st, journal, "plan identity or policy envelope is incomplete")
+		}
+		if journal.CompletedStep < 0 || journal.CompletedStep > len(plan.Operations) {
+			return nil, quarantineJournal(st, journal, fmt.Sprintf("cursor %d is outside plan length %d", journal.CompletedStep, len(plan.Operations)))
+		}
+		return &plan, nil
+	}
+	if journal.CompletedStep == 0 && journal.Status == model.JournalPlanned {
+		if err := st.UpdateReconcile(journal.ID, model.JournalAborted, 0, fmt.Sprintf("plan schema version %d is unsupported; safely replanned before execution", plan.PlanSchemaVersion)); err != nil {
+			return nil, fmt.Errorf("abort unsupported unstarted reconcile journal %q: %w", journal.ID, err)
+		}
+		return nil, nil
+	}
+	if journal.Status != model.JournalNeedsAttention {
+		if err := st.UpdateReconcile(journal.ID, model.JournalNeedsAttention, journal.CompletedStep, fmt.Sprintf("unsupported plan schema version %d; mutation state must be inspected", plan.PlanSchemaVersion)); err != nil {
+			return nil, fmt.Errorf("unsupported plan schema version %d and failed to quarantine journal %q: %w", plan.PlanSchemaVersion, journal.ID, err)
+		}
+	}
+	return nil, fmt.Errorf("reconcile journal %q uses unsupported plan schema version %d at cursor %d; no operations were replayed and the journal remains needs_attention", journal.ID, plan.PlanSchemaVersion, journal.CompletedStep)
+}
+
+func quarantineJournal(st store.Storer, journal *model.ReconcileJournal, reason string) error {
+	if journal.CompletedStep == 0 && journal.Status == model.JournalPlanned {
+		if err := st.UpdateReconcile(journal.ID, model.JournalAborted, 0, "invalid unstarted plan: "+reason); err != nil {
+			return fmt.Errorf("invalid plan (%s); failed to abort unstarted journal: %w", reason, err)
+		}
+		return fmt.Errorf("invalid unstarted reconcile plan: %s; journal aborted before execution", reason)
+	}
+	if journal.Status != model.JournalNeedsAttention {
+		if err := st.UpdateReconcile(journal.ID, model.JournalNeedsAttention, journal.CompletedStep, "invalid persisted plan: "+reason); err != nil {
+			return fmt.Errorf("invalid plan (%s); failed to quarantine journal: %w", reason, err)
+		}
+	}
+	return fmt.Errorf("invalid reconcile plan: %s; journal %q remains needs_attention", reason, journal.ID)
+}
+
+func hasTargetOperationMarkers(snapshot model.Snapshot) bool {
+	targetWindows := make(map[string]bool, len(snapshot.Target.Windows))
+	for _, window := range snapshot.Target.Windows {
+		targetWindows[window.TmuxID] = true
+	}
+	for _, object := range snapshot.Objects {
+		if object.OperationID == "" {
+			continue
+		}
+		switch object.Kind {
+		case model.ObjectSession:
+			if object.RuntimeID == snapshot.TargetSessionID {
+				return true
+			}
+		case model.ObjectWindow:
+			if isWindowMemberOf(snapshot.Memberships, snapshot.TargetSessionID, object.RuntimeID) {
+				return true
+			}
+		case model.ObjectPane:
+			if targetWindows[object.ParentID] {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func isWindowMemberOf(memberships []model.WindowMembership, sessionID, windowID string) bool {
+	for _, membership := range memberships {
+		if membership.SessionID == sessionID && membership.WindowID == windowID {
+			return true
+		}
+	}
+	return false
+}
+
 func loadReconcileBaseline(st store.Storer, name, liveLogicalID string) (*model.Session, error) {
 	if liveLogicalID != "" {
 		base, err := st.GetBaselineByLogicalID(liveLogicalID)
 		if err != nil || base != nil {
 			return base, err
 		}
+		// A known live logical identity is authoritative. A same-name baseline
+		// with another identity is a conflict, not a fallback candidate.
+		byName, err := st.GetBaseline(name)
+		if err != nil {
+			return nil, err
+		}
+		if byName != nil && byName.LogicalID != liveLogicalID {
+			return nil, fmt.Errorf("live session %q has logical identity %s but its name is associated with baseline identity %s", name, liveLogicalID, byName.LogicalID)
+		}
+		return nil, nil
 	}
 	base, err := st.GetBaseline(name)
 	if err != nil || base != nil {

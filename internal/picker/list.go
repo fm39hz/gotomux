@@ -16,25 +16,32 @@ const (
 	KindZoxide
 )
 
-// ID uniquely identifies a session/project. Session names are unique
-// within tmux; sources deduplicate by Name. This is the stable identity
-// for cursor tracking, animation, and dedup — not a convention string.
+// ID uniquely identifies a picker action. Different intents may target the
+// same display name, so names alone cannot identify rows or cursor state.
 type ID string
 
-func (it Item) ID() ID { return ID(it.Name) }
+func (it Item) ID() ID {
+	path := ""
+	if it.Path != "" {
+		path = filepath.Clean(it.Path)
+	}
+	return ID(it.Name + "\x00" + path)
+}
 
 // Item is one picker row from any Source.
 type Item struct {
 	// Host is reserved for the remote-tmux source in docs/todo.md; nothing sets
 	// it yet. Busy used to live here too but was never read — the non-shell tool
 	// badge is rendered through Desc (see mkBusy/badgeFromBusy).
-	Host    string // "" = local; remote: "hostname"
-	Kind    Kind
-	Title   string
-	Desc    string
-	Name    string
-	Path    string
-	Windows int
+	Host      string // "" = local; remote: "hostname"
+	Kind      Kind
+	Title     string
+	Desc      string
+	Name      string
+	Path      string
+	RuntimeID string
+	ServerKey string
+	Windows   int
 	// Recency: higher = better. Preset last_used / zoxide order / usage overlay.
 	Recency int64
 	// Cooccur: decayed pair score with current session.

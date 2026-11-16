@@ -198,6 +198,9 @@ type Operation struct {
 }
 
 type PlanResult struct {
+	// PlanSchemaVersion versions the persisted JSON contract. A zero value is
+	// legacy data and must pass an explicit, cursor-aware upgrade before use.
+	PlanSchemaVersion        int `json:"plan_schema_version"`
 	ID                       string
 	Status                   PlanStatus
 	Policy                   Policy
@@ -211,3 +214,5 @@ type PlanResult struct {
 	PreservedPanes           []string
 	Resolution               Resolution
 }
+
+const CurrentPlanSchemaVersion = 1

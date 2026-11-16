@@ -288,11 +288,10 @@ func runPickerIPC(cfg *config.Config, conn net.Conn) error {
 		recordOpen(st.get(), it.Name, liveNames(resp.Sessions))
 	}
 
-	ctx := context.Background()
 	switch it.Kind {
 	case picker.KindActive:
 		// No store needed: attaching to a live session touches nothing on disk.
-		return ctl.Connect(ctx, it.Name, "")
+		return connectSelectedLive(ctl, it)
 	case picker.KindPreset:
 		p, e := st.get().Get(it.Name)
 		if e != nil {
@@ -485,14 +484,13 @@ func profileRun(cfg *config.Config) error {
 }
 
 func connectItem(ctl tmux.Connector, st store.Storer, res picker.Result) error {
-	ctx := context.Background()
 	it := res.Item
 	recordOpen(st, it.Name, res.Live)
 	switch it.Kind {
 	case picker.KindCreate, picker.KindZoxide:
 		return template.ConnectProject(ctl, st, it.Name, it.Path)
 	case picker.KindActive:
-		return ctl.Connect(ctx, it.Name, "")
+		return connectSelectedLive(ctl, it)
 	case picker.KindPreset:
 		if st == nil {
 			return fmt.Errorf("connect preset: nil store")
@@ -505,6 +503,19 @@ func connectItem(ctl tmux.Connector, st store.Storer, res picker.Result) error {
 	default:
 		return fmt.Errorf("unknown kind %v", it.Kind)
 	}
+}
+
+func connectSelectedLive(ctl tmux.Connector, item picker.Item) error {
+	if item.RuntimeID == "" || item.ServerKey == "" {
+		return fmt.Errorf("live session %q has no observed runtime identity; refresh the picker", item.Name)
+	}
+	connector, ok := ctl.(interface {
+		ConnectObserved(context.Context, string, string) error
+	})
+	if !ok {
+		return fmt.Errorf("tmux adapter cannot connect by observed session identity")
+	}
+	return connector.ConnectObserved(context.Background(), item.RuntimeID, item.ServerKey)
 }
 
 // recordOpen bumps frecency and co-occurrence for a session about to be opened.

@@ -153,13 +153,15 @@ func (s *tmuxSource) Snapshot() []Item {
 		}
 		busy := mkBusy(ls.ActiveCmd)
 		out = append(out, Item{
-			Kind:    KindActive,
-			Title:   fmt.Sprintf("[Active] %s", ls.Name),
-			Desc:    badgeFromBusy(busy),
-			Name:    ls.Name,
-			Path:    ls.Path,
-			Windows: ls.Windows,
-			Recency: rec,
+			Kind:      KindActive,
+			Title:     fmt.Sprintf("[Active] %s", ls.Name),
+			Desc:      badgeFromBusy(busy),
+			Name:      ls.Name,
+			Path:      ls.Path,
+			RuntimeID: ls.ID,
+			ServerKey: ls.ServerKey,
+			Windows:   ls.Windows,
+			Recency:   rec,
 		})
 	}
 	return out
@@ -315,9 +317,8 @@ func refreshCmds(srcs []Source) []tea.Cmd {
 
 func flattenSources(order []Source, bySrc map[Source][]Item, query string) []Item {
 	q := query != ""
-	names := map[string]bool{}
-	paths := map[string]bool{}
 	var out []Item
+	positions := map[string]int{}
 	for _, s := range order {
 		items := bySrc[s]
 		ff := s.FlattenFilter(query)
@@ -332,19 +333,45 @@ func flattenSources(order []Source, bySrc map[Source][]Item, query string) []Ite
 			if ff.Cap > 0 && kept >= ff.Cap {
 				break
 			}
-			nr := normPath(it.Path)
-			if names[it.Name] || (nr != "" && paths[nr]) {
+			key := itemDedupKey(it)
+			if position, exists := positions[key]; exists {
+				if sourcePriority(it.Kind) < sourcePriority(out[position].Kind) {
+					out[position] = it
+					kept++
+				}
 				continue
 			}
-			names[it.Name] = true
-			if nr != "" {
-				paths[nr] = true
-			}
+			positions[key] = len(out)
 			out = append(out, it)
 			kept++
 		}
 	}
 	return out
+}
+
+func itemDedupKey(item Item) string {
+	if path := normPath(item.Path); path != "" {
+		return "path:" + path
+	}
+	return fmt.Sprintf("name:%s", item.Name)
+}
+
+// Prefer the most actionable existing representation when multiple sources
+// describe the same normalized path. A saved preset must win over a generated
+// Create/Zoxide row so it remains selectable without showing duplicate rows.
+func sourcePriority(kind Kind) int {
+	switch kind {
+	case KindActive:
+		return 0
+	case KindPreset:
+		return 1
+	case KindCreate:
+		return 2
+	case KindZoxide:
+		return 3
+	default:
+		return int(kind) + 4
+	}
 }
 
 func applyRankMeta(bySrc map[Source][]Item, st store.Storer, ctx Context) {
@@ -364,7 +391,9 @@ func applyRankMeta(bySrc map[Source][]Item, st store.Storer, ctx Context) {
 		if ctx.HasSession() {
 			n := 0
 			for _, it := range items {
-				if it.Name == ctx.Session || (ctx.Path != "" && it.Path == ctx.Path) {
+				sameLive := it.Kind == KindActive && it.Name == ctx.Session
+				sameCreatePath := (it.Kind == KindCreate || it.Kind == KindZoxide) && ctx.Path != "" && normPath(it.Path) == normPath(ctx.Path)
+				if sameLive || sameCreatePath {
 					continue
 				}
 				items[n] = it

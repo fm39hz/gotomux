@@ -45,6 +45,9 @@ var ErrStalePlan = errors.New("reconcile plan is stale")
 // journal write failed, the next call recognizes that operation and advances
 // without repeating it.
 func (r Runner) Execute(ctx context.Context, sessionName, journalID string, plan core.PlanResult) (retErr error) {
+	if plan.PlanSchemaVersion != core.CurrentPlanSchemaVersion {
+		return fmt.Errorf("reconcile runner refuses plan schema version %d; expected %d", plan.PlanSchemaVersion, core.CurrentPlanSchemaVersion)
+	}
 	if plan.Status == core.PlanNoop {
 		if r.Journal == nil || journalID == "" {
 			return fmt.Errorf("reconcile no-op requires a journal for verified baseline commit")
@@ -79,7 +82,7 @@ func (r Runner) Execute(ctx context.Context, sessionName, journalID string, plan
 	}
 	if journal.PlanJSON != "" {
 		var persisted core.PlanResult
-		if err := json.Unmarshal([]byte(journal.PlanJSON), &persisted); err != nil || persisted.ID != plan.ID || persisted.Policy != plan.Policy {
+		if err := json.Unmarshal([]byte(journal.PlanJSON), &persisted); err != nil || persisted.ID != plan.ID || persisted.Policy != plan.Policy || persisted.PlanSchemaVersion != plan.PlanSchemaVersion {
 			return fmt.Errorf("reconcile journal plan does not match the supplied plan")
 		}
 	}

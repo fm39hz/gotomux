@@ -84,7 +84,7 @@ func tmuxRun(ctx context.Context, args ...string) error {
 }
 
 const (
-	ListSessFmt  = "S\t#{session_id}\t#{session_name}\t#{session_windows}\t#{session_path}\t#{session_last_attached}\t#{session_activity}\t#{session_created}\t#{session_attached}"
+	ListSessFmt  = "S\t#{session_id}\t#{session_name}\t#{session_windows}\t#{session_path}\t#{session_last_attached}\t#{session_activity}\t#{session_created}\t#{session_attached}\t#{socket_path}\t#{pid}"
 	ListPanesFmt = "P\t#{session_name}\t#{pane_current_command}\t#{?pane_active,1,0}\t#{?pane_dead,1,0}"
 )
 
@@ -94,6 +94,9 @@ type LiveSession struct {
 	// $TMUX is "<socket>,<serverpid>,<session index>" and the index matches
 	// #{session_id} minus the '$'.
 	ID           string `json:"id,omitempty"`
+	ServerKey    string `json:"server_key,omitempty"`
+	SocketPath   string `json:"socket_path,omitempty"`
+	ServerPID    string `json:"server_pid,omitempty"`
 	Name         string `json:"name"`
 	Windows      int    `json:"windows,omitempty"`
 	Path         string `json:"path,omitempty"`
@@ -156,7 +159,41 @@ func (c *Ctl) ListLive(ctx context.Context) ([]LiveSession, error) {
 		}
 		return nil, fmt.Errorf("tmux list: %w", err)
 	}
-	return DropHidden(ParseLiveOutput(string(out))), nil
+	live := DropHidden(ParseLiveOutput(string(out)))
+	if len(live) == 0 {
+		return live, nil
+	}
+	serverKey := ServerKeyFromSocket(live[0].SocketPath, live[0].ServerPID)
+	if serverKey == "" {
+		serverKey = tmuxServerKey(ctx, live[0].Name)
+	}
+	if serverKey == "" {
+		return nil, fmt.Errorf("tmux list: cannot establish server generation")
+	}
+	for i := range live {
+		live[i].ServerKey = serverKey
+	}
+	return live, nil
+}
+
+// WithServerGeneration attaches a verified tmux server key to control-mode
+// session rows. A missing key returns nil so callers do not expose sessions
+// that cannot be safely targeted later.
+func WithServerGeneration(sessions []LiveSession) []LiveSession {
+	if len(sessions) == 0 {
+		return sessions
+	}
+	serverKey := ServerKeyFromSocket(sessions[0].SocketPath, sessions[0].ServerPID)
+	if serverKey == "" {
+		return nil
+	}
+	for i := range sessions {
+		if sessions[i].SocketPath != sessions[0].SocketPath || sessions[i].ServerPID != sessions[0].ServerPID {
+			return nil
+		}
+		sessions[i].ServerKey = serverKey
+	}
+	return sessions
 }
 
 func ParseLiveOutput(out string) []LiveSession {
@@ -191,6 +228,11 @@ func ParseLiveOutput(out string) []LiveSession {
 				ID: fields[0], Name: name, Windows: nw, Path: fields[3],
 				LastAttached: parseUnix(fields[4]), Activity: parseUnix(fields[5]),
 				Created: parseUnix(fields[6]), Attached: na,
+			}
+			if len(fields) >= 10 {
+				live := byName[name]
+				live.SocketPath, live.ServerPID = fields[8], fields[9]
+				byName[name] = live
 			}
 			if !orderSeen[name] {
 				orderSeen[name] = true
@@ -527,7 +569,7 @@ func (c *Ctl) Load(ctx context.Context, sess *model.Session) error {
 	}
 
 	w0, p0 := wins[0], wins[0].Panes[0]
-	ns := []string{"new-session", "-d", "-s", sess.Name, "-c", p0.Cwd}
+	ns := []string{"new-session", "-d", "-s", sess.Name, "-c", p0.Cwd, "-P", "-F", "#{session_id}"}
 	if safe := safeWindowName(w0.Name, sess.Name); safe != "" {
 		ns = append(ns, "-n", safe)
 	}
@@ -548,13 +590,45 @@ func (c *Ctl) Load(ctx context.Context, sess *model.Session) error {
 		appendWin(i+1, w, nw)
 	}
 
-	parts = append(parts, []string{"select-window", "-t", windowTarget(sess.Name, base)})
-
-	if err := c.runChain(ctx, parts...); err != nil {
-		_ = c.Kill(ctx, sess.Name)
-		return fmt.Errorf("load %q: %w", sess.Name, err)
+	createdID, err := tmuxCmd(ctx, parts[0]...)
+	if err != nil {
+		return fmt.Errorf("load %q: create session: %w", sess.Name, err)
+	}
+	if !strings.HasPrefix(createdID, "$") {
+		return fmt.Errorf("load %q: tmux did not return the created session runtime ID", sess.Name)
+	}
+	sess.TmuxID = createdID
+	createdServerKey := tmuxServerKeyTarget(ctx, createdID)
+	if createdServerKey == "" {
+		return fmt.Errorf("load %q: created session %s has no verified server generation; left in place for inspection", sess.Name, createdID)
+	}
+	remaining := bindSessionTargets(parts[1:], sess.Name, createdID)
+	remaining = append(remaining, []string{"select-window", "-t", fmt.Sprintf("%s:%d", createdID, base)})
+	if err := c.runChain(ctx, remaining...); err != nil {
+		// Roll back only the exact session returned by new-session, and only
+		// while it still belongs to the server generation observed at creation.
+		if tmuxServerKeyTarget(ctx, createdID) == createdServerKey {
+			_ = tmuxRun(ctx, "kill-session", "-t", createdID)
+		}
+		return fmt.Errorf("load %q (created session %s): %w", sess.Name, createdID, err)
 	}
 	return nil
+}
+
+func bindSessionTargets(commands [][]string, name, runtimeID string) [][]string {
+	from := "=" + name
+	out := make([][]string, len(commands))
+	for i, command := range commands {
+		out[i] = append([]string(nil), command...)
+		for j := 0; j+1 < len(out[i]); j++ {
+			if out[i][j] != "-t" || !strings.HasPrefix(out[i][j+1], from) {
+				continue
+			}
+			target := out[i][j+1]
+			out[i][j+1] = runtimeID + strings.TrimPrefix(target, from)
+		}
+	}
+	return out
 }
 
 func (c *Ctl) windowBaseIndex(ctx context.Context) int {
@@ -709,4 +783,59 @@ func (c *Ctl) Connect(ctx context.Context, name, cwd string) error {
 		return fmt.Errorf("attach to %q: %w", name, err)
 	}
 	return nil
+}
+
+// ConnectObserved attaches to the exact live session selected from one
+// server-scoped observation. It never creates a session and never resolves by
+// mutable session name.
+func (c *Ctl) ConnectObserved(ctx context.Context, runtimeID, serverKey string) error {
+	if !strings.HasPrefix(runtimeID, "$") || serverKey == "" {
+		return fmt.Errorf("connect observed session: missing runtime identity or server generation")
+	}
+	currentKey := tmuxServerKeyTarget(ctx, runtimeID)
+	if currentKey == "" || currentKey != serverKey {
+		return fmt.Errorf("connect observed session %s: tmux server generation changed; refresh the picker", runtimeID)
+	}
+	currentID, err := tmuxCmd(ctx, "display-message", "-p", "-t", runtimeID, "#{session_id}")
+	if err != nil || strings.TrimSpace(currentID) != runtimeID {
+		return fmt.Errorf("connect observed session %s: runtime identity is no longer present", runtimeID)
+	}
+	if os.Getenv("TMUX") != "" {
+		return tmuxRun(ctx, "switch-client", "-t", runtimeID)
+	}
+	tmuxBin, err := exec.LookPath("tmux")
+	if err != nil {
+		return fmt.Errorf("tmux not found: %w", err)
+	}
+	return execAttach(tmuxBin, runtimeID)
+}
+
+func tmuxServerKeyTarget(ctx context.Context, target string) string {
+	identity, err := tmuxCmd(ctx, "display-message", "-p", "-t", target, "#{socket_path}\t#{pid}")
+	if err != nil || identity == "" {
+		return ""
+	}
+	parts := strings.SplitN(identity, "\t", 2)
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		return ""
+	}
+	return ServerKeyFromSocket(parts[0], parts[1])
+}
+
+// ServerKeyFromSocket derives the same server-generation identity from the
+// tmux format fields included in list-sessions, without starting a client
+// subprocess. The daemon uses it on control-mode snapshots.
+func ServerKeyFromSocket(socket, serverPID string) string {
+	if socket == "" || serverPID == "" {
+		return ""
+	}
+	info, err := os.Stat(socket)
+	if err != nil {
+		return ""
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return ""
+	}
+	return fmt.Sprintf("%s:%s:%d:%d:%d:%d", socket, serverPID, stat.Dev, stat.Ino, stat.Ctim.Sec, stat.Ctim.Nsec)
 }

@@ -16,7 +16,7 @@ import (
 // never repairs an ambiguous/conflicting mapping and never emits a destructive
 // operation under the preserve policy.
 func Plan(desired DesiredState, live model.Snapshot, resolution Resolution, policy Policy) PlanResult {
-	result := PlanResult{Status: PlanBlocked, Policy: policy, DesiredSession: desired.Session, ClassifierVersion: desired.ClassifierVersion, Resolution: resolution}
+	result := PlanResult{PlanSchemaVersion: CurrentPlanSchemaVersion, Status: PlanBlocked, Policy: policy, DesiredSession: desired.Session, ClassifierVersion: desired.ClassifierVersion, Resolution: resolution}
 	if err := policy.Validate(); err != nil {
 		result.BlockedReason = err.Error()
 		return result
@@ -271,31 +271,6 @@ func Plan(desired DesiredState, live model.Snapshot, resolution Resolution, poli
 		result.Operations = append(result.Operations, moveOperation(live, copy, currentIndex, tail, false, "move a preserved extra window to the tail"))
 		tail++
 	}
-	if active := live.ActiveWindowID; active != "" {
-		if current, ok := liveByID[active]; ok {
-			desiredIndex := current.Idx
-			for _, match := range resolution.Windows {
-				if match.Match.LiveRuntimeID == active && !match.Match.OutsideTarget {
-					desiredIndex = base.Windows[match.Match.BaselineIndex].Idx
-					break
-				}
-			}
-			if extraStaged[active] {
-				for _, op := range result.Operations {
-					if op.Kind == OperationMoveWindow && op.Target.ID == active && !op.Temporary {
-						desiredIndex = op.ToIndex
-						break
-					}
-				}
-			}
-			if desiredIndex != current.Idx {
-				target := RuntimeRef{ServerGeneration: live.ServerKey, Kind: ObjectWindow, ID: active}
-				copy := current
-				copy.Idx = desiredIndex
-				result.Operations = append(result.Operations, Operation{Kind: OperationSelectWindow, Target: target, TargetIdentityID: current.SlotID, ExpectedServerKey: live.ServerKey, ExpectedSessionID: live.TargetSessionID, ExpectedFingerprint: windowFingerprint(copy), Index: desiredIndex, Reason: "preserve the user's active window"})
-			}
-		}
-	}
 	slotBindings := bindingOperations(desired, live, resolution, false, true)
 	sessionBindings := bindingOperations(desired, live, resolution, true, false)
 	topologyOperations := result.Operations
@@ -495,6 +470,7 @@ func objectFingerprint(object *model.ObjectIdentity) string {
 
 func snapshotFingerprint(snapshot model.Snapshot) string {
 	copy := snapshot
+	copy.ActiveWindowID = "" // client focus is outside the structural plan contract
 	copy.Target.LogicalID = ""
 	copy.Target.Windows = append([]model.Window(nil), snapshot.Target.Windows...)
 	copy.Sessions = append([]model.SessionIdentity(nil), snapshot.Sessions...)

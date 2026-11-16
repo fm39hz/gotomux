@@ -89,6 +89,23 @@ func (s *Store) Save(sess *model.Session) error {
 	return tx.Commit()
 }
 
+// BindPresetIdentity updates only the stable identity columns of an existing
+// preset after its loaded tmux objects have been observed and verified.
+func (s *Store) BindPresetIdentity(sess *model.Session) error {
+	if sess == nil {
+		return fmt.Errorf("bind preset identity: nil session")
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if err := bindPresetIdentityTx(tx, sess); err != nil {
+		return fmt.Errorf("bind preset identity: %w", err)
+	}
+	return tx.Commit()
+}
+
 // deleteSessionsForSave removes presets that this Save should replace.
 func deleteSessionsForSave(tx *sql.Tx, name, cwd string) error {
 	q := dbgen.New(tx)

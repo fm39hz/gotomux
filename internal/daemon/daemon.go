@@ -344,7 +344,7 @@ func (d *Daemon) listLiveViaControl() []tmux.LiveSession {
 		}
 	}
 	d.ccOK.Store(true)
-	return tmux.DropHidden(tmux.ParseLiveOutput(raw))
+	return tmux.WithServerGeneration(tmux.DropHidden(tmux.ParseLiveOutput(raw)))
 }
 
 // syncNow refreshes every cache the IPC layer serves, single-flighted.

@@ -45,6 +45,7 @@ type Storer interface {
 	GetShapeByKey(key string) (id, body string, ok bool)
 
 	SaveBaseline(sess *model.Session) error
+	BindPresetIdentity(sess *model.Session) error
 	GetBaseline(name string) (*model.Session, error)
 	GetBaselineByLogicalID(id string) (*model.Session, error)
 	StartReconcile(journal model.ReconcileJournal) error

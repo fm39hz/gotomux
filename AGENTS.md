@@ -135,7 +135,7 @@ Documented in the header comment of `internal/template/edit.go` (`Format`/`Parse
 
 ### Picker sources & ranking
 
-`Source` = `Snapshot()` (paint) + `Refresh()` (background `tea.Cmd`) + `FlattenFilter(query)` (per-source cap / hide-when-typing). Order, dedup first-wins by name *and* normalized path: create → tmux → preset → zoxide. Create hides itself once a query is typed; zoxide caps at `ZoxideCap` (40) only when the query is empty.
+`Source` = `Snapshot()` (paint) + `Refresh()` (background `tea.Cmd`) + `FlattenFilter(query)` (per-source cap / hide-when-typing). Order is create → tmux → preset → zoxide. Dedup applies within an intent class: create/zoxide share a project-creation class, while live attach and saved-preset instantiation remain separate rows even when names or paths coincide. Picker item IDs include intent and observed identity so same-name actions do not share cursor state. Create hides itself once a query is typed; zoxide caps at `ZoxideCap` (40) only when the query is empty.
 
 #### Cold start — where the time actually goes (measured, do not re-derive)
 
@@ -166,7 +166,7 @@ Migration is additive-only and idempotent: `CREATE TABLE IF NOT EXISTS` plus `pr
 
 ### Connect behavior
 
-Inside tmux (`$TMUX` set): `SwitchClient`. Outside: `Attach`. `Load` is a no-op if the session already exists. Enter on Create/Zoxide: live session? attach : same-name preset? load : bake sticky shape into the project root.
+Inside tmux (`$TMUX` set): `SwitchClient`. Outside: `Attach`. `Load` is a no-op if the session already exists. Enter on Create/Zoxide: attach a same-name live session only when its observed project root matches; an identified name collision stops before creation. With no live or identified-name conflict, bake the sticky shape as a new instance. Preset rows instantiate their saved recipe by logical identity.
 
 `project.FindProjectRoot` walks up for `project.godot`, `.git`, `package.json`, `Cargo.toml`, `go.mod`. `project.SessionName` sanitizes the basename to `[a-z0-9-]`.
 

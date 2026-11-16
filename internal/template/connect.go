@@ -5,10 +5,12 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"path/filepath"
 
 	"github.com/fm39hz/gotomux/internal/classify"
 	"github.com/fm39hz/gotomux/internal/event"
 	"github.com/fm39hz/gotomux/internal/model"
+	"github.com/fm39hz/gotomux/internal/project"
 	"github.com/fm39hz/gotomux/internal/store"
 	"github.com/fm39hz/gotomux/internal/tmux"
 	"github.com/fm39hz/gotomux/internal/tmuxlayout"
@@ -200,43 +202,63 @@ func ConnectProject(ctl tmux.Connector, st store.Storer, name, cwd string) error
 		return fmt.Errorf("connect project: empty session name")
 	}
 	if ctl.Has(context.Background(), name) {
-		if err := ctl.Connect(context.Background(), name, ""); err != nil {
+		if err := connectLiveByName(ctl, name, cwd); err != nil {
 			return fmt.Errorf("attach %q: %w", name, err)
 		}
 		return nil
-	}
-	if st != nil {
-		if p, err := st.Get(name); err == nil && p != nil {
-			_ = st.Touch(name)
-			return ConnectPreset(ctl, st, p)
-		}
 	}
 	tmpl, sid, err := LoadActive(st)
 	if err != nil {
 		return fmt.Errorf("load sticky shape: %w", err)
 	}
 	baked := bakeShape(st, tmpl, name, cwd, sid)
-	if st == nil {
-		return ConnectPreset(ctl, nil, baked)
-	}
-	return ConnectPreset(ctl, st, baked)
+	return connectPreset(ctl, st, baked, false)
 }
 
 // ConnectPreset loads a saved/baked instance, records its baseline before an
 // outside-tmux attach can replace the process, then connects the client.
 func ConnectPreset(ctl tmux.Connector, st store.Storer, p *model.Session) error {
+	return connectPreset(ctl, st, p, true)
+}
+
+func connectPreset(ctl tmux.Connector, st store.Storer, p *model.Session, selectedPreset bool) error {
 	if ctl == nil || p == nil {
 		return fmt.Errorf("connect preset: nil tmux or preset")
 	}
 	ctx := context.Background()
 	if ctl.Has(ctx, p.Name) {
-		return ctl.Connect(ctx, p.Name, "")
+		ops, ok := ctl.(IdentityOps)
+		if !ok {
+			return fmt.Errorf("connect preset %q: cannot verify identity of the same-name live session", p.Name)
+		}
+		live, err := ops.Observe(ctx, p.Name)
+		if err != nil {
+			return fmt.Errorf("connect preset %q: observe existing live session: %w", p.Name, err)
+		}
+		if p.LogicalID == "" || live.Target.LogicalID != p.LogicalID {
+			return fmt.Errorf("connect preset %q: same-name live session identity does not match the selected preset", p.Name)
+		}
+		if err := validateIdentitySnapshot(live, p.Name); err != nil {
+			return fmt.Errorf("connect preset %q: live identity graph is invalid: %w", p.Name, err)
+		}
+		if err := requireTargetIDs(live.Target); err != nil {
+			return fmt.Errorf("connect preset %q: live identity tree is incomplete: %w", p.Name, err)
+		}
+		connector, ok := ctl.(interface {
+			ConnectObserved(context.Context, string, string) error
+		})
+		if !ok {
+			return fmt.Errorf("connect preset %q: tmux adapter cannot connect by observed runtime identity", p.Name)
+		}
+		return connector.ConnectObserved(ctx, live.TargetSessionID, live.ServerKey)
 	}
 	ops, ok := ctl.(IdentityOps)
 	if !ok {
 		return fmt.Errorf("connect preset: tmux adapter does not support logical identity metadata")
 	}
 	instance := cloneSession(p)
+	legacyBaselineWithoutIdentity := false
+	projectNameCollision := false
 	if st != nil {
 		storedPreset, err := st.Get(p.Name)
 		if err != nil && !errors.Is(err, sql.ErrNoRows) {
@@ -246,32 +268,51 @@ func ConnectPreset(ctl tmux.Connector, st store.Storer, p *model.Session) error 
 		if err != nil {
 			return fmt.Errorf("connect preset %q baseline identity: %w", p.Name, err)
 		}
-		if storedPreset != nil {
-			if !samePersistedPreset(p, storedPreset) {
-				return fmt.Errorf("preset %q changed since it was selected; reload it before connecting", p.Name)
+		if storedBaseline != nil && storedBaseline.LogicalID == "" {
+			// Keep an unidentified legacy baseline untouched. It cannot establish
+			// ownership, but it must not prevent creating a fresh instance from a
+			// valid preset; the user can freeze that instance to establish a new
+			// identified baseline explicitly.
+			legacyBaselineWithoutIdentity = true
+			storedBaseline = nil
+			if !selectedPreset {
+				projectNameCollision = true
 			}
-			if storedPreset.LogicalID != "" {
-				if p.LogicalID != "" && p.LogicalID != storedPreset.LogicalID {
-					return fmt.Errorf("preset %q selection has a different logical identity than its stored instance", p.Name)
+		}
+		if !selectedPreset && storedBaseline != nil {
+			return fmt.Errorf("create project %q: an identified baseline already owns this session name; select its preset or freeze an intentional replacement", p.Name)
+		}
+		if storedPreset != nil {
+			if !selectedPreset {
+				projectNameCollision = true
+				clearPresetStableIDs(instance)
+			} else {
+				if !samePersistedPreset(p, storedPreset) {
+					return fmt.Errorf("preset %q changed since it was selected; reload it before connecting", p.Name)
 				}
-				if storedBaseline != nil && storedBaseline.LogicalID != storedPreset.LogicalID {
-					return fmt.Errorf("preset %q belongs to logical session %s but its baseline belongs to %s; freeze the intended replacement before loading", p.Name, storedPreset.LogicalID, storedBaseline.LogicalID)
-				}
-				if err := copyPresetStableIDs(instance, storedPreset); err != nil {
-					return err
-				}
-				if !completePresetStableIDs(instance) && storedBaseline != nil && samePersistedPreset(instance, storedBaseline) {
-					if err := fillMissingPresetStableIDs(instance, storedBaseline); err != nil {
+				if storedPreset.LogicalID != "" {
+					if p.LogicalID != "" && p.LogicalID != storedPreset.LogicalID {
+						return fmt.Errorf("preset %q selection has a different logical identity than its stored instance", p.Name)
+					}
+					if storedBaseline != nil && storedBaseline.LogicalID != storedPreset.LogicalID {
+						return fmt.Errorf("preset %q belongs to logical session %s but its baseline belongs to %s; freeze the intended replacement before loading", p.Name, storedPreset.LogicalID, storedBaseline.LogicalID)
+					}
+					if err := copyPresetStableIDs(instance, storedPreset); err != nil {
 						return err
 					}
-				}
-				if !completePresetStableIDs(instance) {
-					return fmt.Errorf("preset %q has incomplete stable identities; freeze it before loading", p.Name)
-				}
-			} else {
-				clearPresetStableIDs(instance)
-				if err := restorePresetIdentity(instance, storedBaseline); err != nil {
-					return err
+					if !completePresetStableIDs(instance) && storedBaseline != nil && samePersistedPreset(instance, storedBaseline) {
+						if err := fillMissingPresetStableIDs(instance, storedBaseline); err != nil {
+							return err
+						}
+					}
+					if !completePresetStableIDs(instance) {
+						return fmt.Errorf("preset %q has incomplete stable identities; freeze it before loading", p.Name)
+					}
+				} else {
+					clearPresetStableIDs(instance)
+					if err := restorePresetIdentity(instance, storedBaseline); err != nil {
+						return err
+					}
 				}
 			}
 		} else {
@@ -298,6 +339,7 @@ func ConnectPreset(ctl tmux.Connector, st store.Storer, p *model.Session) error 
 	if err != nil {
 		return fmt.Errorf("load preset %q identity: %w", p.Name, err)
 	}
+	instance = cloneSession(observed)
 	if st != nil {
 		baseline := cloneSession(instance)
 		if err := bindLoadedIDs(baseline, observed); err != nil {
@@ -305,11 +347,59 @@ func ConnectPreset(ctl tmux.Connector, st store.Storer, p *model.Session) error 
 		}
 		baseline.SchemaVersion = model.CurrentBaselineSchemaVersion
 		stampSemanticMetadata(baseline)
-		if err := st.SaveBaseline(baseline); err != nil {
+		if !selectedPreset && projectNameCollision {
+			// Do not let a fresh project instance overwrite a same-name preset or
+			// unidentified legacy baseline. Freeze is the explicit baseline write.
+		} else if legacyBaselineWithoutIdentity {
+			if err := st.BindPresetIdentity(baseline); err != nil {
+				return fmt.Errorf("persist loaded preset identity %q: %w", p.Name, err)
+			}
+		} else if err := st.SaveBaseline(baseline); err != nil {
 			return fmt.Errorf("save baseline %q: %w", p.Name, err)
 		}
 	}
-	return ctl.Connect(ctx, instance.Name, instance.Cwd)
+	connector, ok := ctl.(interface {
+		ConnectObserved(context.Context, string, string) error
+	})
+	if !ok {
+		return fmt.Errorf("load preset %q: tmux adapter cannot connect by verified runtime identity", p.Name)
+	}
+	return connector.ConnectObserved(ctx, instance.TmuxID, instance.ServerKey)
+}
+
+func connectLiveByName(ctl tmux.Connector, name, expectedPath string) error {
+	ctx := context.Background()
+	live, err := ctl.ListLive(ctx)
+	if err != nil {
+		return err
+	}
+	var match *tmux.LiveSession
+	for i := range live {
+		if live[i].Name == name {
+			if match != nil {
+				return fmt.Errorf("live session name %q is ambiguous", name)
+			}
+			match = &live[i]
+		}
+	}
+	if match == nil {
+		return fmt.Errorf("live session %q disappeared; refresh and retry", name)
+	}
+	if expectedPath == "" || match.Path == "" {
+		return fmt.Errorf("same-name live session %q has no project path evidence; refusing name-only attach", name)
+	}
+	wantRoot := filepath.Clean(project.FindProjectRoot(expectedPath))
+	gotRoot := filepath.Clean(project.FindProjectRoot(match.Path))
+	if wantRoot != gotRoot {
+		return fmt.Errorf("same-name live session %q belongs to project %q, selected project is %q", name, gotRoot, wantRoot)
+	}
+	connector, ok := ctl.(interface {
+		ConnectObserved(context.Context, string, string) error
+	})
+	if !ok {
+		return fmt.Errorf("tmux adapter cannot connect by observed runtime identity")
+	}
+	return connector.ConnectObserved(ctx, match.ID, match.ServerKey)
 }
 
 func restorePresetIdentity(preset, baseline *model.Session) error {

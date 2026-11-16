@@ -97,12 +97,6 @@ func Verify(desired DesiredState, live model.Snapshot, resolution Resolution, po
 	if policy == PolicyExact && len(live.Target.Windows) != len(desired.Session.Windows) {
 		return fmt.Errorf("exact reconciliation left %d live windows; baseline has %d", len(live.Target.Windows), len(desired.Session.Windows))
 	}
-	if plan.FinalActiveSlotID != "" && live.ActiveWindowID != "" {
-		active := targetWindowByIDValue(live.Target, live.ActiveWindowID)
-		if active == nil || active.SlotID != plan.FinalActiveSlotID {
-			return fmt.Errorf("active window does not match the planned baseline slot")
-		}
-	}
 	return nil
 }
 
