@@ -2,19 +2,19 @@ package runner
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"fmt"
 	"sort"
 
 	"github.com/fm39hz/gotomux/internal/model"
 	core "github.com/fm39hz/gotomux/internal/reconcile/core"
+	"github.com/fm39hz/gotomux/internal/tmuxlayout"
+	"github.com/google/uuid"
 )
 
 // applyExactRebuild creates every desired window at a deterministic staging
 // index before deleting originals. Operation markers make each phase resumable.
 func (r Runner) applyExactRebuild(ctx context.Context, sessionName string, op core.Operation, initial model.Snapshot) error {
-	if len(op.ExactOriginalWindows) == 0 || len(op.DesiredSession.Windows) == 0 {
+	if len(op.ExactOriginalWindows) == 0 || len(op.DesiredBaseline.Session().Windows) == 0 {
 		return fmt.Errorf("exact rebuild plan lacks original or desired windows")
 	}
 	originals := make(map[string]model.Window, len(op.ExactOriginalWindows))
@@ -25,7 +25,7 @@ func (r Runner) applyExactRebuild(ctx context.Context, sessionName string, op co
 		originals[window.TmuxID] = window
 	}
 	stageBase := maxWindowIndex(op.ExactOriginalWindows)
-	if desiredMax := maxWindowIndex(op.DesiredSession.Windows); desiredMax > stageBase {
+	if desiredMax := maxWindowIndex(op.DesiredBaseline.Session().Windows); desiredMax > stageBase {
 		stageBase = desiredMax
 	}
 	stageBase++
@@ -36,21 +36,26 @@ func (r Runner) applyExactRebuild(ctx context.Context, sessionName string, op co
 
 	// Recreate first. This keeps at least one session window alive and ensures
 	// retries can identify completed creations without guessing from names.
-	for i, wanted := range op.DesiredSession.Windows {
+	for i, wanted := range op.DesiredBaseline.Session().Windows {
 		snapshot, err := r.observeExact(ctx, sessionName, op)
 		if err != nil {
 			return err
 		}
 		opID := exactWindowOperationID(op, wanted.Idx)
 		if runtimeID := targetWindowIDByOperation(snapshot, opID); runtimeID != "" {
-			window, ok := targetWindowByRuntime(snapshot.Target, runtimeID)
+			window, ok := targetWindowByRuntime(snapshot.Target.Session(), runtimeID)
 			if _, original := originals[runtimeID]; original || !ok || (window.SlotID != "" && window.SlotID != stagedWindowSlot(op, wanted) && window.SlotID != wanted.SlotID) {
 				return fmt.Errorf("exact operation marker %s is attached to an unexpected window", opID)
+			}
+			if window.SlotID != wanted.SlotID {
+				if _, err := r.Tmux.CreateWindowWithOperationKeepingMarkers(ctx, snapshot.TargetSessionID, window.Idx, stageWindow(op, wanted), snapshot.Target.Cwd, opID); err != nil {
+					return fmt.Errorf("resume staged window %s: %w", runtimeID, err)
+				}
 			}
 			continue
 		}
 		index := stageBase + i
-		if err := targetIndexAvailable(snapshot.Target, index); err != nil {
+		if err := targetIndexAvailable(snapshot.Target.Session(), index); err != nil {
 			return err
 		}
 		staged := stageWindow(op, wanted)
@@ -66,11 +71,14 @@ func (r Runner) applyExactRebuild(ctx context.Context, sessionName string, op co
 	if err := validateExactWindowSet(snapshot, op, originals); err != nil {
 		return err
 	}
-	for _, wanted := range op.DesiredSession.Windows {
+	for _, wanted := range op.DesiredBaseline.Session().Windows {
 		runtimeID := targetWindowIDByOperation(snapshot, exactWindowOperationID(op, wanted.Idx))
-		window, ok := targetWindowByRuntime(snapshot.Target, runtimeID)
-		if runtimeID == "" || !ok || (window.SlotID != "" && window.SlotID != stagedWindowSlot(op, wanted)) {
+		window, ok := targetWindowByRuntime(snapshot.Target.Session(), runtimeID)
+		if runtimeID == "" || !ok || (window.SlotID != stagedWindowSlot(op, wanted) && window.SlotID != wanted.SlotID) {
 			return fmt.Errorf("staged baseline slot %s is missing its operation marker", wanted.SlotID)
+		}
+		if err := validateExactReplacement(snapshot, op, wanted, window); err != nil {
+			return err
 		}
 	}
 
@@ -81,7 +89,7 @@ func (r Runner) applyExactRebuild(ctx context.Context, sessionName string, op co
 		if err != nil {
 			return err
 		}
-		current, ok := targetWindowByRuntime(snapshot.Target, original.TmuxID)
+		current, ok := targetWindowByRuntime(snapshot.Target.Session(), original.TmuxID)
 		if !ok {
 			if objectByRuntime(snapshot.Objects, model.ObjectWindow, original.TmuxID) != nil {
 				return fmt.Errorf("original window %s moved out of the target session during exact rebuild", original.TmuxID)
@@ -91,7 +99,7 @@ func (r Runner) applyExactRebuild(ctx context.Context, sessionName string, op co
 		if core.WindowFingerprint(current) != core.WindowFingerprint(original) {
 			return fmt.Errorf("original window %s changed after exact plan creation", original.TmuxID)
 		}
-		if len(snapshot.Target.Windows) <= len(op.DesiredSession.Windows) {
+		if len(snapshot.Target.Windows) <= len(op.DesiredBaseline.Session().Windows) {
 			return fmt.Errorf("refusing to remove original window %s before all replacements exist", original.TmuxID)
 		}
 		if err := r.Tmux.KillWindowAt(ctx, sessionName, original.TmuxID, current.Idx); err != nil {
@@ -101,13 +109,13 @@ func (r Runner) applyExactRebuild(ctx context.Context, sessionName string, op co
 
 	// Original slots are now free. Promote the operation-scoped temporary IDs
 	// to the frozen slot IDs, retaining operation markers until final verify.
-	for _, wanted := range op.DesiredSession.Windows {
+	for _, wanted := range op.DesiredBaseline.Session().Windows {
 		snapshot, err = r.observeExact(ctx, sessionName, op)
 		if err != nil {
 			return err
 		}
 		windowID := targetWindowIDByOperation(snapshot, exactWindowOperationID(op, wanted.Idx))
-		window, ok := targetWindowByRuntime(snapshot.Target, windowID)
+		window, ok := targetWindowByRuntime(snapshot.Target.Session(), windowID)
 		if !ok {
 			return fmt.Errorf("staged window for baseline slot %s disappeared", wanted.SlotID)
 		}
@@ -154,18 +162,18 @@ func (r Runner) applyExactRebuild(ctx context.Context, sessionName string, op co
 		}
 	}
 
-	for _, wanted := range op.DesiredSession.Windows {
+	for _, wanted := range op.DesiredBaseline.Session().Windows {
 		snapshot, err = r.observeExact(ctx, sessionName, op)
 		if err != nil {
 			return err
 		}
-		runtimeID := targetWindowIDBySlot(snapshot.Target, wanted.SlotID)
-		window, ok := targetWindowByRuntime(snapshot.Target, runtimeID)
+		runtimeID := targetWindowIDBySlot(snapshot.Target.Session(), wanted.SlotID)
+		window, ok := targetWindowByRuntime(snapshot.Target.Session(), runtimeID)
 		if !ok || !operationMarkerForWindow(snapshot, runtimeID, exactWindowOperationID(op, wanted.Idx)) {
 			return fmt.Errorf("staged baseline window %s disappeared before final placement", wanted.SlotID)
 		}
 		if window.Idx != wanted.Idx {
-			if err := targetIndexAvailable(snapshot.Target, wanted.Idx); err != nil {
+			if err := targetIndexAvailable(snapshot.Target.Session(), wanted.Idx); err != nil {
 				return err
 			}
 			if err := r.Tmux.MoveWindowTo(ctx, snapshot.TargetSessionID, runtimeID, window.Idx, wanted.Idx); err != nil {
@@ -182,8 +190,8 @@ func (r Runner) applyExactRebuild(ctx context.Context, sessionName string, op co
 }
 
 func selectAndVerifyExact(ctx context.Context, r Runner, sessionName string, op core.Operation, snapshot model.Snapshot) error {
-	if slot := planFinalSlot(op.DesiredSession); slot != "" {
-		windowID := targetWindowIDBySlot(snapshot.Target, slot)
+	if slot := planFinalSlot(op.DesiredBaseline.Session()); slot != "" {
+		windowID := targetWindowIDBySlot(snapshot.Target.Session(), slot)
 		if windowID == "" {
 			return fmt.Errorf("exact rebuild lost the final active baseline window")
 		}
@@ -195,8 +203,8 @@ func selectAndVerifyExact(ctx context.Context, r Runner, sessionName string, op 
 	if err != nil {
 		return err
 	}
-	resolution := core.Resolve(core.DesiredState{Session: op.DesiredSession}, fresh)
-	if err := core.Verify(core.DesiredState{Session: op.DesiredSession}, fresh, resolution, core.PolicyExact, core.PlanResult{FinalActiveSlotID: planFinalSlot(op.DesiredSession)}); err != nil {
+	resolution := core.Resolve(core.DesiredState{Baseline: op.DesiredBaseline}, fresh)
+	if err := core.Verify(core.DesiredState{Baseline: op.DesiredBaseline}, fresh, resolution, core.PolicyExact, core.PlanResult{FinalActiveSlotID: planFinalSlot(op.DesiredBaseline.Session())}); err != nil {
 		return fmt.Errorf("exact rebuild did not verify: %w", err)
 	}
 	return nil
@@ -211,8 +219,8 @@ func exactPaneOperationID(windowOperationID string, index int) string {
 }
 
 func exactOperationMarkersValid(snapshot model.Snapshot, op core.Operation) bool {
-	for _, window := range op.DesiredSession.Windows {
-		windowID := targetWindowIDBySlot(snapshot.Target, window.SlotID)
+	for _, window := range op.DesiredBaseline.Session().Windows {
+		windowID := targetWindowIDBySlot(snapshot.Target.Session(), window.SlotID)
 		windowOperationID := exactWindowOperationID(op, window.Idx)
 		if windowID == "" {
 			return false
@@ -221,7 +229,7 @@ func exactOperationMarkersValid(snapshot model.Snapshot, op core.Operation) bool
 		if windowObject == nil || windowObject.OperationID != "" && windowObject.OperationID != windowOperationID {
 			return false
 		}
-		liveWindow, _ := targetWindowByRuntime(snapshot.Target, windowID)
+		liveWindow, _ := targetWindowByRuntime(snapshot.Target.Session(), windowID)
 		for paneIndex, wantedPane := range window.Panes {
 			var runtimeID string
 			for _, pane := range liveWindow.Panes {
@@ -259,7 +267,7 @@ func validateExactWindowSet(snapshot model.Snapshot, op core.Operation, original
 			continue
 		}
 		marked := false
-		for _, wanted := range op.DesiredSession.Windows {
+		for _, wanted := range op.DesiredBaseline.Session().Windows {
 			if operationMarkerForWindow(snapshot, window.TmuxID, exactWindowOperationID(op, wanted.Idx)) {
 				if window.SlotID != "" && window.SlotID != wanted.SlotID && window.SlotID != stagedWindowSlot(op, wanted) {
 					return fmt.Errorf("exact window operation marker is attached to an unexpected slot")
@@ -294,12 +302,7 @@ func stagedPaneSlot(op core.Operation, wanted model.Window, paneIndex int) strin
 }
 
 func deterministicUUID(seed string) string {
-	sum := sha256.Sum256([]byte(seed))
-	raw := append([]byte(nil), sum[:16]...)
-	raw[6] = raw[6]&0x0f | 0x40
-	raw[8] = raw[8]&0x3f | 0x80
-	encoded := hex.EncodeToString(raw)
-	return encoded[:8] + "-" + encoded[8:12] + "-" + encoded[12:16] + "-" + encoded[16:20] + "-" + encoded[20:]
+	return uuid.NewSHA1(uuid.NameSpaceOID, []byte(seed)).String()
 }
 
 func targetPaneIDByOperation(snapshot model.Snapshot, operationID, parentID string) string {
@@ -346,7 +349,7 @@ func targetWindowIndex(session model.Session, id string) (int, bool) {
 func targetWindowIDByOperation(snapshot model.Snapshot, operationID string) string {
 	for _, object := range snapshot.Objects {
 		if object.Kind == model.ObjectWindow && object.OperationID == operationID {
-			if _, ok := targetWindowByRuntime(snapshot.Target, object.RuntimeID); ok {
+			if _, ok := targetWindowByRuntime(snapshot.Target.Session(), object.RuntimeID); ok {
 				return object.RuntimeID
 			}
 		}
@@ -374,4 +377,29 @@ func planFinalSlot(session model.Session) string {
 		return ""
 	}
 	return session.Windows[0].SlotID
+}
+
+// validateExactReplacement is the destructive phase gate. A window marker
+// alone cannot prove that all pane creation and layout steps have finished.
+func validateExactReplacement(snapshot model.Snapshot, op core.Operation, wanted, window model.Window) error {
+	if len(window.Panes) != len(wanted.Panes) {
+		return fmt.Errorf("replacement window %s has incomplete pane set", window.TmuxID)
+	}
+	seen := map[string]bool{}
+	windowOp := exactWindowOperationID(op, wanted.Idx)
+	for index, pane := range wanted.Panes {
+		runtimeID := targetPaneIDByOperation(snapshot, exactPaneOperationID(windowOp, index), window.TmuxID)
+		livePane := paneByRuntime(window, runtimeID)
+		if runtimeID == "" || seen[runtimeID] || livePane == nil || livePane.SlotID != pane.SlotID && livePane.SlotID != stagedPaneSlot(op, wanted, index) {
+			return fmt.Errorf("replacement pane %s/%d lacks unique operation-owned identity", window.TmuxID, index)
+		}
+		seen[runtimeID] = true
+	}
+	if wanted.Layout != "" {
+		equal, known := tmuxlayout.Compare(wanted.Layout, len(wanted.Panes), window.Layout, len(window.Panes))
+		if !known || !equal {
+			return fmt.Errorf("replacement window %s layout is incomplete", window.TmuxID)
+		}
+	}
+	return nil
 }

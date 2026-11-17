@@ -95,7 +95,7 @@ const (
 type OperationID string
 
 type DesiredState struct {
-	Session           model.Session
+	Baseline          model.Baseline
 	ClassifierVersion int
 }
 
@@ -192,7 +192,7 @@ type Operation struct {
 	ExpectedPaneSlotIDs  []string
 	Window               model.Window
 	Pane                 model.Pane
-	DesiredSession       model.Session
+	DesiredBaseline      model.Baseline
 	ExactOriginalWindows []model.Window
 	Reason               string
 }
@@ -204,7 +204,7 @@ type PlanResult struct {
 	ID                       string
 	Status                   PlanStatus
 	Policy                   Policy
-	DesiredSession           model.Session
+	DesiredBaseline          model.Baseline
 	ClassifierVersion        int
 	BlockedReason            string
 	StartSnapshotFingerprint string
@@ -215,4 +215,4 @@ type PlanResult struct {
 	Resolution               Resolution
 }
 
-const CurrentPlanSchemaVersion = 1
+const CurrentPlanSchemaVersion = 2

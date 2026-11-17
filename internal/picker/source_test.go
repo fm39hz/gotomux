@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	tea "charm.land/bubbletea/v2"
+	mod "github.com/fm39hz/gotomux/internal/model"
 )
 
 type testSource struct {
@@ -19,18 +20,56 @@ func (s *testSource) FlattenFilter(string) FlattenFilter {
 	return FlattenFilter{Cap: s.cap, Hide: s.hide}
 }
 
-func TestFlattenSourcesDedupByName(t *testing.T) {
+func TestFlattenSourcesKeepsSameNameAtDifferentPaths(t *testing.T) {
 	src1 := &testSource{items: []Item{{Name: "x", Path: "/a"}, {Name: "y", Path: "/b"}}}
 	src2 := &testSource{items: []Item{{Name: "x", Path: "/c"}}}
 	bySrc := map[Source][]Item{src1: src1.items, src2: src2.items}
 	order := []Source{src1, src2}
 
 	flat := flattenSources(order, bySrc, "")
-	if len(flat) != 2 {
-		t.Fatalf("got %d items, want 2 (first-wins dedup)", len(flat))
+	if len(flat) != 3 {
+		t.Fatalf("got %d items, want three different path/name entities", len(flat))
 	}
-	if flat[0].Path != "/a" {
-		t.Errorf("first x path = %q, want /a (first-wins)", flat[0].Path)
+	if flat[0].Path != "/a" || flat[2].Path != "/c" {
+		t.Fatalf("same-name paths lost: %+v", flat)
+	}
+}
+
+func TestCurrentEntityIsRemovedAcrossPickerSourcesByIdentity(t *testing.T) {
+	active := &testSource{items: []Item{{Kind: KindActive, Name: "renamed", Identity: mod.EntityIdentity{LogicalID: "logical-a", ServerKey: "server-a", RuntimeID: "$7"}}}}
+	presets := &testSource{items: []Item{
+		{Kind: KindPreset, Name: "old-name", Path: "/old/path", Identity: mod.EntityIdentity{LogicalID: "logical-a"}},
+		{Kind: KindPreset, Name: "other", Path: "/other", Identity: mod.EntityIdentity{LogicalID: "logical-b"}},
+	}}
+	bySrc := map[Source][]Item{active: active.items, presets: presets.items}
+	applyRankMeta(bySrc, nil, Context{
+		Session:  "renamed",
+		Identity: mod.EntityIdentity{LogicalID: "logical-a", ServerKey: "server-a", RuntimeID: "$7"},
+	})
+	if len(bySrc[active]) != 0 || len(bySrc[presets]) != 1 || bySrc[presets][0].Name != "other" {
+		t.Fatalf("current logical entity must be absent from every source; active=%+v presets=%+v", bySrc[active], bySrc[presets])
+	}
+}
+
+func TestUnidentifiedSameNamePresetIsOmittedWhenLiveCollisionMakesItUnlaunchable(t *testing.T) {
+	active := &testSource{items: []Item{{Kind: KindActive, Name: "gotomux", Identity: mod.EntityIdentity{ServerKey: "server-a", RuntimeID: "$1"}}}}
+	presets := &testSource{items: []Item{
+		{Kind: KindPreset, Name: "gotomux"},
+		{Kind: KindPreset, Name: "other", Identity: mod.EntityIdentity{LogicalID: "logical-b"}},
+	}}
+	bySrc := map[Source][]Item{active: active.items, presets: presets.items}
+	applyRankMeta(bySrc, nil, Context{Session: "gotomux", Identity: mod.EntityIdentity{ServerKey: "server-a", RuntimeID: "$1"}})
+	if len(bySrc[active]) != 0 || len(bySrc[presets]) != 1 || bySrc[presets][0].Name != "other" {
+		t.Fatalf("unlaunchable same-name preset leaked or unrelated preset was lost: active=%+v presets=%+v", bySrc[active], bySrc[presets])
+	}
+}
+
+func TestFlattenSourcesPrefersRecipeOverRedundantProjectNavigation(t *testing.T) {
+	create := &testSource{items: []Item{{Kind: KindCreate, Name: "repo", Path: "/work/repo"}}}
+	preset := &testSource{items: []Item{{Kind: KindPreset, Name: "repo", Path: "/work/repo"}}}
+	flat := flattenSources([]Source{create, preset}, map[Source][]Item{create: create.items, preset: preset.items}, "")
+	if len(flat) != 1 || flat[0].Kind != KindPreset {
+		t.Fatalf("same-project selection=%+v", flat)
 	}
 }
 

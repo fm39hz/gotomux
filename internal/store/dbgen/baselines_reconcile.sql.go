@@ -9,6 +9,40 @@ import (
 	"context"
 )
 
+const abortReconcilesForFreeze = `-- name: AbortReconcilesForFreeze :exec
+UPDATE reconcile_journal
+SET status = 'aborted', last_error = 'superseded by explicit freeze', updated_at = ?
+WHERE status IN ('planned', 'running', 'needs_attention')
+  AND (session_logical_id = ? OR session_name = ?)
+`
+
+type AbortReconcilesForFreezeParams struct {
+	UpdatedAt        int64
+	SessionLogicalID string
+	SessionName      string
+}
+
+func (q *Queries) AbortReconcilesForFreeze(ctx context.Context, arg AbortReconcilesForFreezeParams) error {
+	_, err := q.db.ExecContext(ctx, abortReconcilesForFreeze, arg.UpdatedAt, arg.SessionLogicalID, arg.SessionName)
+	return err
+}
+
+const abortReconcilesForRevision = `-- name: AbortReconcilesForRevision :exec
+UPDATE reconcile_journal
+SET status = 'aborted', last_error = 'superseded by explicit recipe edit', updated_at = ?
+WHERE status IN ('planned', 'running', 'needs_attention') AND session_logical_id = ?
+`
+
+type AbortReconcilesForRevisionParams struct {
+	UpdatedAt        int64
+	SessionLogicalID string
+}
+
+func (q *Queries) AbortReconcilesForRevision(ctx context.Context, arg AbortReconcilesForRevisionParams) error {
+	_, err := q.db.ExecContext(ctx, abortReconcilesForRevision, arg.UpdatedAt, arg.SessionLogicalID)
+	return err
+}
+
 const activeReconcileBySessionKey = `-- name: ActiveReconcileBySessionKey :one
 SELECT id, session_key, session_name, session_logical_id, policy, status, plan_json, completed_step, last_error, created_at, updated_at
 FROM reconcile_journal
@@ -76,25 +110,35 @@ func (q *Queries) ActiveReconciles(ctx context.Context) ([]ReconcileJournal, err
 }
 
 const baselineByLogicalID = `-- name: BaselineByLogicalID :one
-SELECT body FROM baseline WHERE logical_id = ?
+SELECT body, logical_id FROM baseline WHERE logical_id = ?
 `
 
-func (q *Queries) BaselineByLogicalID(ctx context.Context, logicalID string) (string, error) {
+type BaselineByLogicalIDRow struct {
+	Body      string
+	LogicalID string
+}
+
+func (q *Queries) BaselineByLogicalID(ctx context.Context, logicalID string) (BaselineByLogicalIDRow, error) {
 	row := q.db.QueryRowContext(ctx, baselineByLogicalID, logicalID)
-	var body string
-	err := row.Scan(&body)
-	return body, err
+	var i BaselineByLogicalIDRow
+	err := row.Scan(&i.Body, &i.LogicalID)
+	return i, err
 }
 
 const baselineByName = `-- name: BaselineByName :one
-SELECT body FROM baseline WHERE name = ?
+SELECT body, logical_id FROM baseline WHERE name = ?
 `
 
-func (q *Queries) BaselineByName(ctx context.Context, name string) (string, error) {
+type BaselineByNameRow struct {
+	Body      string
+	LogicalID string
+}
+
+func (q *Queries) BaselineByName(ctx context.Context, name string) (BaselineByNameRow, error) {
 	row := q.db.QueryRowContext(ctx, baselineByName, name)
-	var body string
-	err := row.Scan(&body)
-	return body, err
+	var i BaselineByNameRow
+	err := row.Scan(&i.Body, &i.LogicalID)
+	return i, err
 }
 
 const baselineLogicalIDByName = `-- name: BaselineLogicalIDByName :one

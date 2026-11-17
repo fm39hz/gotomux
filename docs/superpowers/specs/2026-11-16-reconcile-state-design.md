@@ -64,13 +64,13 @@ Each baseline has one session `LogicalID` and a unique `SlotID` for every requir
 
 ### Separate the three session representations
 
-The current `model.Session` is used as a saved preset, a baseline, and a live observation. That allows fields such as `Window.Layout` and `Pane.TmuxID` to carry different meanings at different call sites. The target model separates:
+The domain now uses `model.Recipe`, `model.Baseline`, and `model.ObservedSession`. `model.Session` remains a compatibility and persistence DTO. Conversion boundaries strip runtime values from recipes and project baseline bindings by stable slot.
 
-- **Preset recipe:** saved project path, command intent, ordered windows/panes, logical ID, slot IDs, and canonical layout blueprint. It has no tmux runtime IDs.
-- **Baseline:** verified desired state for the preset's logical ID, with the same slot tree, semantic contract, canonical layout, and an optional last-known runtime binding paired with `ServerKey`.
-- **Live snapshot:** one complete observation containing current tmux runtime IDs, slot tags, server generation, memberships, pane evidence, and tmux's observed layout.
+- **Recipe:** saved project path, command intent, ordered windows/panes, logical ID, slot IDs, and canonical layout blueprint. It has no tmux runtime IDs.
+- **Baseline:** desired recipe plus a separate optional last-known binding set paired with `ServerKey`.
+- **Observed session/snapshot:** one current incarnation with runtime IDs, slot tags, server generation, and memberships.
 
-Conversions between these types are explicit at store/load, freeze, observation, and commit boundaries. Reconcile core consumes `Baseline + LiveSnapshot`; it does not receive one overloaded model that can silently mix persisted and runtime values. `store.Storer` stays the package boundary while its domain method types can change as part of this internal model refactor.
+Conversions are explicit at store/load, freeze, observation, and commit boundaries. Reconcile planning consumes a `Baseline`; tmux observations use `ObservedSession`. The store exposes typed baseline and recipe repositories while retaining the existing JSON body through Goose/sqlc.
 
 ### Preset and baseline relationship
 
@@ -78,7 +78,7 @@ Conversions between these types are explicit at store/load, freeze, observation,
 - A baseline is the last frozen, identity-complete desired state for that same `LogicalID`.
 - A shape is reusable topology/product intent. Creating a new session from a shape creates a new `LogicalID` and new slot IDs.
 - Loading an identified preset reuses its identity. It does not clear IDs merely because tmux runtime IDs will be new.
-- A v1–v8 preset whose identity columns are empty may inherit IDs from a baseline only when the entire persisted instance shape matches: project path, ordered windows, pane counts, names, layout topology, pane paths, commands, and executable paths. Names alone never establish the association.
+- A v1–v8 preset whose identity columns are empty may inherit IDs only on an exact ordered recipe match. An edited recipe is a new revision under the same logical instance: unchanged units retain slots, changed units receive new slots, and their old runtime bindings are cleared.
 - If an old baseline has no `LogicalID` or slot IDs, it is unsupported for reconcile and remains untouched. Loading a preset may create fresh IDs and persist them on the preset; it does not reinterpret or rewrite the unidentified baseline. `gotomux -f` is the explicit action that replaces it with a valid baseline.
 - A nonempty preset ID that conflicts with a nonempty baseline ID is a hard conflict. Loading stops before `tmux new-session`.
 
@@ -152,14 +152,13 @@ Active-window/client focus is not stored in the baseline, so it is not a reconci
 
 ## Journal and recovery contract
 
-`PlanResult` is persisted JSON and therefore a versioned storage format, not an in-memory-only struct. Add `PlanSchemaVersion` and a decoder/upgrade path. Version 1 stores stable slot IDs for desired targets and server-scoped runtime refs for the current snapshot. Runtime pane IDs embedded in old version-0 layout operations are upgraded by using the layout leaf's saved pane index to locate the desired baseline pane, then binding its `SlotID` to the live pane. This conversion is allowed only when the plan's identity resolution and pane topology agree.
+PlanResult is persisted JSON and its plan schema version is 2. It stores a typed baseline separating desired recipe from server-scoped runtime bindings. Unsupported older plans that may have mutated tmux are quarantined; an unstarted plan is aborted and rebuilt.
 
 - `planned`, cursor 0: no operation has completed. If the start preconditions no longer match, abort and build a new plan from a fresh snapshot.
 - `running`, cursor `k`: operations `[0,k)` were observed complete. Re-observe and resume only the next operation under its identity and fingerprint checks.
 - `needs_attention`, cursor `< operation count`: the next operation's outcome or precondition needs recovery. Keep the plan pinned; never blindly create a duplicate.
 - `needs_attention`, cursor `== operation count`: all recorded operations completed but terminal verification failed. Do not rerun the same completed list indefinitely. For preserve, re-resolve from a fresh snapshot and supersede the old plan only after confirming no operation markers or uncertain effects remain. For exact rebuild, resume the existing exact phase only when the original server/session generation matches and every staged object is uniquely owned by the operation marker. Each desired window/pane may carry either its deterministic temporary slot ID (promotion pending) or its exact final baseline slot ID (promotion already completed); no other slot/marker pairing is recoverable. Originals that remain must match their recorded fingerprints; an absent original counts as already removed only when every replacement is uniquely operation-owned. Missing, duplicate, foreign, or contradictory markers stop with `needs_attention` and leave observed objects untouched. Cleanup markers only after a full fresh verification succeeds.
 - Unsupported journal plan version: do not reinterpret its JSON. If cursor is 0, abort and replan. If any mutation may have occurred, stop with `needs_attention` and an explicit diagnostic path.
-- Version-0 plans with a completed cursor can be resumed only through a registered upgrader that reconstructs the missing layout pane-slot list from the plan's stored `DesiredSession` and `Resolution`; it must verify target runtime lineage, pane count, and layout topology. Any mismatch stops before replay.
 - `complete` is written only in the same transaction as the baseline binding refresh. `aborted` means the plan will not resume.
 
 Every error includes phase, operation ID, cursor, and whether the journal has pending mutations. Logs distinguish telemetry events from actual preset creation/attachment.
@@ -208,8 +207,8 @@ Standalone and daemon paths share the same store and tmux semantics. Reconcile s
 - Active focus changes during preserve: reconcile still verifies/commits the structural result and does not select a window as an unrequested consequence.
 - Apply-layout completed but final verification failed: resume from cursor without replaying the operation; classify the terminal failure according to policy rather than looping forever on a completed plan.
 - Interrupt after each mutation boundary: recovery observes tmux and never duplicates a completed create/split.
-- Existing journal with an older plan schema: use the specified decoder or stop before reinterpreting it.
+- Existing journal with a prior plan schema: abort only when certainly unstarted; otherwise quarantine before replay.
 
 ## Rollout boundary
 
-This document is approved for staged implementation. The implementation plan inventories current fields and call paths against this contract; each stage must keep persisted data and user-visible behavior safe while converging on the target boundaries. Existing CLI surface remains unchanged.
+This contract is implemented on dev. Full unit and isolated tmux integration tests, build, vet, deterministic sqlc generation, and Goose migration checks are the verification evidence. Existing CLI surface remains unchanged.

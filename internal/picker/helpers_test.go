@@ -1,6 +1,7 @@
 package picker
 
 import (
+	mod "github.com/fm39hz/gotomux/internal/model"
 	"testing"
 )
 
@@ -425,7 +426,7 @@ func TestApplyTransitionsMapsNames(t *testing.T) {
 func TestIdleMRUAndFilterCurrent(t *testing.T) {
 	// empty query: higher Recency among Active wins.
 	// Inside tmux, the current session is filtered out (you're already there).
-	cur := Item{Kind: KindActive, Name: "here", Recency: 1000}
+	cur := Item{Kind: KindActive, Name: "here", Identity: mod.EntityIdentity{LogicalID: "current", ServerKey: "server", RuntimeID: "$1"}, Recency: 1000}
 	left := Item{Kind: KindActive, Name: "left", Recency: 900}
 	old := Item{Kind: KindActive, Name: "old", Recency: 100}
 	// pre-filter: cur first by recency
@@ -435,7 +436,7 @@ func TestIdleMRUAndFilterCurrent(t *testing.T) {
 	}
 	tmuxSrc := &tmuxSource{}
 	by := map[Source][]Item{tmuxSrc: {old, cur, left}}
-	applyRankMeta(by, nil, Context{Session: "here"})
+	applyRankMeta(by, nil, Context{Session: "here", Identity: cur.Identity})
 	// current session removed
 	for _, it := range by[tmuxSrc] {
 		if it.Name == "here" {

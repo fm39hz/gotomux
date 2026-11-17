@@ -51,7 +51,7 @@ func TestRunnerCreatesTaggedMissingWindowAndRetryDoesNotDuplicate(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	base := snapshot.Target
+	base := snapshot.Target.Session()
 	base.Windows = append([]model.Window(nil), snapshot.Target.Windows...)
 	for i := range base.Windows {
 		base.Windows[i].Panes = append([]model.Pane(nil), snapshot.Target.Windows[i].Panes...)
@@ -61,7 +61,10 @@ func TestRunnerCreatesTaggedMissingWindowAndRetryDoesNotDuplicate(t *testing.T) 
 		Idx: 2, Name: "agent", Role: "agent", SlotID: "00000000-0000-4000-8000-000000000004", Cwd: "/tmp",
 		Panes: []model.Pane{{Idx: 0, Cmd: "sleep", StartCmd: "sleep 301", Cwd: "/tmp", SlotID: "00000000-0000-4000-8000-000000000005"}},
 	})
-	desired := core.DesiredState{Session: base, ClassifierVersion: 1}
+	if err := st.SaveBaseline(&base); err != nil {
+		t.Fatal(err)
+	}
+	desired := core.DesiredState{Baseline: model.BaselineFromSession(base), ClassifierVersion: 1}
 	resolution := core.Resolve(desired, *snapshot)
 	plan := core.Plan(desired, *snapshot, resolution, core.PolicyPreserve)
 	if plan.Status != core.PlanReady {
@@ -145,7 +148,7 @@ func TestRunnerExactRebuildRecoversPartialWindowSet(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	base := snapshot.Target
+	base := snapshot.Target.Session()
 	base.Windows = append([]model.Window(nil), snapshot.Target.Windows...)
 	base.Windows[0].Panes = append([]model.Pane(nil), snapshot.Target.Windows[0].Panes...)
 	base.ClassifierVersion = 1
@@ -158,7 +161,7 @@ func TestRunnerExactRebuildRecoversPartialWindowSet(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	desired := core.DesiredState{Session: base, ClassifierVersion: 1}
+	desired := core.DesiredState{Baseline: model.BaselineFromSession(base), ClassifierVersion: 1}
 	resolution := core.Resolve(desired, *snapshot)
 	plan := core.Plan(desired, *snapshot, resolution, core.PolicyExact)
 	if plan.Status != core.PlanReady || len(plan.Operations) != 1 || plan.Operations[0].Kind != core.OperationExactRebuild {
@@ -193,7 +196,7 @@ func TestRunnerExactRebuildRecoversPartialWindowSet(t *testing.T) {
 		t.Fatal(err)
 	}
 	firstRuntimeID := targetWindowIDByOperation(*partial, exactWindowOperationID(exact, first.Idx))
-	firstLiveWindow, firstFound := targetWindowByRuntime(partial.Target, firstRuntimeID)
+	firstLiveWindow, firstFound := targetWindowByRuntime(partial.Target.Session(), firstRuntimeID)
 	windowMarker := objectByRuntime(partial.Objects, model.ObjectWindow, firstRuntimeID)
 	if !firstFound || len(firstLiveWindow.Panes) != 1 {
 		t.Fatalf("partial exact baseline window was not observable: %+v", partial.Target.Windows)

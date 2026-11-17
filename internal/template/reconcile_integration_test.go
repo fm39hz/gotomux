@@ -3,6 +3,7 @@ package template
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -183,7 +184,7 @@ func TestNeedsAttentionNoopJournalReplansAfterWindowDisappears(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	desired := core.DesiredState{Session: *baseline, ClassifierVersion: baseline.ClassifierVersion}
+	desired := core.DesiredState{Baseline: model.BaselineFromSession(*baseline), ClassifierVersion: baseline.ClassifierVersion}
 	plan := core.Plan(desired, *snapshot, core.Resolve(desired, *snapshot), core.PolicyPreserve)
 	if plan.Status != core.PlanNoop {
 		t.Fatalf("initial no-op plan = %+v", plan)
@@ -594,7 +595,7 @@ func TestReconcileLooksUpBaselineBySessionLogicalIDAfterRename(t *testing.T) {
 	}
 }
 
-func TestEquivalentUntaggedWindowsKeepProcesses(t *testing.T) {
+func TestUnmanagedEquivalentWindowsKeepProcessesAndDoNotClaimSlots(t *testing.T) {
 	root := tmuxtest.Isolate(t)
 	st, err := store.OpenWithConfig(&config.Config{DataDir: root})
 	if err != nil {
@@ -642,11 +643,11 @@ func TestEquivalentUntaggedWindowsKeepProcesses(t *testing.T) {
 	if err != nil {
 		t.Fatalf("group reconcile returned error: %v", err)
 	}
-	if !strings.Contains(report, "interchangeable live group") {
+	if !strings.Contains(report, "2 recreated") || !strings.Contains(report, "2 extra window") {
 		t.Fatalf("equivalent-group report = %q", report)
 	}
 	after := tmuxOut(t, "list-windows", "-t", "="+name, "-F", "#{window_id}|#{window_name}")
-	if len(strings.Split(before, "\n")) != len(strings.Split(after, "\n")) {
+	if len(strings.Split(before, "\n"))+2 != len(strings.Split(after, "\n")) {
 		t.Fatalf("equivalent-group reconciliation changed window count:\nbefore=%s\nafter=%s", before, after)
 	}
 	idsAfter, err := ctl.Observe(context.Background(), name)
@@ -659,11 +660,11 @@ func TestEquivalentUntaggedWindowsKeepProcesses(t *testing.T) {
 	}
 	for _, window := range idsAfter.Target.Windows {
 		afterIDs[window.TmuxID] = true
-		if window.SlotID == "" {
-			t.Fatalf("slot binding missing on window %s", window.TmuxID)
+		if beforeIDs[window.TmuxID] && strings.HasPrefix(window.Name, "new-") && window.SlotID != "" {
+			t.Fatalf("unmanaged window %s was assigned baseline ownership", window.TmuxID)
 		}
 	}
-	if len(beforeIDs) != len(afterIDs) {
+	if len(beforeIDs)+2 != len(afterIDs) {
 		t.Fatalf("window runtime identities changed: before=%v after=%v", beforeIDs, afterIDs)
 	}
 	for id := range beforeIDs {
@@ -675,7 +676,80 @@ func TestEquivalentUntaggedWindowsKeepProcesses(t *testing.T) {
 	if err != nil {
 		t.Fatalf("second grouped reconcile: %v", err)
 	}
-	if second != "already aligned" || len(strings.Split(tmuxOut(t, "list-windows", "-t", "="+name, "-F", "#{window_id}"), "\n")) != len(afterIDs) {
+	if !strings.Contains(second, "already aligned") || len(strings.Split(tmuxOut(t, "list-windows", "-t", "="+name, "-F", "#{window_id}"), "\n")) != len(afterIDs) {
 		t.Fatalf("second reconcile was not idempotent: report=%q", second)
+	}
+}
+
+type detachedConnector struct {
+	*tmux.Ctl
+	connectedID string
+}
+
+func (c *detachedConnector) ConnectObserved(ctx context.Context, id, key string) error {
+	snapshot, err := c.Observe(ctx, "recreate-contract")
+	if err != nil {
+		return err
+	}
+	if snapshot.TargetSessionID != id || snapshot.ServerKey != key {
+		return fmt.Errorf("attach receipt mismatch")
+	}
+	c.connectedID = id
+	return nil
+}
+
+func TestPresetRecreationOnSurvivingServerRetainsFrozenContract(t *testing.T) {
+	root := tmuxtest.Isolate(t)
+	// Keep the tmux server alive after removing the target incarnation.
+	tmuxOut(t, "new-session", "-d", "-s", "recreate-holder")
+	st, err := store.OpenWithConfig(&config.Config{DataDir: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	ctl, _ := tmux.New()
+	recipe := &model.Session{Name: "recreate-contract", Cwd: "/tmp", Windows: []model.Window{{Name: "worker", Cwd: "/tmp", Panes: []model.Pane{{Cmd: "sleep 300", Cwd: "/tmp"}}}}}
+	if err := ctl.Load(context.Background(), recipe); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := FreezeRemember(ctl, st, recipe.Name); err != nil {
+		t.Fatal(err)
+	}
+	frozen, err := st.GetBaseline(recipe.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	saved, err := st.Get(recipe.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldRuntime := frozen.TmuxID
+	tmuxOut(t, "kill-session", "-t", oldRuntime)
+	detached := &detachedConnector{Ctl: ctl}
+	if err := ConnectPreset(detached, st, saved); err != nil {
+		t.Fatal(err)
+	}
+	if detached.connectedID == oldRuntime || detached.connectedID == "" {
+		t.Fatal("recreate did not bind new incarnation")
+	}
+	afterLoad, err := st.GetBaseline(recipe.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if afterLoad.TmuxID != oldRuntime || afterLoad.LogicalID != frozen.LogicalID {
+		t.Fatal("load rewrote frozen contract")
+	}
+	if _, err := ReconcileSession(context.Background(), ctl, st, recipe.Name, false); err != nil {
+		t.Fatalf("recreated logical instance cannot reconcile: %v", err)
+	}
+	rebound, err := st.GetBaseline(recipe.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rebound.LogicalID != frozen.LogicalID || rebound.TmuxID != detached.connectedID {
+		t.Fatal("verified reconcile did not refresh runtime binding")
+	}
+	if report, err := ReconcileSession(context.Background(), ctl, st, recipe.Name, false); err != nil || !strings.Contains(report, "already aligned") {
+		t.Fatalf("repeat is not idempotent: %s %v", report, err)
 	}
 }

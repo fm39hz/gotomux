@@ -1,9 +1,11 @@
 package picker
 
 import (
+	"fmt"
 	"path/filepath"
 	"slices"
 
+	mod "github.com/fm39hz/gotomux/internal/model"
 	"github.com/fm39hz/gotomux/internal/store"
 )
 
@@ -21,11 +23,7 @@ const (
 type ID string
 
 func (it Item) ID() ID {
-	path := ""
-	if it.Path != "" {
-		path = filepath.Clean(it.Path)
-	}
-	return ID(it.Name + "\x00" + path)
+	return ID(fmt.Sprintf("%d\x00%s", it.Kind, itemDedupKey(it)))
 }
 
 // Item is one picker row from any Source.
@@ -39,6 +37,7 @@ type Item struct {
 	Desc      string
 	Name      string
 	Path      string
+	Identity  mod.EntityIdentity
 	RuntimeID string
 	ServerKey string
 	Windows   int

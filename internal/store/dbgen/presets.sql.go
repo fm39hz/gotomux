@@ -45,7 +45,7 @@ func (q *Queries) DeleteSessionsByCwdExcept(ctx context.Context, arg DeleteSessi
 }
 
 const insertPane = `-- name: InsertPane :exec
-INSERT INTO pane(window_id, idx, cwd, cmd, cmd_path, slot_id) VALUES(?, ?, ?, ?, ?, ?)
+INSERT INTO pane(window_id, idx, cwd, cmd, cmd_path, slot_id, start_cmd) VALUES(?, ?, ?, ?, ?, ?, ?)
 `
 
 type InsertPaneParams struct {
@@ -55,6 +55,7 @@ type InsertPaneParams struct {
 	Cmd      sql.NullString
 	CmdPath  string
 	SlotID   string
+	StartCmd string
 }
 
 func (q *Queries) InsertPane(ctx context.Context, arg InsertPaneParams) error {
@@ -65,6 +66,7 @@ func (q *Queries) InsertPane(ctx context.Context, arg InsertPaneParams) error {
 		arg.Cmd,
 		arg.CmdPath,
 		arg.SlotID,
+		arg.StartCmd,
 	)
 	return err
 }
@@ -117,13 +119,14 @@ func (q *Queries) InsertWindow(ctx context.Context, arg InsertWindowParams) (sql
 }
 
 const listPresetMeta = `-- name: ListPresetMeta :many
-SELECT name, cwd, last_used FROM session ORDER BY last_used DESC, name
+SELECT name, cwd, last_used, logical_id FROM session ORDER BY last_used DESC, name
 `
 
 type ListPresetMetaRow struct {
-	Name     string
-	Cwd      string
-	LastUsed int64
+	Name      string
+	Cwd       string
+	LastUsed  int64
+	LogicalID string
 }
 
 func (q *Queries) ListPresetMeta(ctx context.Context) ([]ListPresetMetaRow, error) {
@@ -135,7 +138,12 @@ func (q *Queries) ListPresetMeta(ctx context.Context) ([]ListPresetMetaRow, erro
 	items := []ListPresetMetaRow{}
 	for rows.Next() {
 		var i ListPresetMetaRow
-		if err := rows.Scan(&i.Name, &i.Cwd, &i.LastUsed); err != nil {
+		if err := rows.Scan(
+			&i.Name,
+			&i.Cwd,
+			&i.LastUsed,
+			&i.LogicalID,
+		); err != nil {
 			return nil, err
 		}
 		items = append(items, i)
@@ -167,17 +175,18 @@ func (q *Queries) PresetByName(ctx context.Context, name string) (PresetByNameRo
 }
 
 const presetPanes = `-- name: PresetPanes :many
-SELECT id, idx, COALESCE(cwd, '') AS cwd, COALESCE(cmd, '') AS cmd, COALESCE(cmd_path, '') AS cmd_path, slot_id
+SELECT id, idx, COALESCE(cwd, '') AS cwd, COALESCE(cmd, '') AS cmd, COALESCE(cmd_path, '') AS cmd_path, slot_id, start_cmd
 FROM pane WHERE window_id = ? ORDER BY idx
 `
 
 type PresetPanesRow struct {
-	ID      int64
-	Idx     int64
-	Cwd     string
-	Cmd     string
-	CmdPath string
-	SlotID  string
+	ID       int64
+	Idx      int64
+	Cwd      string
+	Cmd      string
+	CmdPath  string
+	SlotID   string
+	StartCmd string
 }
 
 func (q *Queries) PresetPanes(ctx context.Context, windowID int64) ([]PresetPanesRow, error) {
@@ -196,6 +205,7 @@ func (q *Queries) PresetPanes(ctx context.Context, windowID int64) ([]PresetPane
 			&i.Cmd,
 			&i.CmdPath,
 			&i.SlotID,
+			&i.StartCmd,
 		); err != nil {
 			return nil, err
 		}

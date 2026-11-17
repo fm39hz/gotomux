@@ -16,6 +16,8 @@ import (
 )
 
 type Storer interface {
+	RecipeRepository
+	BaselineRepository
 	Close() error
 	Prune()
 	Checkpoint()
@@ -45,6 +47,7 @@ type Storer interface {
 	GetShapeByKey(key string) (id, body string, ok bool)
 
 	SaveBaseline(sess *model.Session) error
+	SaveInitialBaseline(sess *model.Session) error
 	BindPresetIdentity(sess *model.Session) error
 	GetBaseline(name string) (*model.Session, error)
 	GetBaselineByLogicalID(id string) (*model.Session, error)
@@ -74,6 +77,12 @@ type Storer interface {
 	SaveRootNeg(path string) error
 	ForgetRootNeg(path string) error
 }
+
+// BaselineRepository is the typed persistence boundary used by reconciliation.
+// The legacy Session DTO methods remain for edit/shape paths during migration.
+type BaselineRepository = model.BaselineRepository
+type RecipeRevisionRepository = model.RecipeRevisionRepository
+type RecipeRepository = model.RecipeRepository
 
 type Store struct {
 	db  *sql.DB

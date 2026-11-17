@@ -17,7 +17,7 @@ Reconciliation must converge from observable state. It must identify the target 
 - Model session identity, baseline slot identity, runtime object identity, and session membership explicitly; these are different facts.
 - Use tmux runtime IDs and tmux user options as complementary identity evidence.
 - Require a complete, identified baseline. If session or slot IDs are missing, ask the user to freeze the intended session again with the existing `gotomux -f` action.
-- Match baseline slots to live objects one-to-one using multiple independent signals, explain the evidence, and detect competing assignments.
+- Match baseline slots one-to-one using durable tags and server-scoped runtime lineage; report contradictory ownership evidence.
 - Separate desired state, matching, planning, execution, verification, persistence, and CLI policy.
 - Make retries idempotent and recoverable after a partial operation or process interruption.
 - Preserve live pane processes in the default mode; make destructive pruning explicit.
@@ -45,7 +45,7 @@ Identity has three layers; do not use one layer as a substitute for another:
 
 The CLI session name locates the target. It is not proof that a live session is the same logical session as a stored baseline. The session `LogicalID` establishes that association; if the live tag is missing, same-server runtime session identity can restore it. Session membership is represented separately from window identity because tmux can link one window into more than one session.
 
-Gotomux stores the session `LogicalID` and assigned window/pane `SlotID`s in versioned, namespaced tmux user options. Runtime IDs identify live objects; slot IDs identify desired baseline entries. A live extra has no slot ID merely because it is in the target session. Operation markers are temporary recovery evidence for objects created during an interrupted mutation, not another user-managed identity system. IDs are unique across the observed server. Duplicate or malformed tags invalidate those tags; names and indices cannot silently repair the conflict. Instantiating a preset creates a new session identity and new slot IDs. Recreating a missing object retains its baseline slot ID.
+Gotomux stores the session `LogicalID` and assigned window/pane `SlotID`s in versioned, namespaced tmux user options. Runtime IDs identify live objects; slot IDs identify desired baseline entries. A live extra has no slot ID merely because it is in the target session. Operation markers are temporary recovery evidence for objects created during an interrupted mutation, not another user-managed identity system. IDs are unique across the observed server. Duplicate or malformed tags invalidate those tags; names and indices cannot silently repair the conflict. Restoring an identified saved session recipe preserves its logical and slot identities; baking a reusable shape for a new project creates fresh identities. Recreating a missing object retains its baseline slot ID.
 
 ### Desired state and live snapshot
 
@@ -57,24 +57,40 @@ Window names are presentation values. A versioned semantic classifier maps pane 
 
 ## Matching algorithm
 
-1. Validate that the observation is complete and that the selected session is the session owning the baseline. A session name locates a candidate; a unique session tag/runtime lineage establishes the association. If that association is absent or contradictory, stop before mutation.
-2. Match baseline window/pane slots to live objects in this order: valid unique slot tag; same-server runtime binding; then a multi-signal match for an untagged live object. A tag/runtime contradiction is a conflict, never a reason to fall back to the window name.
-3. Multi-signal matching compares the whole observable object: pane/tool executable evidence, pane count and topology, normalized project/cwd scope, and semantic role. Window name is a weak hint; index is only a destination coordinate and is not identity evidence. A single name, command, cwd, or topology fact cannot establish a match by itself. A live object already carrying a different slot tag is ineligible.
-4. Solve the one-to-one assignment globally, including explicit unmatched candidates. Use lexicographic evidence tiers and hard incompatibilities; do not blend all signals into an opaque scalar score.
-5. If several assignments remain, distinguish **interchangeable groups** from material ambiguity. A group is interchangeable only if every assignment has the same required semantic/topology outcome and preserves the same live processes. Assign slots deterministically within that group and persist the association only after verification. This makes no claim about historical ownership. If the alternatives could change which object is repaired, moved, or destroyed, stop preserve-mode mutation for that dependency and report the conflicting evidence.
-6. Resolve pane slots within each matched window using the same rules. Pane indices/order are not identity.
-7. Return matches, unmatched baseline slots, extra live objects, conflicts, ambiguity, and evidence provenance. Resolution is pure and does not write tags or mutate tmux/store state.
+The resolver is pure and deterministic. It validates the complete server
+snapshot, baseline identity tree and unique ownership of tags before matching.
 
-The resolver must be idempotent as a whole: a successful run writes verified slot bindings, so the next observation uses those bindings. If the first run cannot distinguish a candidate safely, it must not create a second copy and then rely on that copy's new tag to hide the original uncertainty.
+1. Resolve the target session by its unique logical ID. If its tag is absent,
+   only its recorded session runtime ID within the same server generation can
+   establish ownership. Names locate candidates and never establish ownership.
+2. Resolve each required window and pane by its unique slot tag or its recorded
+   runtime binding in the same server generation. Contradictory tag and runtime
+   evidence is a conflict. Pane parentage and window membership are checked
+   independently of identity.
+3. A baseline slot with no surviving anchor is missing. A live object with no
+   association to a baseline slot is extra. Similar commands, names, working
+   directories, layouts and semantic roles never confer ownership.
+4. Preserve retains extra objects and their running processes. It restores
+   missing required slots where the planner can satisfy membership and layout
+   preconditions. Exact rebuild follows its explicit destructive policy.
+5. Semantic roles are desired attributes, not matching evidence. Durable
+   identity remains valid when a running process changes its role.
+6. The planner emits identity binding only for already established ownership.
+   New objects carry operation markers for recovery and retain the required
+   slot identity. Verified runtime bindings are committed only after execution
+   and final verification succeed.
 
-Session logical-ID and window/pane slot-tag matches are accepted only when unique in the observed server scope. A copied window can copy its tmux user options; duplicate slot tags invalidate the affected bindings and stop matching for those objects.
+The resolver does not run a similarity assignment algorithm. If both durable
+metadata and same-generation runtime lineage are lost, historical ownership
+cannot be reconstructed from attributes. This distinction must remain visible
+in diagnostics and acceptance tests.
 
 ## Policies
 
 - `preserve` is the default: restore required baseline topology where safe, preserve unclassified/extra live objects, and report them.
 - `exact` is the existing `--hard` policy: rebuild the session to match the frozen baseline exactly and terminate the pane processes it replaces. It requires explicit confirmation unless the user supplies `--force`.
 - Name normalization and semantic-classifier version are persisted. A classifier-version change triggers re-resolution; it does not silently rewrite identity.
-- In preserve mode, a durable window slot/runtime identity remains authoritative if its process-derived role changes; the live process is preserved and the frozen role remains in the baseline. A semantic-only match still must satisfy the role contract. Exact mode always verifies the frozen role.
+- In preserve mode, a durable window slot/runtime identity remains authoritative if its process-derived role changes; the live process is preserved and the frozen role remains in the baseline. Exact mode always verifies the frozen role.
 
 The existing `--hard` flag maps to `exact`. `--force` skips only the interactive confirmation; it never skips identity checks, conflict checks, preconditions, or verification.
 
@@ -100,7 +116,7 @@ Planning is pure and deterministic for identical inputs. The plan is inspectable
 
 ## Executor and recovery
 
-The executor is the only component allowed to issue mutating tmux commands. Before each operation it re-observes the required scope and checks the plan's preconditions. For a semantic identity binding, it also confirms the original baseline-to-runtime association and compares the candidate's planned fingerprint immediately before writing the slot tag. Preserve plans bind verified identities before topology operations, so expected fingerprints describe the observed object rather than a later reshaped state. It applies one operation, observes again, and verifies that the intended object changed. If the server generation, association, or relevant membership/fingerprint changed, execution stops and the caller resolves a fresh plan.
+The executor is the only component allowed to issue mutating tmux commands. Before each operation it re-observes the required scope and checks the plan's preconditions. For an identity binding established through same-generation runtime lineage, it also confirms the original baseline-to-runtime association and compares the candidate's planned fingerprint immediately before writing the slot tag. Preserve plans bind verified identities before topology operations, so expected fingerprints describe the observed object rather than a later reshaped state. It applies one operation, observes again, and verifies that the intended object changed. If the server generation, association, or relevant membership/fingerprint changed, execution stops and the caller resolves a fresh plan.
 
 Tmux mutations are not globally atomic. Therefore:
 
@@ -154,7 +170,7 @@ Both standalone and daemon-mediated paths must use the same semantics. Reconcile
 
 1. No mutation on incomplete observations, unknown server generation, session identity mismatch, duplicate session/slot IDs, or unresolved conflict.
 2. Names and indices never establish identity by themselves; matching uses independent evidence and a global assignment.
-3. No slot tag is written before its match has been verified. Extras remain untagged. Interchangeable groups may be assigned as a group only when all assignments preserve the same live processes and satisfy the same baseline contract; material ambiguity is not guessed through.
+3. No slot tag is written before its match has been verified. Extras remain untagged; similarity never authorizes assignment.
 4. Every mutation is guarded by a fresh identity and precondition check.
 5. Runtime bindings are committed only after identity-aware verification.
 6. A successful reconcile is idempotent on immediate repetition.
@@ -170,7 +186,7 @@ Both standalone and daemon-mediated paths must use the same semantics. Reconcile
 
 - Close a baseline window and reconcile twice: the missing role is restored once; the second run makes no change.
 - Close the baseline agent, create a Codex window, and reconcile twice: preserve Codex; do not duplicate the agent or other roles.
-- Keep several semantically interchangeable untagged live editor candidates under a complete baseline: preserve their pane processes, assign the required slots as a group, and make the next reconcile a no-op without creating copies.
+- Keep several similar untagged live editors with no recorded runtime lineage: preserve them as extras, restore missing baseline slots once, and make the next reconcile a no-op.
 - Add a semantically incompatible Codex window while the frozen agent slot is missing: preserve Codex as an extra, restore the agent slot once, and make the next reconcile a no-op.
 - Present candidates with materially different evidence but no safe assignment: do not tag them or create a competing copy; report the unresolved dependency and leave live processes untouched.
 - Rename and renumber windows: identity remains stable and the plan uses runtime IDs.

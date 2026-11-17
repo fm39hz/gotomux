@@ -2,6 +2,7 @@ package picker
 
 import (
 	"context"
+	"fmt"
 	"sync"
 
 	"github.com/fm39hz/gotomux/internal/store"
@@ -179,4 +180,13 @@ func (c *countingConnector) calls() int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.listLive + c.currentSession + c.currentPath + c.currentCtx
+}
+
+func (c *countingConnector) KillObserved(ctx context.Context, runtimeID, serverKey string) error {
+	for _, session := range c.live {
+		if session.ID == runtimeID && session.ServerKey == serverKey {
+			return c.Kill(ctx, session.Name)
+		}
+	}
+	return fmt.Errorf("stale session receipt")
 }

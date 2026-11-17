@@ -7,6 +7,7 @@ import (
 
 	"github.com/fm39hz/gotomux/internal/event"
 	"github.com/fm39hz/gotomux/internal/model"
+	"github.com/fm39hz/gotomux/internal/sessionguard"
 	"github.com/fm39hz/gotomux/internal/store"
 	"github.com/fm39hz/gotomux/internal/template"
 	"github.com/fm39hz/gotomux/internal/tmux"
@@ -39,6 +40,13 @@ func (m *mockStorer) SaveBaseline(s *model.Session) error {
 	}
 	m.baseline[s.Name] = s
 	return nil
+}
+
+func (m *mockStorer) SaveInitialBaseline(s *model.Session) error {
+	if err := m.SaveBaseline(s); err != nil {
+		return err
+	}
+	return m.BindPresetIdentity(s)
 }
 
 func (m *mockStorer) BindPresetIdentity(s *model.Session) error {
@@ -161,6 +169,18 @@ type mockConnector struct {
 	session   *model.Session
 }
 
+func (m *mockConnector) ListLive(ctx context.Context) ([]tmux.LiveSession, error) {
+	if !m.has {
+		return nil, nil
+	}
+	if m.session != nil {
+		return []tmux.LiveSession{{Name: m.session.Name, ID: m.session.TmuxID, Path: m.session.Cwd, ServerKey: m.session.ServerKey, LogicalID: m.session.LogicalID}}, nil
+	}
+	return []tmux.LiveSession{{Name: "my-session", ID: "$1", Path: "/tmp", ServerKey: "mock-server"}}, nil
+}
+func (m *mockConnector) ConnectObserved(ctx context.Context, runtimeID, serverKey string) error {
+	return m.Connect(ctx, runtimeID, "")
+}
 func (m *mockConnector) Has(ctx context.Context, name string) bool { return m.has }
 func (m *mockConnector) Connect(ctx context.Context, name, cwd string) error {
 	if m.onConnect != nil {
@@ -184,13 +204,16 @@ func (m *mockConnector) Load(ctx context.Context, p *model.Session) error {
 	}
 	for wi := range copy.Windows {
 		copy.Windows[wi].Idx = wi
+		p.Windows[wi].TmuxID = "@" + string(rune('1'+wi))
 		copy.Windows[wi].TmuxID = "@" + string(rune('1'+wi))
 		for pi := range copy.Windows[wi].Panes {
 			copy.Windows[wi].Panes[pi].Idx = pi
-			copy.Windows[wi].Panes[pi].TmuxID = "%" + string(rune('1'+pi))
+			p.Windows[wi].Panes[pi].TmuxID = "%" + string(rune('1'+wi*10+pi))
+			copy.Windows[wi].Panes[pi].TmuxID = "%" + string(rune('1'+wi*10+pi))
 		}
 	}
 	m.session = copy
+	p.TmuxID, p.ServerKey = copy.TmuxID, copy.ServerKey
 	return nil
 }
 
@@ -211,7 +234,7 @@ func (m *mockConnector) Observe(ctx context.Context, name string) (*model.Snapsh
 	if err != nil {
 		return nil, err
 	}
-	snapshot := &model.Snapshot{ServerKey: s.ServerKey, Complete: true, Target: *s, TargetSessionID: s.TmuxID}
+	snapshot := &model.Snapshot{ServerKey: s.ServerKey, Complete: true, Target: model.ObserveSession(*s), TargetSessionID: s.TmuxID}
 	snapshot.Sessions = []model.SessionIdentity{{Name: s.Name, LogicalID: s.LogicalID, RuntimeID: s.TmuxID}}
 	snapshot.Objects = append(snapshot.Objects, model.ObjectIdentity{Kind: "session", LogicalID: s.LogicalID, RuntimeID: s.TmuxID})
 	for _, w := range s.Windows {
@@ -384,7 +407,7 @@ func TestConnectProjectExisting(t *testing.T) {
 
 func TestConnectProjectPreset(t *testing.T) {
 	st := newMockStorer()
-	st.presets["my-session"] = &model.Session{Name: "my-session", Cwd: "/tmp"}
+	st.presets["my-session"] = &model.Session{Name: "my-session", Cwd: "/tmp", Windows: []model.Window{{Name: "shell", Cwd: "/tmp", Panes: []model.Pane{{Cwd: "/tmp"}}}}}
 	ctl := &mockConnector{onConnect: func() {
 		if st.baseline["my-session"] == nil {
 			t.Error("attach started before baseline was recorded")
@@ -450,5 +473,110 @@ func TestConnectProjectNilCtl(t *testing.T) {
 	err := template.ConnectProject(nil, newMockStorer(), "x", "/tmp")
 	if err == nil {
 		t.Error("expected error for nil ctl")
+	}
+}
+
+func TestConnectPresetDoesNotReplaceFrozenDesiredState(t *testing.T) {
+	st := newMockStorer()
+	recipe := &model.Session{Name: "revision", Cwd: "/tmp", LogicalID: "00000000-0000-4000-8000-000000000001", Windows: []model.Window{{Name: "shell", Cwd: "/tmp", SlotID: "00000000-0000-4000-8000-000000000002", Panes: []model.Pane{{Cwd: "/tmp", Cmd: "new-command", SlotID: "00000000-0000-4000-8000-000000000003"}}}}}
+	st.presets[recipe.Name] = cloneMockSession(recipe)
+	frozen := cloneMockSession(recipe)
+	frozen.Windows[0].Panes[0].Cmd = "frozen-command"
+	st.baseline[recipe.Name] = frozen
+	if err := template.ConnectPreset(&mockConnector{}, st, recipe); err != nil {
+		t.Fatal(err)
+	}
+	if st.baseline[recipe.Name].Windows[0].Panes[0].Cmd != "frozen-command" {
+		t.Fatal("loading an edited recipe overwrote frozen desired state")
+	}
+}
+
+func TestConnectPresetPersistsIdentityRestoredFromExactLegacyBaseline(t *testing.T) {
+	st := newMockStorer()
+	id := "00000000-0000-4000-8000-000000000001"
+	windowID := "00000000-0000-4000-8000-000000000002"
+	paneID := "00000000-0000-4000-8000-000000000003"
+	legacy := &model.Session{Name: "legacy", Cwd: "/work/legacy", Windows: []model.Window{{Idx: 0, Name: "shell", Cwd: "/work/legacy", Panes: []model.Pane{{Idx: 0, Cwd: "/work/legacy", Cmd: "bash"}}}}}
+	frozen := cloneMockSession(legacy)
+	frozen.LogicalID = id
+	frozen.Windows[0].SlotID = windowID
+	frozen.Windows[0].Panes[0].SlotID = paneID
+	st.presets[legacy.Name] = cloneMockSession(legacy)
+	st.baseline[legacy.Name] = frozen
+
+	if err := template.ConnectPreset(&mockConnector{}, st, cloneMockSession(legacy)); err != nil {
+		t.Fatal(err)
+	}
+	bound := st.presets[legacy.Name]
+	if bound.LogicalID != id || bound.Windows[0].SlotID != windowID || bound.Windows[0].Panes[0].SlotID != paneID {
+		t.Fatalf("verified legacy preset identity was not persisted: %+v", bound)
+	}
+}
+
+func TestConnectPresetFindsRenamedLogicalOwner(t *testing.T) {
+	id := "00000000-0000-4000-8000-000000000001"
+	connected := false
+	ctl := &mockConnector{has: true, session: &model.Session{Name: "renamed", LogicalID: id, TmuxID: "$8", ServerKey: "mock-server", Cwd: "/tmp"}, onConnect: func() { connected = true }}
+	if err := template.ConnectPreset(ctl, newMockStorer(), &model.Session{Name: "old-name", LogicalID: id, Cwd: "/tmp"}); err != nil {
+		t.Fatal(err)
+	}
+	if !connected || ctl.loadCall.Load() != 0 {
+		t.Fatal("renamed logical owner was not attached directly")
+	}
+}
+
+func (m *mockStorer) GetRecipe(name string) (model.Recipe, error) {
+	session, err := m.Get(name)
+	if err != nil || session == nil {
+		return model.Recipe{}, err
+	}
+	return model.RecipeFromSession(*session), nil
+}
+
+func (m *mockStorer) NormalizeRecipeIdentity(recipe, baseline model.Recipe) (model.Recipe, error) {
+	restored, err := model.RestoreRecipeIdentity(recipe, baseline)
+	if err != nil {
+		return model.Recipe{}, err
+	}
+	session := restored.Session()
+	return restored, m.BindPresetIdentity(&session)
+}
+
+func TestFreezeObservedRejectsReusedNameBeforeIdentityWrites(t *testing.T) {
+	ctl := &mockConnector{session: &model.Session{Name: "work", TmuxID: "$9", ServerKey: "server", Windows: []model.Window{{TmuxID: "@9", Panes: []model.Pane{{TmuxID: "%9"}}}}}}
+	st := newMockStorer()
+	_, _, err := template.FreezeObserved(ctl, st, "work", model.EntityIdentity{RuntimeID: "$1", ServerKey: "server"})
+	if err == nil {
+		t.Fatal("freeze accepted replacement session under reused name")
+	}
+	if ctl.session.LogicalID != "" || len(st.presets) != 0 {
+		t.Fatal("rejected receipt mutated identity or store")
+	}
+}
+
+func TestPresetConnectReleasesMutationLockBeforeInteractiveAttach(t *testing.T) {
+	st := newMockStorer()
+	ctl := &mockConnector{}
+	called := false
+	ctl.onConnect = func() {
+		called = true
+		// This callback runs before ConnectObserved returns, exactly while an
+		// interactive attach would still be blocking the parent process.
+		release, err := sessionguard.Acquire(ctl.session.ServerKey, ctl.session.TmuxID)
+		if err != nil {
+			t.Errorf("interactive attach still holds mutation lock: %v", err)
+			return
+		}
+		defer release()
+		if st.baseline["attach-lock"] == nil {
+			t.Error("lock released before baseline was persisted")
+		}
+	}
+	recipe := &model.Session{Name: "attach-lock", Cwd: "/tmp", Windows: []model.Window{{Name: "shell", Cwd: "/tmp", Panes: []model.Pane{{Cwd: "/tmp"}}}}}
+	if err := template.ConnectPreset(ctl, st, recipe); err != nil {
+		t.Fatal(err)
+	}
+	if !called {
+		t.Fatal("attach did not run")
 	}
 }

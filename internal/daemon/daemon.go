@@ -398,6 +398,7 @@ func (d *Daemon) syncNowInner() {
 		presets     []store.PresetMeta
 		sticky      string
 	)
+	storeOK := st != nil
 	if st != nil {
 		now := time.Now().Unix()
 		// One map per live session, so a client can look up the scores for its own
@@ -412,9 +413,12 @@ func (d *Daemon) syncNowInner() {
 				transitions[s.Name] = t
 			}
 		}
-		usage, _ = st.AllUsage()
-		if pm, err := st.ListMeta(); err == nil {
-			presets = pm
+		var usageErr, presetErr error
+		usage, usageErr = st.AllUsage()
+		presets, presetErr = st.ListMeta()
+		if usageErr != nil || presetErr != nil {
+			storeOK = false
+			log.Printf("[store] [ERROR] snapshot refresh failed: usage=%v presets=%v; retaining previous cache", usageErr, presetErr)
 		}
 		sticky = template.StickyLabel(st)
 	}
@@ -432,7 +436,7 @@ func (d *Daemon) syncNowInner() {
 	if tmuxOK {
 		d.cachedSessions = sessions
 	}
-	if st != nil {
+	if storeOK {
 		d.cachedPairs, d.cachedTransitions, d.cachedUsage, d.cachedPresets = pairs, transitions, usage, presets
 		d.cachedSticky = sticky
 	}
@@ -444,7 +448,7 @@ func (d *Daemon) syncNowInner() {
 	// changes matter.
 	d.stateVersion.Add(1)
 
-	ready := tmuxOK && st != nil
+	ready := tmuxOK && storeOK
 	d.ready.Store(ready)
 	if ready {
 		d.syncedAt.Store(time.Now().Unix())

@@ -1,7 +1,9 @@
 package template
 
 import (
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -224,12 +226,59 @@ func CommitEdit(st store.Storer, oldName string, np *model.Session) error {
 	if st == nil || np == nil {
 		return fmt.Errorf("commit edit: nil store or preset")
 	}
-	if err := st.Save(np); err != nil {
+	if oldName != "" {
+		previous, err := st.Get(oldName)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("read recipe before edit: %w", err)
+		}
+		if previous != nil {
+			revised, err := reviseRecipe(model.RecipeFromSession(*previous), model.RecipeFromSession(*np))
+			if err != nil {
+				return fmt.Errorf("edit recipe identity: %w", err)
+			}
+			value := revised.Session()
+			np = &value
+		}
+	}
+	revisionStored := false
+	if repo, ok := st.(store.RecipeRevisionRepository); ok {
+		recipe := model.RecipeFromSession(*np)
+		if err := repo.SaveRecipeRevision(recipe, oldName); err != nil {
+			return err
+		}
+		revisionStored = true
+	} else if err := st.Save(np); err != nil {
 		return err
 	}
 	if oldName != "" && np.Name != oldName {
-		_ = st.Delete(oldName)
+		if !revisionStored {
+			_ = st.Delete(oldName)
+		}
 		_ = st.RebindName(oldName, np.Name)
+	}
+	return nil
+}
+
+// CommitObservedEdit retains the document opened by the editor as the write
+// precondition. The file format never needs to expose concurrency metadata.
+func CommitObservedEdit(st store.Storer, original, edited *model.Session) error {
+	if original == nil || edited == nil {
+		return fmt.Errorf("edit: missing original or edited recipe")
+	}
+	expected := model.RecipeFromSession(*original)
+	revised, err := reviseRecipe(expected, model.RecipeFromSession(*edited))
+	if err != nil {
+		return err
+	}
+	repo, ok := st.(model.CheckedRecipeRevisionRepository)
+	if !ok {
+		return fmt.Errorf("edit repository does not support checked revisions")
+	}
+	if err := repo.SaveRecipeRevisionChecked(revised, expected); err != nil {
+		return err
+	}
+	if revised.Name != expected.Name {
+		return st.RebindName(expected.Name, revised.Name)
 	}
 	return nil
 }
@@ -262,7 +311,6 @@ func Edit(st store.Storer, name string, pick func([]string) (string, error)) err
 		}
 	}
 
-	oldName := p.Name
 	tmp, err := os.CreateTemp("", "gotomux-edit-*.json")
 	if err != nil {
 		return err
@@ -292,7 +340,7 @@ func Edit(st store.Storer, name string, pick func([]string) (string, error)) err
 	if err != nil {
 		return fmt.Errorf("parse: %w", err)
 	}
-	if err := CommitEdit(st, oldName, np); err != nil {
+	if err := CommitObservedEdit(st, p, np); err != nil {
 		return err
 	}
 	outDir, _ := store.DataDir()

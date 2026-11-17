@@ -50,10 +50,6 @@ func ProfileRun(cfg *config.Config, ctl tmux.Connector, st store.Storer, createN
 		env = newContext(ctl, st, cache.tmuxSnap, tmux.CurrentSessionID())
 	})
 
-	stage("applyRankMeta", func() {
-		applyRankMeta(bySrc, st, env)
-	})
-
 	var m model
 	stage("assemble+refilter", func() {
 		m = assemble(cfg, Deps{Ctl: ctl, Store: st, SessionID: tmux.CurrentSessionID()}, createName, createCwd, cache, srcs, bySrc, env, "")

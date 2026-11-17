@@ -3,11 +3,7 @@ package store
 import "testing"
 
 func TestOpenStorePragma(t *testing.T) {
-	s, err := Open()
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer s.Close()
+	s := isolatedStore(t)
 	var mode string
 	if err := s.db.QueryRow(`PRAGMA journal_mode`).Scan(&mode); err != nil {
 		t.Fatal(err)

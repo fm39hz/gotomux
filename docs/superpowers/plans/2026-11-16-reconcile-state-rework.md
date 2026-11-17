@@ -13,10 +13,13 @@
 3. [x] Prevent terminal verification loops. Preserve can replan only after completion and absence of target operation markers; exact stays in `needs_attention` when safe ownership proof is unavailable.
 4. [x] Keep layout normalization slot-based and operation-time mapping runtime-based (existing implementation retained).
 5. [x] Carry runtime session ID and server generation through picker attach; separate create, attach, and preset intents; scope load rollback to the exact created session ID.
-6. [ ] Split `model.Session` into explicit preset recipe, baseline, and live observation types and migrate remaining call sites.
-7. [x] Confirm store persistence remains on the existing Goose/sqlc path; no parallel schema/SQL path added.
+6. [x] Add explicit `Recipe`, `Baseline`, and `ObservedSession` types; move reconcile plans and store baseline boundaries to typed values while keeping `Session` at compatibility adapters.
+7. [x] Remove semantic similarity as ownership evidence. Untagged windows/panes remain unmanaged and survive preserve.
+8. [x] Save edited recipe and desired baseline revision atomically; retain bindings only for unchanged slots and invalidate stale plans.
+9. [x] Replace tmux subprocess/control framing with pinned gotmux APIs; keep one centralized executor and explicit ExistingOnly/start policy.
+10. [x] Keep Goose/sqlc as the sole schema and typed query path; add the launch command column without rewriting legacy data.
 
-The unchecked domain-type split remains a required follow-up stage; the current model is still overloaded at non-reconcile call sites.
+`Session` remains as a compatibility DTO for shape, edit rendering, and tmux adapters. Reconcile planning, baseline persistence, and live snapshots now use the distinct domain contracts.
 
 ## Constraints
 
@@ -29,4 +32,4 @@ The unchecked domain-type split remains a required follow-up stage; the current 
 
 ## Verification boundary
 
-The implementation environment instructions prohibit adding or running tests unless explicitly requested. Keep changes limited and inspect diffs, migrations, interfaces, and error paths statically; report verification limits clearly.
+Verification completed on isolated HOME/XDG and tmux sockets: full unit/integration suite, go vet, build, deterministic sqlc generation, Goose migration order, checksum, and immutability checks.

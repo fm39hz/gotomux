@@ -36,6 +36,28 @@ func (s *Store) SaveFreezeWithBaseline(sess, baseline *model.Session, shapeID, s
 	if baseline != nil && baseline.Name != sess.Name {
 		return "", false, fmt.Errorf("baseline name %q does not match frozen session %q", baseline.Name, sess.Name)
 	}
+	if baseline != nil {
+		if !model.RecipeFromSession(*sess).SameReplay(model.RecipeFromSession(*baseline)) {
+			return "", false, fmt.Errorf("freeze recipe and baseline replay content differ")
+		}
+		if sess.LogicalID == "" || sess.LogicalID != baseline.LogicalID {
+			return "", false, fmt.Errorf("freeze recipe and baseline must share a non-empty logical identity")
+		}
+		if len(sess.Windows) != len(baseline.Windows) {
+			return "", false, fmt.Errorf("freeze recipe and baseline window identities differ")
+		}
+		for wi, window := range sess.Windows {
+			frozen := baseline.Windows[wi]
+			if window.SlotID == "" || window.SlotID != frozen.SlotID || len(window.Panes) != len(frozen.Panes) {
+				return "", false, fmt.Errorf("freeze recipe and baseline window %d identities differ", wi)
+			}
+			for pi, pane := range window.Panes {
+				if pane.SlotID == "" || pane.SlotID != frozen.Panes[pi].SlotID {
+					return "", false, fmt.Errorf("freeze recipe and baseline window %d pane %d identities differ", wi, pi)
+				}
+			}
+		}
+	}
 	tx, err := s.db.Begin()
 	if err != nil {
 		return "", false, err
@@ -58,6 +80,12 @@ func (s *Store) SaveFreezeWithBaseline(sess, baseline *model.Session, shapeID, s
 			return "", false, err
 		}
 	}
+	if baseline != nil {
+		if err := dbgen.New(tx).AbortReconcilesForFreeze(storeContext, dbgen.AbortReconcilesForFreezeParams{UpdatedAt: time.Now().Unix(), SessionLogicalID: baseline.LogicalID, SessionName: baseline.Name}); err != nil {
+			return "", false, fmt.Errorf("supersede reconcile journal on freeze: %w", err)
+		}
+	}
+
 	if err := tx.Commit(); err != nil {
 		return "", false, err
 	}
@@ -152,20 +180,27 @@ func min6(key string) int {
 }
 
 func savePresetTx(tx *sql.Tx, sess *model.Session) error {
+	if sess == nil {
+		return fmt.Errorf("nil preset")
+	}
+	return saveRecipeTx(tx, model.RecipeFromSession(*sess))
+}
+
+func saveRecipeTx(tx *sql.Tx, recipe model.Recipe) error {
 	now := time.Now().Unix()
-	if err := deleteSessionsForSave(tx, sess.Name, sess.Cwd); err != nil {
+	if err := deleteSessionsForSave(tx, recipe.Name, recipe.Cwd); err != nil {
 		return err
 	}
 	q := dbgen.New(tx)
-	if err := q.InsertSession(storeContext, dbgen.InsertSessionParams{Name: sess.Name, Cwd: sess.Cwd, CreatedAt: now, LastUsed: now, LogicalID: sess.LogicalID}); err != nil {
+	if err := q.InsertSession(storeContext, dbgen.InsertSessionParams{Name: recipe.Name, Cwd: recipe.Cwd, CreatedAt: now, LastUsed: now, LogicalID: recipe.LogicalID}); err != nil {
 		return err
 	}
-	for i, w := range sess.Windows {
+	for i, w := range recipe.Windows {
 		widx := w.Idx
 		if widx == 0 {
 			widx = i
 		}
-		res, err := q.InsertWindow(storeContext, dbgen.InsertWindowParams{Session: sess.Name, Idx: int64(widx), Name: w.Name, Cwd: w.Cwd, Layout: sql.NullString{String: w.Layout, Valid: true}, SlotID: w.SlotID})
+		res, err := q.InsertWindow(storeContext, dbgen.InsertWindowParams{Session: recipe.Name, Idx: int64(widx), Name: w.Name, Cwd: w.Cwd, Layout: sql.NullString{String: w.Layout, Valid: true}, SlotID: w.SlotID})
 		if err != nil {
 			return err
 		}
@@ -178,7 +213,7 @@ func savePresetTx(tx *sql.Tx, sess *model.Session) error {
 			if pidx == 0 {
 				pidx = j
 			}
-			if err := q.InsertPane(storeContext, dbgen.InsertPaneParams{WindowID: wid, Idx: int64(pidx), Cwd: sql.NullString{String: pn.Cwd, Valid: true}, Cmd: sql.NullString{String: pn.Cmd, Valid: true}, CmdPath: pn.CmdPath, SlotID: pn.SlotID}); err != nil {
+			if err := q.InsertPane(storeContext, dbgen.InsertPaneParams{WindowID: wid, Idx: int64(pidx), Cwd: sql.NullString{String: pn.Cwd, Valid: true}, Cmd: sql.NullString{String: pn.Cmd, Valid: true}, CmdPath: pn.CmdPath, StartCmd: pn.StartCmd, SlotID: pn.SlotID}); err != nil {
 				return err
 			}
 		}

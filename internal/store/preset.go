@@ -10,7 +10,6 @@ import (
 	"github.com/fm39hz/gotomux/internal/model"
 	"github.com/fm39hz/gotomux/internal/project"
 	"github.com/fm39hz/gotomux/internal/store/dbgen"
-	"github.com/fm39hz/gotomux/internal/tmuxlayout"
 )
 
 func (s *Store) ListNames() ([]string, error) {
@@ -30,9 +29,10 @@ func (s *Store) ListNames() ([]string, error) {
 // tags: without them the payload mixed snake_case keys from daemon.Response with
 // Go field names from the embedded types.
 type PresetMeta struct {
-	Name     string `json:"name"`
-	Cwd      string `json:"cwd,omitempty"`
-	LastUsed int64  `json:"last_used,omitempty"`
+	Name      string `json:"name"`
+	Cwd       string `json:"cwd,omitempty"`
+	LastUsed  int64  `json:"last_used,omitempty"`
+	LogicalID string `json:"logical_id,omitempty"`
 }
 
 func (s *Store) ListMeta() ([]PresetMeta, error) {
@@ -42,7 +42,7 @@ func (s *Store) ListMeta() ([]PresetMeta, error) {
 	}
 	out := make([]PresetMeta, 0, len(rows))
 	for _, row := range rows {
-		out = append(out, PresetMeta{Name: row.Name, Cwd: row.Cwd, LastUsed: row.LastUsed})
+		out = append(out, PresetMeta{Name: row.Name, Cwd: row.Cwd, LastUsed: row.LastUsed, LogicalID: row.LogicalID})
 	}
 	return out, nil
 }
@@ -64,11 +64,24 @@ func (s *Store) Get(name string) (*model.Session, error) {
 			return nil, err
 		}
 		for _, pane := range panes {
-			w.Panes = append(w.Panes, model.Pane{Idx: int(pane.Idx), Cwd: pane.Cwd, Cmd: pane.Cmd, CmdPath: pane.CmdPath, SlotID: pane.SlotID})
+			w.Panes = append(w.Panes, model.Pane{Idx: int(pane.Idx), Cwd: pane.Cwd, Cmd: pane.Cmd, CmdPath: pane.CmdPath, StartCmd: pane.StartCmd, SlotID: pane.SlotID})
 		}
 		sess.Windows = append(sess.Windows, w)
 	}
 	return sess, nil
+}
+
+func (s *Store) GetRecipe(name string) (model.Recipe, error) {
+	session, err := s.Get(name)
+	if err != nil {
+		return model.Recipe{}, err
+	}
+	return model.RecipeFromSession(*session), nil
+}
+
+func (s *Store) SaveRecipe(recipe model.Recipe) error {
+	session := recipe.Session()
+	return s.Save(&session)
 }
 
 func (s *Store) Save(sess *model.Session) error {
@@ -85,6 +98,80 @@ func (s *Store) Save(sess *model.Session) error {
 	defer func() { _ = tx.Rollback() }()
 	if err := savePresetTx(tx, sess); err != nil {
 		return err
+	}
+	return tx.Commit()
+}
+
+// SaveRecipeRevision writes the edited recipe, matching desired baseline
+// revision, runtime bindings for unchanged slots, and journal invalidation in
+// one transaction. The baseline is updated only when it belongs to this
+// logical instance; unidentified and foreign legacy rows are left untouched.
+func (s *Store) SaveRecipeRevision(recipe model.Recipe, oldName string) error {
+	return s.saveRecipeRevision(recipe, oldName, nil)
+}
+
+func (s *Store) SaveRecipeRevisionChecked(recipe, expected model.Recipe) error {
+	return s.saveRecipeRevision(recipe, expected.Name, &expected)
+}
+
+func (s *Store) saveRecipeRevision(recipe model.Recipe, oldName string, expected *model.Recipe) error {
+	if !project.ValidSessionName(recipe.Name) {
+		return fmt.Errorf("invalid preset name %q", recipe.Name)
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if expected != nil {
+		reader := &Store{q: dbgen.New(tx)}
+		current, err := reader.GetRecipe(oldName)
+		if err != nil {
+			return fmt.Errorf("read edit revision: %w", err)
+		}
+		if !expected.SameReplay(current) || expected.LogicalID != current.LogicalID {
+			return fmt.Errorf("recipe changed while editor was open; reopen before saving")
+		}
+		for wi, window := range expected.Windows {
+			if window.SlotID != current.Windows[wi].SlotID {
+				return fmt.Errorf("recipe window identity changed while editing")
+			}
+			for pi, pane := range window.Panes {
+				if pane.SlotID != current.Windows[wi].Panes[pi].SlotID {
+					return fmt.Errorf("recipe pane identity changed while editing")
+				}
+			}
+		}
+	}
+	if err := saveRecipeTx(tx, recipe); err != nil {
+		return err
+	}
+	if oldName != "" && oldName != recipe.Name {
+		if err := dbgen.New(tx).DeleteSession(storeContext, oldName); err != nil {
+			return err
+		}
+	}
+	if recipe.LogicalID != "" {
+		q := dbgen.New(tx)
+		row, lookupErr := q.BaselineByLogicalID(storeContext, recipe.LogicalID)
+		if lookupErr != nil && !errors.Is(lookupErr, sql.ErrNoRows) {
+			return lookupErr
+		}
+		if lookupErr == nil {
+			old, err := decodeBaselineEnvelope(row.Body, row.LogicalID)
+			if err != nil {
+				return fmt.Errorf("decode baseline before recipe revision: %w", err)
+			}
+
+			previous := model.BaselineFromSession(old)
+			revised := model.ReviseBaseline(recipe, previous).Session()
+			if err := saveBaselineTx(tx, &revised, false); err != nil {
+				return fmt.Errorf("save revised desired baseline: %w", err)
+			}
+			if err := q.AbortReconcilesForRevision(storeContext, dbgen.AbortReconcilesForRevisionParams{UpdatedAt: time.Now().Unix(), SessionLogicalID: recipe.LogicalID}); err != nil {
+				return fmt.Errorf("invalidate old reconcile plans: %w", err)
+			}
+		}
 	}
 	return tx.Commit()
 }
@@ -172,13 +259,7 @@ func bindPresetIdentityTx(tx *sql.Tx, sess *model.Session) error {
 	}
 	for i, want := range sess.Windows {
 		got := windows[i]
-		layoutEqual := got.Layout == want.Layout
-		if !layoutEqual {
-			layoutEqual, _ = tmuxlayout.Compare(got.Layout, len(want.Panes), want.Layout, len(want.Panes))
-		}
-		if got.Name != want.Name || got.Cwd != want.Cwd || !layoutEqual {
-			return fmt.Errorf("preset %q window %d no longer matches the baseline", sess.Name, i)
-		}
+
 		if got.SlotID != "" && got.SlotID != want.SlotID {
 			return fmt.Errorf("preset %q window %d already has a different stable identity", sess.Name, i)
 		}
@@ -189,11 +270,16 @@ func bindPresetIdentityTx(tx *sql.Tx, sess *model.Session) error {
 		if len(panes) != len(want.Panes) {
 			return fmt.Errorf("preset %q window %d pane count changed while binding identity", sess.Name, i)
 		}
+		storedWindow := model.WindowSpec{Idx: int(got.Idx), Name: got.Name, Cwd: got.Cwd, Layout: got.Layout}
+		for _, pane := range panes {
+			storedWindow.Panes = append(storedWindow.Panes, model.PaneSpec{Idx: int(pane.Idx), Cwd: pane.Cwd, Cmd: pane.Cmd, CmdPath: pane.CmdPath, StartCmd: pane.StartCmd})
+		}
+		if !storedWindow.SameReplay(model.RecipeFromSession(model.Session{Windows: []model.Window{want}}).Windows[0]) {
+			return fmt.Errorf("preset %q window %d replay content changed while binding identity", sess.Name, i)
+		}
 		for j, pane := range want.Panes {
 			storedPane := panes[j]
-			if storedPane.Cwd != pane.Cwd || storedPane.Cmd != pane.Cmd || storedPane.CmdPath != pane.CmdPath {
-				return fmt.Errorf("preset %q window %d pane %d no longer matches the baseline", sess.Name, i, j)
-			}
+
 			if storedPane.SlotID != "" && storedPane.SlotID != pane.SlotID {
 				return fmt.Errorf("preset %q window %d pane %d already has a different stable identity", sess.Name, i, j)
 			}
@@ -343,4 +429,40 @@ func (s *Store) RebindName(old, newName string) error {
 		}
 	}
 	return tx.Commit()
+}
+
+// NormalizeRecipeIdentity verifies the persisted replay and binds the canonical
+// logical/slot identities through the transactional store boundary.
+func (s *Store) NormalizeRecipeIdentity(recipe, baseline model.Recipe) (model.Recipe, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return model.Recipe{}, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	row, err := dbgen.New(tx).BaselineByLogicalID(storeContext, baseline.LogicalID)
+	if err != nil {
+		return model.Recipe{}, fmt.Errorf("read canonical baseline for normalization: %w", err)
+	}
+	canonical, err := decodeBaselineEnvelope(row.Body, row.LogicalID)
+	if err != nil {
+		return model.Recipe{}, err
+	}
+	canonicalRecipe := model.RecipeFromSession(canonical)
+	// Resolve both documents against the canonical persisted tree; caller
+	// identity metadata cannot replace canonical ownership.
+	if _, err := model.RestoreRecipeIdentity(baseline, canonicalRecipe); err != nil {
+		return model.Recipe{}, fmt.Errorf("baseline changed before normalization: %w", err)
+	}
+	restored, err := model.RestoreRecipeIdentity(recipe, canonicalRecipe)
+	if err != nil {
+		return model.Recipe{}, err
+	}
+	session := restored.Session()
+	if err := bindPresetIdentityTx(tx, &session); err != nil {
+		return model.Recipe{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return model.Recipe{}, err
+	}
+	return restored, nil
 }

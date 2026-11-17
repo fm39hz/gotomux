@@ -88,3 +88,10 @@ func TestLayoutTopologyIgnoresGeometryAndPaneIDsButKeepsTreeOrder(t *testing.T) 
 		t.Fatalf("split tree nesting/order was lost: %q vs %q", gotA, gotC)
 	}
 }
+
+func TestCommandArgumentsPreserveQuotedValues(t *testing.T) {
+	got := cmdArgs(`tool --title "two words" 'literal value'`)
+	if len(got) != 4 || got[2] != "two words" || got[3] != "literal value" {
+		t.Fatalf("quoted arguments lost: %#v", got)
+	}
+}

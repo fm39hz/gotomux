@@ -11,6 +11,8 @@ import (
 	"github.com/fm39hz/gotomux/internal/event"
 	"github.com/fm39hz/gotomux/internal/model"
 	"github.com/fm39hz/gotomux/internal/project"
+	core "github.com/fm39hz/gotomux/internal/reconcile/core"
+	"github.com/fm39hz/gotomux/internal/sessionguard"
 	"github.com/fm39hz/gotomux/internal/store"
 	"github.com/fm39hz/gotomux/internal/tmux"
 	"github.com/fm39hz/gotomux/internal/tmuxlayout"
@@ -146,7 +148,9 @@ func FreezeSave(st store.Storer, s *model.Session, setSticky bool) (shapeID stri
 		return "", false, fmt.Errorf("freeze save: nil store or preset")
 	}
 	ensureShapesReady(st)
-	baseline := cloneSession(s)
+	contract := model.BaselineFromSession(*s)
+	frozen := contract.Session()
+	baseline := &frozen
 	baseline.SchemaVersion = model.CurrentBaselineSchemaVersion
 	stampSemanticMetadata(baseline)
 	id, key, body := shapeBody(s, false)
@@ -158,7 +162,20 @@ func FreezeSave(st store.Storer, s *model.Session, setSticky bool) (shapeID stri
 	return shapeID, shapeCreated, nil
 }
 
-func FreezeRemember(ctl tmux.Connector, st store.Storer, name string) (shapeID string, shapeCreated bool, err error) {
+func FreezeRemember(ctl tmux.Connector, st store.Storer, name string) (string, bool, error) {
+	return freezeRemember(ctl, st, name, model.EntityIdentity{})
+}
+
+// FreezeObserved preserves the picker selection receipt through observation
+// and lock acquisition. A reused name cannot redirect this operation.
+func FreezeObserved(ctl tmux.Connector, st store.Storer, name string, receipt model.EntityIdentity) (string, bool, error) {
+	if receipt.RuntimeID == "" || receipt.ServerKey == "" {
+		return "", false, fmt.Errorf("freeze: missing selected runtime receipt")
+	}
+	return freezeRemember(ctl, st, name, receipt)
+}
+
+func freezeRemember(ctl tmux.Connector, st store.Storer, name string, receipt model.EntityIdentity) (shapeID string, shapeCreated bool, err error) {
 	if ctl == nil {
 		return "", false, fmt.Errorf("freeze: nil tmux")
 	}
@@ -169,7 +186,41 @@ func FreezeRemember(ctl tmux.Connector, st store.Storer, name string) (shapeID s
 	if !ok {
 		return "", false, fmt.Errorf("freeze: tmux adapter does not support logical identity metadata")
 	}
-	p, err := EnsureLiveIdentities(context.Background(), ops, name)
+	snapshot, err := ops.Observe(context.Background(), name)
+	if err != nil {
+		return "", false, err
+	}
+	if err := validateIdentitySnapshot(snapshot, name); err != nil {
+		return "", false, err
+	}
+	if receipt.RuntimeID != "" && (snapshot.TargetSessionID != receipt.RuntimeID || snapshot.ServerKey != receipt.ServerKey) {
+		return "", false, fmt.Errorf("freeze: selected session incarnation changed; refresh the picker")
+	}
+	release, err := sessionguard.Acquire(snapshot.ServerKey, snapshot.TargetSessionID)
+	if err != nil {
+		return "", false, err
+	}
+	defer func() { _ = release() }()
+	// Discover the lock key before acquiring it, then discard that observation.
+	// All ownership and recovery decisions must use a snapshot taken under the
+	// same lock as reconcile, otherwise a completed intervening operation can
+	// leave freeze checking stale markers or assigning IDs from stale receipts.
+	locked, err := ops.Observe(context.Background(), name)
+	if err != nil {
+		return "", false, err
+	}
+	if err := validateIdentitySnapshot(locked, name); err != nil {
+		return "", false, err
+	}
+	if locked.ServerKey != snapshot.ServerKey || locked.TargetSessionID != snapshot.TargetSessionID {
+		return "", false, fmt.Errorf("session incarnation changed before freeze lock was acquired")
+	}
+	snapshot = locked
+	if hasTargetOperationMarkers(*snapshot, core.PlanResult{}) {
+		return "", false, fmt.Errorf("freeze: session contains unfinished operation objects; resume reconcile before replacing its baseline")
+	}
+	preferred := snapshot.Target.Session()
+	p, err := EnsureLiveIdentitiesFromPreset(context.Background(), ops, name, &preferred)
 	if err != nil {
 		return "", false, err
 	}
@@ -207,25 +258,83 @@ func ConnectProject(ctl tmux.Connector, st store.Storer, name, cwd string) error
 		}
 		return nil
 	}
+	// Project entry restores a saved recipe before baking a new shape.
+	if st != nil {
+		recipe, err := st.GetRecipe(name)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("connect project preset lookup: %w", err)
+		}
+		if recipe.Name != "" {
+			if filepath.Clean(project.FindProjectRoot(recipe.Cwd)) != filepath.Clean(project.FindProjectRoot(cwd)) {
+				return fmt.Errorf("preset %q belongs to another project path", name)
+			}
+			return ConnectRecipe(ctl, st, recipe)
+		}
+	}
 	tmpl, sid, err := LoadActive(st)
 	if err != nil {
 		return fmt.Errorf("load sticky shape: %w", err)
 	}
 	baked := bakeShape(st, tmpl, name, cwd, sid)
-	return connectPreset(ctl, st, baked, false)
+	return connectPreset(ctl, st, baked, connectNewProject)
 }
 
 // ConnectPreset loads a saved/baked instance, records its baseline before an
 // outside-tmux attach can replace the process, then connects the client.
 func ConnectPreset(ctl tmux.Connector, st store.Storer, p *model.Session) error {
-	return connectPreset(ctl, st, p, true)
+	return connectPreset(ctl, st, p, connectSavedSession)
 }
 
-func connectPreset(ctl tmux.Connector, st store.Storer, p *model.Session, selectedPreset bool) error {
+// ConnectRecipe enters through the ID-free preset domain type and creates a
+// disposable tmux DTO only at the effect boundary.
+func ConnectRecipe(ctl tmux.Connector, st store.Storer, recipe model.Recipe) error {
+	session := recipe.Session()
+	return connectPreset(ctl, st, &session, connectSavedSession)
+}
+
+type connectIntent uint8
+
+const (
+	connectNewProject connectIntent = iota
+	connectSavedSession
+)
+
+type baselineWritePolicy uint8
+
+const (
+	baselineInitialize baselineWritePolicy = iota
+	baselineRetain
+	baselineBindRecipeOnly
+)
+
+func connectPreset(ctl tmux.Connector, st store.Storer, p *model.Session, intent connectIntent) (retErr error) {
 	if ctl == nil || p == nil {
 		return fmt.Errorf("connect preset: nil tmux or preset")
 	}
 	ctx := context.Background()
+	// A supported rename does not create a new logical instance. Search
+	// logical ownership before treating the recipe's display name as a create.
+	if intent == connectSavedSession && p.LogicalID != "" {
+		live, err := ctl.ListLive(ctx)
+		if err != nil {
+			return fmt.Errorf("connect preset logical lookup: %w", err)
+		}
+		candidates := make([]model.SessionCandidate, 0, len(live))
+		for _, candidate := range live {
+			candidates = append(candidates, model.SessionCandidate{Name: candidate.Name, Identity: model.EntityIdentity{LogicalID: candidate.LogicalID, ServerKey: candidate.ServerKey, RuntimeID: candidate.ID}})
+		}
+		resolved := model.ResolveSavedTarget(p.Name, model.EntityIdentity{LogicalID: p.LogicalID}, candidates)
+		if resolved.Disposition == model.TargetConflictingOwners {
+			return fmt.Errorf("preset logical identity has multiple live owners")
+		}
+		if resolved.Disposition == model.TargetAttach {
+			connector, ok := ctl.(tmux.ObservedConnector)
+			if !ok {
+				return fmt.Errorf("tmux adapter cannot attach an observed logical owner")
+			}
+			return connector.ConnectObserved(ctx, resolved.Owner.Identity.RuntimeID, resolved.Owner.Identity.ServerKey)
+		}
+	}
 	if ctl.Has(ctx, p.Name) {
 		ops, ok := ctl.(IdentityOps)
 		if !ok {
@@ -235,18 +344,13 @@ func connectPreset(ctl tmux.Connector, st store.Storer, p *model.Session, select
 		if err != nil {
 			return fmt.Errorf("connect preset %q: observe existing live session: %w", p.Name, err)
 		}
-		if p.LogicalID == "" || live.Target.LogicalID != p.LogicalID {
-			return fmt.Errorf("connect preset %q: same-name live session identity does not match the selected preset", p.Name)
-		}
 		if err := validateIdentitySnapshot(live, p.Name); err != nil {
 			return fmt.Errorf("connect preset %q: live identity graph is invalid: %w", p.Name, err)
 		}
-		if err := requireTargetIDs(live.Target); err != nil {
-			return fmt.Errorf("connect preset %q: live identity tree is incomplete: %w", p.Name, err)
+		if p.LogicalID == "" || live.Target.LogicalID != p.LogicalID {
+			return fmt.Errorf("connect preset %q: same-name live session identity does not match the selected preset", p.Name)
 		}
-		connector, ok := ctl.(interface {
-			ConnectObserved(context.Context, string, string) error
-		})
+		connector, ok := ctl.(tmux.ObservedConnector)
 		if !ok {
 			return fmt.Errorf("connect preset %q: tmux adapter cannot connect by observed runtime identity", p.Name)
 		}
@@ -256,9 +360,10 @@ func connectPreset(ctl tmux.Connector, st store.Storer, p *model.Session, select
 	if !ok {
 		return fmt.Errorf("connect preset: tmux adapter does not support logical identity metadata")
 	}
-	instance := cloneSession(p)
-	legacyBaselineWithoutIdentity := false
-	projectNameCollision := false
+	recipe := model.RecipeFromSession(*p)
+	instanceValue := recipe.Session()
+	instance := &instanceValue
+	writePolicy := baselineInitialize
 	if st != nil {
 		storedPreset, err := st.Get(p.Name)
 		if err != nil && !errors.Is(err, sql.ErrNoRows) {
@@ -268,23 +373,26 @@ func connectPreset(ctl tmux.Connector, st store.Storer, p *model.Session, select
 		if err != nil {
 			return fmt.Errorf("connect preset %q baseline identity: %w", p.Name, err)
 		}
+		if storedBaseline != nil {
+			writePolicy = baselineRetain
+		}
 		if storedBaseline != nil && storedBaseline.LogicalID == "" {
 			// Keep an unidentified legacy baseline untouched. It cannot establish
 			// ownership, but it must not prevent creating a fresh instance from a
 			// valid preset; the user can freeze that instance to establish a new
 			// identified baseline explicitly.
-			legacyBaselineWithoutIdentity = true
+			writePolicy = baselineBindRecipeOnly
 			storedBaseline = nil
-			if !selectedPreset {
-				projectNameCollision = true
+			if intent == connectNewProject {
+				writePolicy = baselineRetain
 			}
 		}
-		if !selectedPreset && storedBaseline != nil {
+		if intent == connectNewProject && storedBaseline != nil {
 			return fmt.Errorf("create project %q: an identified baseline already owns this session name; select its preset or freeze an intentional replacement", p.Name)
 		}
 		if storedPreset != nil {
-			if !selectedPreset {
-				projectNameCollision = true
+			if intent == connectNewProject {
+				writePolicy = baselineRetain
 				clearPresetStableIDs(instance)
 			} else {
 				if !samePersistedPreset(p, storedPreset) {
@@ -310,8 +418,13 @@ func connectPreset(ctl tmux.Connector, st store.Storer, p *model.Session, select
 					}
 				} else {
 					clearPresetStableIDs(instance)
-					if err := restorePresetIdentity(instance, storedBaseline); err != nil {
-						return err
+					if storedBaseline != nil {
+						normalized, err := st.NormalizeRecipeIdentity(model.RecipeFromSession(*instance), model.RecipeFromSession(*storedBaseline))
+						if err != nil {
+							return fmt.Errorf("normalize saved recipe %q: %w", p.Name, err)
+						}
+						normalizedSession := normalized.Session()
+						instance = &normalizedSession
 					}
 				}
 			}
@@ -335,36 +448,67 @@ func connectPreset(ctl tmux.Connector, st store.Storer, p *model.Session, select
 	if err := ctl.Load(ctx, instance); err != nil {
 		return fmt.Errorf("load preset %q: %w", p.Name, err)
 	}
-	observed, err := EnsureLiveIdentitiesFromPreset(ctx, ops, p.Name, instance)
-	if err != nil {
-		return fmt.Errorf("load preset %q identity: %w", p.Name, err)
+	if instance.TmuxID == "" || instance.ServerKey == "" {
+		return fmt.Errorf("load preset %q returned no creation receipt; refusing to assign identity", p.Name)
 	}
-	instance = cloneSession(observed)
-	if st != nil {
-		baseline := cloneSession(instance)
-		if err := bindLoadedIDs(baseline, observed); err != nil {
-			return fmt.Errorf("load preset %q layout identity: %w", p.Name, err)
+	// The mutation phase owns both rollback and lock lifetime. It must finish
+	// before an interactive attach can block until the user detaches.
+	observed, err := func() (_ *model.Session, retErr error) {
+		release, err := sessionguard.Acquire(instance.ServerKey, instance.TmuxID)
+		if err != nil {
+			return nil, fmt.Errorf("created session %s could not enter identity phase: %w", instance.TmuxID, err)
 		}
-		baseline.SchemaVersion = model.CurrentBaselineSchemaVersion
-		stampSemanticMetadata(baseline)
-		if !selectedPreset && projectNameCollision {
-			// Do not let a fresh project instance overwrite a same-name preset or
-			// unidentified legacy baseline. Freeze is the explicit baseline write.
-		} else if legacyBaselineWithoutIdentity {
-			if err := st.BindPresetIdentity(baseline); err != nil {
-				return fmt.Errorf("persist loaded preset identity %q: %w", p.Name, err)
+		defer func() { _ = release() }()
+		creationComplete := false
+		defer func() {
+			if retErr == nil || creationComplete {
+				return
 			}
-		} else if err := st.SaveBaseline(baseline); err != nil {
-			return fmt.Errorf("save baseline %q: %w", p.Name, err)
+			cleaner, ok := ctl.(tmux.CreatedSessionCleaner)
+			if !ok {
+				retErr = fmt.Errorf("%w; partial session %s on server %s remains for recovery", retErr, instance.TmuxID, instance.ServerKey)
+				return
+			}
+			if err := cleaner.RemoveCreatedSession(ctx, instance.TmuxID, instance.ServerKey); err != nil {
+				retErr = fmt.Errorf("%w; cleanup of created session %s failed: %v", retErr, instance.TmuxID, err)
+			}
+		}()
+		observed, err := EnsureLiveIdentitiesFromPreset(ctx, ops, p.Name, instance)
+		if err != nil {
+			return nil, fmt.Errorf("load preset %q identity: %w", p.Name, err)
 		}
+		if st != nil {
+			baseline := cloneSession(instance)
+			if err := bindLoadedIDs(baseline, observed); err != nil {
+				return nil, fmt.Errorf("load preset %q layout identity: %w", p.Name, err)
+			}
+			baseline.SchemaVersion = model.CurrentBaselineSchemaVersion
+			stampSemanticMetadata(baseline)
+			switch writePolicy {
+			case baselineRetain:
+				// Preserve the independently frozen desired state.
+			case baselineBindRecipeOnly:
+				if err := st.BindPresetIdentity(baseline); err != nil {
+					return nil, fmt.Errorf("persist loaded preset identity %q: %w", p.Name, err)
+				}
+			case baselineInitialize:
+				if err := st.SaveInitialBaseline(baseline); err != nil {
+					return nil, fmt.Errorf("save baseline %q: %w", p.Name, err)
+				}
+			}
+		}
+		creationComplete = true
+		return observed, nil
+	}()
+	if err != nil {
+		return err
 	}
-	connector, ok := ctl.(interface {
-		ConnectObserved(context.Context, string, string) error
-	})
+
+	connector, ok := ctl.(tmux.ObservedConnector)
 	if !ok {
 		return fmt.Errorf("load preset %q: tmux adapter cannot connect by verified runtime identity", p.Name)
 	}
-	return connector.ConnectObserved(ctx, instance.TmuxID, instance.ServerKey)
+	return connector.ConnectObserved(ctx, observed.TmuxID, observed.ServerKey)
 }
 
 func connectLiveByName(ctl tmux.Connector, name, expectedPath string) error {
@@ -393,9 +537,7 @@ func connectLiveByName(ctl tmux.Connector, name, expectedPath string) error {
 	if wantRoot != gotRoot {
 		return fmt.Errorf("same-name live session %q belongs to project %q, selected project is %q", name, gotRoot, wantRoot)
 	}
-	connector, ok := ctl.(interface {
-		ConnectObserved(context.Context, string, string) error
-	})
+	connector, ok := ctl.(tmux.ObservedConnector)
 	if !ok {
 		return fmt.Errorf("tmux adapter cannot connect by observed runtime identity")
 	}
@@ -406,37 +548,11 @@ func restorePresetIdentity(preset, baseline *model.Session) error {
 	if baseline == nil {
 		return nil
 	}
-	if baseline.LogicalID == "" {
-		return fmt.Errorf("preset %q has a baseline without logical identity; freeze it before loading", preset.Name)
+	restored, err := model.RestoreRecipeIdentity(model.RecipeFromSession(*preset), model.RecipeFromSession(*baseline))
+	if err != nil {
+		return fmt.Errorf("preset %q identity: %w", preset.Name, err)
 	}
-	if preset.LogicalID != "" && preset.LogicalID != baseline.LogicalID {
-		return fmt.Errorf("preset %q belongs to logical session %s but its baseline belongs to %s; freeze the intended replacement before loading", preset.Name, preset.LogicalID, baseline.LogicalID)
-	}
-	if preset.LogicalID == "" && !samePersistedPreset(preset, baseline) {
-		return fmt.Errorf("preset %q does not structurally match baseline logical session %s; freeze the intended replacement before loading", preset.Name, baseline.LogicalID)
-	}
-	if preset.LogicalID == "" {
-		preset.LogicalID = baseline.LogicalID
-	}
-	if len(preset.Windows) != len(baseline.Windows) {
-		return fmt.Errorf("preset %q and baseline identity tree have different window counts", preset.Name)
-	}
-	for wi := range preset.Windows {
-		pw, bw := &preset.Windows[wi], baseline.Windows[wi]
-		if pw.SlotID != "" && pw.SlotID != bw.SlotID {
-			return fmt.Errorf("preset %q window %d identity conflicts with baseline", preset.Name, wi)
-		}
-		pw.SlotID = bw.SlotID
-		if len(pw.Panes) != len(bw.Panes) {
-			return fmt.Errorf("preset %q window %d and baseline identity tree have different pane counts", preset.Name, wi)
-		}
-		for pi := range pw.Panes {
-			if pw.Panes[pi].SlotID != "" && pw.Panes[pi].SlotID != bw.Panes[pi].SlotID {
-				return fmt.Errorf("preset %q window %d pane %d identity conflicts with baseline", preset.Name, wi, pi)
-			}
-			pw.Panes[pi].SlotID = bw.Panes[pi].SlotID
-		}
-	}
+	*preset = restored.Session()
 	return nil
 }
 
@@ -468,23 +584,10 @@ func copyPresetStableIDs(target, source *model.Session) error {
 }
 
 func fillMissingPresetStableIDs(target, source *model.Session) error {
-	if target == nil || source == nil || len(target.Windows) != len(source.Windows) {
-		return fmt.Errorf("preset stable identity tree does not match baseline")
+	if target == nil || source == nil {
+		return fmt.Errorf("missing recipe identity document")
 	}
-	for wi := range target.Windows {
-		if target.Windows[wi].SlotID == "" {
-			target.Windows[wi].SlotID = source.Windows[wi].SlotID
-		}
-		if len(target.Windows[wi].Panes) != len(source.Windows[wi].Panes) {
-			return fmt.Errorf("preset window %d stable identity tree does not match baseline", wi)
-		}
-		for pi := range target.Windows[wi].Panes {
-			if target.Windows[wi].Panes[pi].SlotID == "" {
-				target.Windows[wi].Panes[pi].SlotID = source.Windows[wi].Panes[pi].SlotID
-			}
-		}
-	}
-	return nil
+	return restorePresetIdentity(target, source)
 }
 
 func completePresetStableIDs(preset *model.Session) bool {
@@ -521,26 +624,7 @@ func clearPresetStableIDs(preset *model.Session) {
 // every persisted instance field agrees in the same ordered tree; names alone
 // are insufficient to infer ownership.
 func samePersistedPreset(preset, baseline *model.Session) bool {
-	if preset == nil || baseline == nil || preset.Name != baseline.Name || preset.Cwd != baseline.Cwd || len(preset.Windows) != len(baseline.Windows) {
-		return false
-	}
-	for wi := range preset.Windows {
-		pw, bw := preset.Windows[wi], baseline.Windows[wi]
-		layoutEqual := pw.Layout == bw.Layout
-		if !layoutEqual {
-			layoutEqual, _ = tmuxlayout.Compare(pw.Layout, len(pw.Panes), bw.Layout, len(bw.Panes))
-		}
-		if pw.Idx != bw.Idx || pw.Name != bw.Name || pw.Cwd != bw.Cwd || !layoutEqual || len(pw.Panes) != len(bw.Panes) {
-			return false
-		}
-		for pi := range pw.Panes {
-			pp, bp := pw.Panes[pi], bw.Panes[pi]
-			if pp.Idx != bp.Idx || pp.Cwd != bp.Cwd || pp.Cmd != bp.Cmd || pp.CmdPath != bp.CmdPath {
-				return false
-			}
-		}
-	}
-	return true
+	return preset != nil && baseline != nil && model.RecipeFromSession(*preset).SameReplay(model.RecipeFromSession(*baseline))
 }
 
 func stampSemanticMetadata(s *model.Session) {

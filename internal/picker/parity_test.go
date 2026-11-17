@@ -10,6 +10,7 @@ import (
 
 	"github.com/fm39hz/gotomux/internal/config"
 	"github.com/fm39hz/gotomux/internal/daemon"
+	mod "github.com/fm39hz/gotomux/internal/model"
 	"github.com/fm39hz/gotomux/internal/store"
 	"github.com/fm39hz/gotomux/internal/tmux"
 	"github.com/fm39hz/gotomux/internal/zoxide"
@@ -28,7 +29,7 @@ type fixture struct {
 func newFixture() fixture {
 	return fixture{
 		sessions: []tmux.LiveSession{
-			{ID: "$0", Name: "alpha", Windows: 2, Path: "/w/alpha", LastAttached: 1000, Activity: 1100, Created: 900},
+			{ID: "$0", Name: "alpha", LogicalID: "logical-alpha", ServerKey: "server-a", Windows: 2, Path: "/w/alpha", LastAttached: 1000, Activity: 1100, Created: 900},
 			{ID: "$1", Name: "beta", Windows: 1, Path: "/w/beta", Activity: 1050, Created: 1050},
 		},
 		presets: []store.PresetMeta{
@@ -106,6 +107,9 @@ func TestPathParity(t *testing.T) {
 			env := &Context{
 				Session: tc.session, Path: tc.path,
 				Pairs: tc.pairs, Usage: f.usage, Now: 0,
+			}
+			if cur, ok := tmux.FindByID(f.sessions, tc.sessID); ok {
+				env.Identity = mod.EntityIdentity{LogicalID: cur.LogicalID, ServerKey: cur.ServerKey, RuntimeID: cur.ID, ProjectPath: cur.Path}
 			}
 			seeded := NewModelFromDaemon(cfg, Deps{Ctl: ctlB, Store: stB}, "newproj", "/w/newproj", f.seed(env))
 
@@ -236,7 +240,7 @@ func TestZoxideSnapshotDoesNotMutateCache(t *testing.T) {
 
 	// Drop the "current session" row exactly the way the real pipeline does.
 	bySrc := map[Source][]Item{src: first}
-	applyRankMeta(bySrc, nil, Context{Session: "current", Path: "/cur", Now: 1})
+	applyRankMeta(bySrc, nil, Context{Session: "current", Path: "/cur", Identity: mod.EntityIdentity{ProjectPath: "/cur"}, Now: 1})
 	if got := len(bySrc[src]); got != 2 {
 		t.Fatalf("after applyRankMeta = %d items, want 2", got)
 	}
@@ -406,6 +410,7 @@ func seedFromResponse(resp daemon.Response, sessID string) Seed {
 	env := Context{Pairs: resp.Pairs, Transitions: resp.Transitions, Usage: resp.Usage, Now: time.Now().Unix()}
 	if cur, ok := tmux.FindByID(resp.Sessions, sessID); ok {
 		env.Session, env.Path = cur.Name, cur.Path
+		env.Identity = mod.EntityIdentity{LogicalID: cur.LogicalID, ServerKey: cur.ServerKey, RuntimeID: cur.ID, ProjectPath: cur.Path}
 	}
 	return Seed{
 		Sessions:    resp.Sessions,
@@ -474,7 +479,9 @@ func TestDualModeParityMatrix(t *testing.T) {
 		},
 		{
 			name: "inside_tmux_drops_current_session_and_path",
-			edit: func(*testing.T, *fixture) parityInputs {
+			edit: func(_ *testing.T, f *fixture) parityInputs {
+				f.presets = append(f.presets, store.PresetMeta{Name: "alpha-old", Cwd: "/w/alpha-old", LogicalID: "logical-alpha", LastUsed: 1200})
+				f.presets = append(f.presets, store.PresetMeta{Name: "alpha", Cwd: "/w/alpha", LastUsed: 1100})
 				return parityInputs{
 					sessID: "$0", session: "alpha", path: "/w/alpha",
 					pairs:       map[string]int64{"beta": 500, "gamma": 200},
@@ -486,7 +493,7 @@ func TestDualModeParityMatrix(t *testing.T) {
 				// the drop; assert the rule itself in each mode.
 				for label, m := range map[string]model{"local": local, "seeded": seeded} {
 					for _, it := range m.ui.items {
-						if it.Name == in.session || normPath(it.Path) == normPath(in.path) {
+						if it.Name == in.session || normPath(it.Path) == normPath(in.path) || it.Identity.LogicalID == "logical-alpha" {
 							t.Errorf("%s: current-session row leaked into the list: %+v", label, it)
 						}
 					}
@@ -599,7 +606,7 @@ func TestDualModeParityMatrix(t *testing.T) {
 				_ = in
 				for label, m := range map[string]model{"local": local, "seeded": seeded} {
 					keys := itemKeys(m.ui.items)
-					if len(keys) != 1 || keys[0] != "alpha" {
+					if len(keys) != 1 || m.ui.items[0].Name != "alpha" {
 						t.Errorf("%s: multi-token AND yielded %v, want [alpha]", label, keys)
 					}
 				}

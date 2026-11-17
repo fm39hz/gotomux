@@ -10,6 +10,7 @@ import (
 
 	tea "charm.land/bubbletea/v2"
 
+	mod "github.com/fm39hz/gotomux/internal/model"
 	"github.com/fm39hz/gotomux/internal/store"
 	"github.com/fm39hz/gotomux/internal/tmux"
 	"github.com/fm39hz/gotomux/internal/toolclass"
@@ -117,18 +118,20 @@ func (s *createSource) Snapshot() []Item {
 	if s.name == "" {
 		return nil
 	}
+	projectTarget := mod.EntityIdentity{ProjectPath: s.cwd}
 	for _, ls := range s.live {
-		if ls.Name == s.name {
+		if projectTarget.SameProject(mod.EntityIdentity{LogicalID: ls.LogicalID, ServerKey: ls.ServerKey, RuntimeID: ls.ID, ProjectPath: ls.Path}) {
 			return nil
 		}
 	}
 	return []Item{{
-		Kind:    KindCreate,
-		Title:   fmt.Sprintf("[Create] %s", s.name),
-		Desc:    s.cwd,
-		Name:    s.name,
-		Path:    s.cwd,
-		Recency: time.Now().Unix(),
+		Kind:     KindCreate,
+		Title:    fmt.Sprintf("[Create] %s", s.name),
+		Desc:     s.cwd,
+		Name:     s.name,
+		Path:     s.cwd,
+		Identity: projectTarget,
+		Recency:  time.Now().Unix(),
 	}}
 }
 
@@ -158,6 +161,7 @@ func (s *tmuxSource) Snapshot() []Item {
 			Desc:      badgeFromBusy(busy),
 			Name:      ls.Name,
 			Path:      ls.Path,
+			Identity:  mod.EntityIdentity{LogicalID: ls.LogicalID, ServerKey: ls.ServerKey, RuntimeID: ls.ID, ProjectPath: ls.Path},
 			RuntimeID: ls.ID,
 			ServerKey: ls.ServerKey,
 			Windows:   ls.Windows,
@@ -195,12 +199,13 @@ func (s *presetSource) Snapshot() []Item {
 	out := make([]Item, 0, len(meta))
 	for _, m := range meta {
 		out = append(out, Item{
-			Kind:    KindPreset,
-			Title:   fmt.Sprintf("[Preset] %s", m.Name),
-			Desc:    "saved preset",
-			Name:    m.Name,
-			Path:    m.Cwd,
-			Recency: m.LastUsed,
+			Kind:     KindPreset,
+			Title:    fmt.Sprintf("[Preset] %s", m.Name),
+			Desc:     "saved preset",
+			Name:     m.Name,
+			Path:     m.Cwd,
+			Identity: mod.EntityIdentity{LogicalID: m.LogicalID},
+			Recency:  m.LastUsed,
 		})
 	}
 	return out
@@ -319,6 +324,17 @@ func flattenSources(order []Source, bySrc map[Source][]Item, query string) []Ite
 	q := query != ""
 	var out []Item
 	positions := map[string]int{}
+	// Project navigation resolves an existing live session or saved recipe
+	// before creating anything. Suppress that redundant navigation action while
+	// retaining every independently identified session and recipe.
+	coveredProjects := map[string]bool{}
+	for _, items := range bySrc {
+		for _, item := range items {
+			if (item.Kind == KindActive || item.Kind == KindPreset) && item.Path != "" {
+				coveredProjects[item.Host+"\x00"+normPath(item.Path)] = true
+			}
+		}
+	}
 	for _, s := range order {
 		items := bySrc[s]
 		ff := s.FlattenFilter(query)
@@ -327,6 +343,9 @@ func flattenSources(order []Source, bySrc map[Source][]Item, query string) []Ite
 		// so ZoxideCap=40 yielded fewer than 40 zoxide rows for no stated reason.
 		kept := 0
 		for _, it := range items {
+			if (it.Kind == KindCreate || it.Kind == KindZoxide) && it.Path != "" && coveredProjects[it.Host+"\x00"+normPath(it.Path)] {
+				continue
+			}
 			if ff.Hide && q {
 				continue
 			}
@@ -334,9 +353,9 @@ func flattenSources(order []Source, bySrc map[Source][]Item, query string) []Ite
 				break
 			}
 			key := itemDedupKey(it)
-			if position, exists := positions[key]; exists {
-				if sourcePriority(it.Kind) < sourcePriority(out[position].Kind) {
-					out[position] = it
+			if pos, exists := positions[key]; exists {
+				if sourcePriority(it.Kind) < sourcePriority(out[pos].Kind) {
+					out[pos] = it
 					kept++
 				}
 				continue
@@ -350,15 +369,33 @@ func flattenSources(order []Source, bySrc map[Source][]Item, query string) []Ite
 }
 
 func itemDedupKey(item Item) string {
-	if path := normPath(item.Path); path != "" {
-		return "path:" + path
+	scope := item.Host + "\x00"
+	switch item.Kind {
+	case KindActive:
+		runtimeID, serverKey := item.Identity.RuntimeID, item.Identity.ServerKey
+		if runtimeID == "" {
+			runtimeID = item.RuntimeID
+		}
+		if serverKey == "" {
+			serverKey = item.ServerKey
+		}
+		if runtimeID != "" && serverKey != "" {
+			return scope + "live:" + serverKey + "\x00" + runtimeID
+		}
+		return scope + "live-name:" + item.Name
+	case KindPreset:
+		if item.Identity.LogicalID != "" {
+			return scope + "recipe:" + item.Identity.LogicalID
+		}
+		return scope + "recipe-name:" + item.Name
+	default:
+		if path := normPath(item.Path); path != "" {
+			return scope + "project:" + path
+		}
+		return scope + "project-name:" + item.Name
 	}
-	return fmt.Sprintf("name:%s", item.Name)
 }
 
-// Prefer the most actionable existing representation when multiple sources
-// describe the same normalized path. A saved preset must win over a generated
-// Create/Zoxide row so it remains selectable without showing duplicate rows.
 func sourcePriority(kind Kind) int {
 	switch kind {
 	case KindActive:
@@ -381,6 +418,14 @@ func applyRankMeta(bySrc map[Source][]Item, st store.Storer, ctx Context) {
 	} else if st != nil {
 		us, _ = st.AllUsage()
 	}
+	var active []mod.SessionCandidate
+	for _, items := range bySrc {
+		for _, it := range items {
+			if it.Kind == KindActive {
+				active = append(active, mod.SessionCandidate{Name: it.Name, Identity: it.Identity})
+			}
+		}
+	}
 
 	for key, items := range bySrc {
 		if len(us) > 0 {
@@ -388,20 +433,29 @@ func applyRankMeta(bySrc map[Source][]Item, st store.Storer, ctx Context) {
 		}
 		applyCooccur(items, ctx.Pairs)
 		applyTransitions(items, ctx.Transitions)
-		if ctx.HasSession() {
-			n := 0
-			for _, it := range items {
-				sameLive := it.Kind == KindActive && it.Name == ctx.Session
-				sameCreatePath := (it.Kind == KindCreate || it.Kind == KindZoxide) && ctx.Path != "" && normPath(it.Path) == normPath(ctx.Path)
-				if sameLive || sameCreatePath {
-					continue
-				}
-				items[n] = it
-				n++
+		n := 0
+		for _, it := range items {
+			if ctx.Identity.SameEntity(it.Identity) || presetShadowedByLive(it, active) {
+				continue
 			}
-			bySrc[key] = items[:n]
+			items[n] = it
+			n++
 		}
+		bySrc[key] = items[:n]
 	}
+}
+
+// A preset is an instantiation action. A live row with the same logical
+// identity already provides the corresponding attach action. A same-name live
+// session without a matching logical owner makes instantiation fail its
+// identity preflight, so that unusable preset action is omitted as well. Name
+// is used here only for tmux's namespace collision check, never to equate two
+// session identities.
+func presetShadowedByLive(item Item, active []mod.SessionCandidate) bool {
+	if item.Kind != KindPreset {
+		return false
+	}
+	return mod.ResolveSavedTarget(item.Name, item.Identity, active).Disposition != mod.TargetCreate
 }
 
 func mkBusy(cmd string) string {

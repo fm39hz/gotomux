@@ -22,6 +22,7 @@ import (
 	"github.com/fm39hz/gotomux/internal/config"
 	"github.com/fm39hz/gotomux/internal/daemon"
 	"github.com/fm39hz/gotomux/internal/event"
+	"github.com/fm39hz/gotomux/internal/model"
 	"github.com/fm39hz/gotomux/internal/picker"
 	"github.com/fm39hz/gotomux/internal/project"
 	"github.com/fm39hz/gotomux/internal/store"
@@ -239,6 +240,7 @@ func runPickerIPC(cfg *config.Config, conn net.Conn) error {
 	env := picker.Context{Pairs: resp.Pairs, Transitions: resp.Transitions, Usage: resp.Usage, Now: time.Now().Unix()}
 	if cur, ok := tmux.FindByID(resp.Sessions, tmux.CurrentSessionID()); ok {
 		env.Session, env.Path = cur.Name, cur.Path
+		env.Identity = model.EntityIdentity{LogicalID: cur.LogicalID, ServerKey: cur.ServerKey, RuntimeID: cur.ID, ProjectPath: cur.Path}
 	}
 
 	seed := picker.Seed{
@@ -279,27 +281,20 @@ func runPickerIPC(cfg *config.Config, conn net.Conn) error {
 	}
 	it := res.Item
 
-	// Record telemetry before connecting — outside tmux, Connect replaces this
-	// process with the interactive client.
-	// Prefer the daemon (it owns the store), but fall back to writing locally if
-	// the ack does not come back, so a daemon that dies mid-session cannot
-	// silently stop frecency from updating.
-	if !recordOpenViaDaemon(enc, dec, it.Name) {
-		recordOpen(st.get(), it.Name, liveNames(resp.Sessions))
-	}
-
 	switch it.Kind {
 	case picker.KindActive:
 		// No store needed: attaching to a live session touches nothing on disk.
-		return connectSelectedLive(ctl, it)
+		err := connectSelectedLive(ctl, it)
+		reportConnectResultViaDaemon(enc, dec, it, err)
+		return err
 	case picker.KindPreset:
-		p, e := st.get().Get(it.Name)
-		if e != nil {
-			return e
-		}
-		return template.ConnectPreset(ctl, st.get(), p)
+		err := connectStoredRecipe(ctl, st.get(), it)
+		reportConnectResultViaDaemon(enc, dec, it, err)
+		return err
 	default:
-		return template.ConnectProject(ctl, st.get(), it.Name, it.Path)
+		err := template.ConnectProject(ctl, st.get(), it.Name, it.Path)
+		reportConnectResultViaDaemon(enc, dec, it, err)
+		return err
 	}
 }
 
@@ -337,18 +332,20 @@ func (h *storeHandle) close() {
 
 // recordOpenViaDaemon asks the daemon to record the open. Reports whether it
 // acknowledged; a false return means the caller must record locally.
-func recordOpenViaDaemon(enc *json.Encoder, dec *json.Decoder, name string) bool {
-	if name == "" {
-		return false
+func reportConnectResultViaDaemon(enc *json.Encoder, dec *json.Decoder, item picker.Item, connectErr error) {
+	if item.RuntimeID == "" || item.ServerKey == "" {
+		return
 	}
-	if enc.Encode(daemon.Request{Cmd: "connect", Name: name}) != nil {
-		return false
+	request := daemon.Request{Cmd: "connect-result", Name: item.Name, RuntimeID: item.RuntimeID, ServerKey: item.ServerKey, Outcome: "succeeded"}
+	if connectErr != nil {
+		request.Outcome = "failed"
+		request.Error = connectErr.Error()
+	}
+	if enc.Encode(request) != nil {
+		return
 	}
 	var ack daemon.Response
-	if decodeWithTimeout(dec, &ack) != nil {
-		return false
-	}
-	return ack.OK
+	_ = decodeWithTimeout(dec, &ack)
 }
 
 // usablePayload decides whether a daemon response may be trusted instead of
@@ -361,6 +358,13 @@ func recordOpenViaDaemon(enc *json.Encoder, dec *json.Decoder, name string) bool
 func usablePayload(cfg *config.Config, resp daemon.Response) bool {
 	if !resp.OK || !resp.Ready {
 		return false
+	}
+	// An older daemon may serve display rows without targetable runtime
+	// metadata. Reject that payload before painting and use standalone data.
+	for _, session := range resp.Sessions {
+		if session.ID == "" || session.ServerKey == "" {
+			return false
+		}
 	}
 	maxAge := 30 * time.Second
 	if cfg != nil && cfg.PollInterval > 0 {
@@ -485,33 +489,45 @@ func profileRun(cfg *config.Config) error {
 
 func connectItem(ctl tmux.Connector, st store.Storer, res picker.Result) error {
 	it := res.Item
-	recordOpen(st, it.Name, res.Live)
+	var err error
 	switch it.Kind {
 	case picker.KindCreate, picker.KindZoxide:
-		return template.ConnectProject(ctl, st, it.Name, it.Path)
+		err = template.ConnectProject(ctl, st, it.Name, it.Path)
 	case picker.KindActive:
-		return connectSelectedLive(ctl, it)
+		err = connectSelectedLive(ctl, it)
 	case picker.KindPreset:
 		if st == nil {
 			return fmt.Errorf("connect preset: nil store")
 		}
-		p, e := st.Get(it.Name)
-		if e != nil {
-			return e
-		}
-		return template.ConnectPreset(ctl, st, p)
+		err = connectStoredRecipe(ctl, st, it)
 	default:
 		return fmt.Errorf("unknown kind %v", it.Kind)
 	}
+	if err == nil {
+		recordOpen(st, it.Name, res.Live)
+	}
+	return err
+}
+
+func connectStoredRecipe(ctl tmux.Connector, st store.Storer, selected picker.Item) error {
+	if st == nil {
+		return fmt.Errorf("connect preset: nil store")
+	}
+	recipe, err := st.GetRecipe(selected.Name)
+	if err != nil {
+		return err
+	}
+	if selected.Identity.LogicalID != recipe.LogicalID {
+		return fmt.Errorf("preset %q identity changed since selection; refresh the picker", selected.Name)
+	}
+	return template.ConnectRecipe(ctl, st, recipe)
 }
 
 func connectSelectedLive(ctl tmux.Connector, item picker.Item) error {
 	if item.RuntimeID == "" || item.ServerKey == "" {
 		return fmt.Errorf("live session %q has no observed runtime identity; refresh the picker", item.Name)
 	}
-	connector, ok := ctl.(interface {
-		ConnectObserved(context.Context, string, string) error
-	})
+	connector, ok := ctl.(tmux.ObservedConnector)
 	if !ok {
 		return fmt.Errorf("tmux adapter cannot connect by observed session identity")
 	}

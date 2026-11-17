@@ -33,16 +33,63 @@ func (s *Store) SaveBaseline(sess *model.Session) error {
 	if err := saveBaselineTx(tx, sess, false); err != nil {
 		return err
 	}
+	return tx.Commit()
+}
+
+// SaveInitialBaseline binds a legacy recipe only when the first verified
+// instantiation creates its baseline, in one transaction. Later baseline
+// refreshes never rewrite or reinterpret the independent recipe.
+func (s *Store) SaveInitialBaseline(sess *model.Session) error {
+	if sess == nil {
+		return fmt.Errorf("save initial baseline: nil session")
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if err := saveBaselineTx(tx, sess, false); err != nil {
+		return err
+	}
 	if err := bindPresetIdentityTx(tx, sess); err != nil {
-		return fmt.Errorf("save baseline preset identity: %w", err)
+		return fmt.Errorf("bind initial recipe identity: %w", err)
 	}
 	return tx.Commit()
+}
+
+func (s *Store) GetBaselineState(name string) (*model.Baseline, error) {
+	session, err := s.GetBaseline(name)
+	if err != nil || session == nil {
+		return nil, err
+	}
+	state := model.BaselineFromSession(*session)
+	return &state, nil
+}
+
+func (s *Store) GetBaselineStateByLogicalID(id string) (*model.Baseline, error) {
+	session, err := s.GetBaselineByLogicalID(id)
+	if err != nil || session == nil {
+		return nil, err
+	}
+	state := model.BaselineFromSession(*session)
+	return &state, nil
+}
+
+func (s *Store) SaveBaselineState(state model.Baseline) error {
+	session := state.Session()
+	return s.SaveBaseline(&session)
 }
 
 func saveBaselineTx(tx *sql.Tx, sess *model.Session, allowSessionReplacement bool) error {
 	if sess == nil {
 		return fmt.Errorf("save baseline: nil session")
 	}
+	return saveBaselineContractTx(tx, model.BaselineFromSession(*sess), allowSessionReplacement)
+}
+
+func saveBaselineContractTx(tx *sql.Tx, baseline model.Baseline, allowSessionReplacement bool) error {
+	session := baseline.Session()
+	sess := &session
 	if sess.Name == "" {
 		return fmt.Errorf("save baseline: empty session name")
 	}
@@ -152,17 +199,21 @@ func validateBaselineIdentityTree(session model.Session) error {
 // GetBaseline returns the recorded baseline for a session, or (nil, nil) when
 // none has been recorded yet.
 func (s *Store) GetBaseline(name string) (*model.Session, error) {
-	body, err := s.q.BaselineByName(storeContext, name)
+	row, err := s.q.BaselineByName(storeContext, name)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
 	if err != nil {
 		return nil, fmt.Errorf("get baseline: %w", err)
 	}
-	var sess model.Session
-	if err := json.Unmarshal([]byte(body), &sess); err != nil {
-		return nil, fmt.Errorf("get baseline: corrupt baseline for %q: %w", name, err)
+	sess, err := decodeBaselineEnvelope(row.Body, row.LogicalID)
+	if err != nil {
+		return nil, fmt.Errorf("get baseline %q: %w", name, err)
 	}
+	if sess.Name != name {
+		return nil, fmt.Errorf("get baseline: stored name disagrees for %q", name)
+	}
+
 	if err := normalizeBaselineLayouts(&sess); err != nil {
 		return nil, fmt.Errorf("get baseline: invalid layout binding for %q: %w", name, err)
 	}
@@ -173,17 +224,21 @@ func (s *Store) GetBaselineByLogicalID(id string) (*model.Session, error) {
 	if id == "" {
 		return nil, nil
 	}
-	body, err := s.q.BaselineByLogicalID(storeContext, id)
+	row, err := s.q.BaselineByLogicalID(storeContext, id)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
 	if err != nil {
 		return nil, fmt.Errorf("get baseline by logical ID: %w", err)
 	}
-	var sess model.Session
-	if err := json.Unmarshal([]byte(body), &sess); err != nil {
-		return nil, fmt.Errorf("get baseline by logical ID: corrupt body: %w", err)
+	sess, err := decodeBaselineEnvelope(row.Body, row.LogicalID)
+	if err != nil {
+		return nil, fmt.Errorf("get baseline by logical ID: %w", err)
 	}
+	if row.LogicalID != id {
+		return nil, fmt.Errorf("get baseline: lookup identity disagrees")
+	}
+
 	if err := normalizeBaselineLayouts(&sess); err != nil {
 		return nil, fmt.Errorf("get baseline by logical ID: invalid layout binding: %w", err)
 	}
@@ -225,4 +280,20 @@ func normalizeBaselineLayouts(sess *model.Session) error {
 		window.Layout = layout
 	}
 	return nil
+}
+
+// decodeBaselineEnvelope normalizes the persisted baseline envelope once for
+// every repository path, including transactional recipe revision.
+func decodeBaselineEnvelope(body, logicalID string) (model.Session, error) {
+	var session model.Session
+	if err := json.Unmarshal([]byte(body), &session); err != nil {
+		return session, fmt.Errorf("corrupt baseline body: %w", err)
+	}
+	if session.LogicalID == "" {
+		session.LogicalID = logicalID
+	}
+	if session.LogicalID != logicalID {
+		return session, fmt.Errorf("baseline envelope/body identity mismatch")
+	}
+	return session, nil
 }

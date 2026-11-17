@@ -397,7 +397,7 @@ func (c *Ctl) ensureOperationID(ctx context.Context, kind IdentityKind, runtimeI
 	return nil
 }
 
-func findWindowForOperation(snapshot *model.Snapshot, stableID, operationID, temporaryName string) string {
+func findWindowForOperation(snapshot *model.Snapshot, stableID, operationID, _ string) string {
 	if snapshot == nil {
 		return ""
 	}
@@ -410,11 +410,6 @@ func findWindowForOperation(snapshot *model.Snapshot, stableID, operationID, tem
 		}
 		if stableID != "" && object.SlotID == stableID {
 			return object.RuntimeID
-		}
-	}
-	for _, window := range snapshot.Target.Windows {
-		if window.Name == temporaryName {
-			return window.TmuxID
 		}
 	}
 	return ""

@@ -9,13 +9,14 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"syscall"
 
 	"github.com/fm39hz/gotomux/internal/classify"
 	"github.com/fm39hz/gotomux/internal/model"
 	"github.com/fm39hz/gotomux/internal/project"
 	"github.com/fm39hz/gotomux/internal/tmuxlayout"
 	"github.com/fm39hz/gotomux/internal/toolclass"
+	"github.com/junegunn/go-shellwords"
+	gotmux "github.com/zigai/gotmux/tmux"
 )
 
 func IsNamedLayout(s string) bool           { return tmuxlayout.IsNamed(s) }
@@ -67,24 +68,8 @@ func New() (*Ctl, error) {
 	return &Ctl{}, nil
 }
 
-func tmuxCmd(ctx context.Context, args ...string) (string, error) {
-	out, err := exec.CommandContext(ctx, "tmux", args...).Output()
-	if err != nil {
-		return "", fmt.Errorf("tmux %s: %w", strings.Join(args, " "), err)
-	}
-	return strings.TrimSuffix(strings.TrimRight(string(out), "\n"), "\n"), nil
-}
-
-func tmuxRun(ctx context.Context, args ...string) error {
-	cmd := exec.CommandContext(ctx, "tmux", args...)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("tmux %s: %w (%s)", strings.Join(args, " "), err, strings.TrimSpace(string(out)))
-	}
-	return nil
-}
-
 const (
-	ListSessFmt  = "S\t#{session_id}\t#{session_name}\t#{session_windows}\t#{session_path}\t#{session_last_attached}\t#{session_activity}\t#{session_created}\t#{session_attached}\t#{socket_path}\t#{pid}"
+	ListSessFmt  = "S\t#{session_id}\t#{session_name}\t#{session_windows}\t#{session_path}\t#{session_last_attached}\t#{session_activity}\t#{session_created}\t#{session_attached}\t#{socket_path}\t#{pid}\t#{start_time}\t#{@gotomux_session_id_v1}"
 	ListPanesFmt = "P\t#{session_name}\t#{pane_current_command}\t#{?pane_active,1,0}\t#{?pane_dead,1,0}"
 )
 
@@ -93,18 +78,20 @@ type LiveSession struct {
 	// which session it is running inside from $TMUX alone, without forking tmux:
 	// $TMUX is "<socket>,<serverpid>,<session index>" and the index matches
 	// #{session_id} minus the '$'.
-	ID           string `json:"id,omitempty"`
-	ServerKey    string `json:"server_key,omitempty"`
-	SocketPath   string `json:"socket_path,omitempty"`
-	ServerPID    string `json:"server_pid,omitempty"`
-	Name         string `json:"name"`
-	Windows      int    `json:"windows,omitempty"`
-	Path         string `json:"path,omitempty"`
-	LastAttached int64  `json:"last_attached,omitempty"`
-	Activity     int64  `json:"activity,omitempty"`
-	Created      int64  `json:"created,omitempty"`
-	Attached     int    `json:"attached,omitempty"`
-	ActiveCmd    string `json:"active_cmd,omitempty"`
+	ID            string `json:"id,omitempty"`
+	ServerKey     string `json:"server_key,omitempty"`
+	LogicalID     string `json:"logical_id,omitempty"`
+	SocketPath    string `json:"socket_path,omitempty"`
+	ServerPID     string `json:"server_pid,omitempty"`
+	ServerStarted string `json:"server_started,omitempty"`
+	Name          string `json:"name"`
+	Windows       int    `json:"windows,omitempty"`
+	Path          string `json:"path,omitempty"`
+	LastAttached  int64  `json:"last_attached,omitempty"`
+	Activity      int64  `json:"activity,omitempty"`
+	Created       int64  `json:"created,omitempty"`
+	Attached      int    `json:"attached,omitempty"`
+	ActiveCmd     string `json:"active_cmd,omitempty"`
 }
 
 // SessionIDFromEnv extracts the current session id from a $TMUX value, or "" when
@@ -147,12 +134,10 @@ func FindByID(sessions []LiveSession, id string) (LiveSession, bool) {
 // daemon's own control session is dropped here so every exec-path consumer
 // (picker sources, freeze pick list) inherits the filtering.
 func (c *Ctl) ListLive(ctx context.Context) ([]LiveSession, error) {
-	out, err := exec.CommandContext(
-		ctx, "tmux",
-		"list-sessions", "-F", ListSessFmt,
-		";",
-		"list-panes", "-s", "-F", ListPanesFmt,
-	).Output()
+	out, err := tmuxSequenceOutput(ctx,
+		[]string{"list-sessions", "-F", ListSessFmt},
+		[]string{"list-panes", "-s", "-F", ListPanesFmt},
+	)
 	if err != nil {
 		if IsNoServerError(err) {
 			return nil, nil
@@ -163,7 +148,7 @@ func (c *Ctl) ListLive(ctx context.Context) ([]LiveSession, error) {
 	if len(live) == 0 {
 		return live, nil
 	}
-	serverKey := ServerKeyFromSocket(live[0].SocketPath, live[0].ServerPID)
+	serverKey := ServerKeyFromMetadata(live[0].SocketPath, live[0].ServerPID, live[0].ServerStarted)
 	if serverKey == "" {
 		serverKey = tmuxServerKey(ctx, live[0].Name)
 	}
@@ -183,12 +168,12 @@ func WithServerGeneration(sessions []LiveSession) []LiveSession {
 	if len(sessions) == 0 {
 		return sessions
 	}
-	serverKey := ServerKeyFromSocket(sessions[0].SocketPath, sessions[0].ServerPID)
+	serverKey := ServerKeyFromMetadata(sessions[0].SocketPath, sessions[0].ServerPID, sessions[0].ServerStarted)
 	if serverKey == "" {
 		return nil
 	}
 	for i := range sessions {
-		if sessions[i].SocketPath != sessions[0].SocketPath || sessions[i].ServerPID != sessions[0].ServerPID {
+		if sessions[i].SocketPath != sessions[0].SocketPath || sessions[i].ServerPID != sessions[0].ServerPID || sessions[i].ServerStarted != sessions[0].ServerStarted {
 			return nil
 		}
 		sessions[i].ServerKey = serverKey
@@ -232,6 +217,14 @@ func ParseLiveOutput(out string) []LiveSession {
 			if len(fields) >= 10 {
 				live := byName[name]
 				live.SocketPath, live.ServerPID = fields[8], fields[9]
+				if len(fields) >= 11 {
+					live.ServerStarted = fields[10]
+				}
+				byName[name] = live
+			}
+			if len(fields) >= 12 {
+				live := byName[name]
+				live.LogicalID = fields[11]
 				byName[name] = live
 			}
 			if !orderSeen[name] {
@@ -295,7 +288,8 @@ func parseUnix(s string) int64 {
 }
 
 func (c *Ctl) Has(ctx context.Context, name string) bool {
-	return exec.CommandContext(ctx, "tmux", "has-session", "-t", name).Run() == nil
+	_, err := tmuxCmd(ctx, "has-session", "-t", name)
+	return err == nil
 }
 
 func (c *Ctl) CurrentSession(ctx context.Context) string {
@@ -348,26 +342,7 @@ func (c *Ctl) Kill(ctx context.Context, name string) error {
 
 // runChain: one tmux client process, commands separated by "\;".
 func (c *Ctl) runChain(ctx context.Context, parts ...[]string) error {
-	var args []string
-	first := true
-	for _, p := range parts {
-		if len(p) == 0 {
-			continue
-		}
-		if !first {
-			args = append(args, ";")
-		}
-		first = false
-		args = append(args, p...)
-	}
-	if len(args) == 0 {
-		return nil
-	}
-	cmd := exec.CommandContext(ctx, "tmux", args...)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("tmux chain: %w (%s)", err, strings.TrimSpace(string(out)))
-	}
-	return nil
+	return tmuxRunChain(ctx, parts...)
 }
 
 const freezeFmt = "#{window_index}\t#{window_name}\t#{window_layout}\t#{pane_index}\t#{pane_current_path}\t#{pane_current_command}\t#{pane_start_command}\t#{pane_pid}\t#{pane_active}\t#{session_path}\t#{session_id}\t#{@gotomux_session_id_v1}\t#{window_id}\t#{@gotomux_window_slot_v1}\t#{pane_id}\t#{@gotomux_pane_slot_v1}\t#{socket_path}\t#{pid}"
@@ -522,24 +497,7 @@ func (c *Ctl) Freeze(ctx context.Context, name string) (*model.Session, error) {
 }
 
 func tmuxServerKey(ctx context.Context, session string) string {
-	identity, err := tmuxCmd(ctx, "display-message", "-p", "-t", "="+session, "#{socket_path}\t#{pid}")
-	if err != nil || identity == "" {
-		return ""
-	}
-	parts := strings.SplitN(identity, "\t", 2)
-	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
-		return ""
-	}
-	socket, serverPID := parts[0], parts[1]
-	info, err := os.Stat(socket)
-	if err != nil {
-		return ""
-	}
-	stat, ok := info.Sys().(*syscall.Stat_t)
-	if !ok {
-		return ""
-	}
-	return fmt.Sprintf("%s:%s:%d:%d:%d:%d", socket, serverPID, stat.Dev, stat.Ino, stat.Ctim.Sec, stat.Ctim.Nsec)
+	return tmuxServerKeyTarget(ctx, "="+session)
 }
 
 func (c *Ctl) Load(ctx context.Context, sess *model.Session) error {
@@ -547,7 +505,7 @@ func (c *Ctl) Load(ctx context.Context, sess *model.Session) error {
 		return fmt.Errorf("invalid session name %q", sess.Name)
 	}
 	if c.Has(ctx, sess.Name) {
-		return nil
+		return fmt.Errorf("load %q: session already exists; resolve and attach it explicitly", sess.Name)
 	}
 
 	sessCwd := sess.Cwd
@@ -559,15 +517,7 @@ func (c *Ctl) Load(ctx context.Context, sess *model.Session) error {
 		}
 	}
 	base := c.windowBaseIndex(ctx)
-
 	wins := normalizeWindows(sess.Windows, sessCwd)
-	var parts [][]string
-
-	appendWin := func(i int, w model.Window, create []string) {
-		parts = append(parts, create)
-		parts = append(parts, windowBodyParts(windowTarget(sess.Name, base+i), sess.Name, w)...)
-	}
-
 	w0, p0 := wins[0], wins[0].Panes[0]
 	ns := []string{"new-session", "-d", "-s", sess.Name, "-c", p0.Cwd, "-P", "-F", "#{session_id}"}
 	if safe := safeWindowName(w0.Name, sess.Name); safe != "" {
@@ -576,21 +526,7 @@ func (c *Ctl) Load(ctx context.Context, sess *model.Session) error {
 	if cmd := paneCmd(p0); cmd != "" {
 		ns = append(ns, cmdArgs(cmd)...)
 	}
-	appendWin(0, w0, ns)
-
-	for i, w := range wins[1:] {
-		pn := w.Panes[0]
-		nw := []string{"new-window", "-t", sessionTarget(sess.Name), "-d", "-c", pn.Cwd}
-		if safe := safeWindowName(w.Name, sess.Name); safe != "" {
-			nw = append(nw, "-n", safe)
-		}
-		if cmd := paneCmd(pn); cmd != "" {
-			nw = append(nw, cmdArgs(cmd)...)
-		}
-		appendWin(i+1, w, nw)
-	}
-
-	createdID, err := tmuxCmd(ctx, parts[0]...)
+	createdID, err := tmuxCmd(ctx, ns...)
 	if err != nil {
 		return fmt.Errorf("load %q: create session: %w", sess.Name, err)
 	}
@@ -602,33 +538,82 @@ func (c *Ctl) Load(ctx context.Context, sess *model.Session) error {
 	if createdServerKey == "" {
 		return fmt.Errorf("load %q: created session %s has no verified server generation; left in place for inspection", sess.Name, createdID)
 	}
-	remaining := bindSessionTargets(parts[1:], sess.Name, createdID)
-	remaining = append(remaining, []string{"select-window", "-t", fmt.Sprintf("%s:%d", createdID, base)})
-	if err := c.runChain(ctx, remaining...); err != nil {
-		// Roll back only the exact session returned by new-session, and only
-		// while it still belongs to the server generation observed at creation.
+	sess.ServerKey = createdServerKey
+	cleanup := func(cause error) error {
 		if tmuxServerKeyTarget(ctx, createdID) == createdServerKey {
 			_ = tmuxRun(ctx, "kill-session", "-t", createdID)
 		}
-		return fmt.Errorf("load %q (created session %s): %w", sess.Name, createdID, err)
+		return fmt.Errorf("load %q (created session %s): %w", sess.Name, createdID, cause)
 	}
-	return nil
-}
-
-func bindSessionTargets(commands [][]string, name, runtimeID string) [][]string {
-	from := "=" + name
-	out := make([][]string, len(commands))
-	for i, command := range commands {
-		out[i] = append([]string(nil), command...)
-		for j := 0; j+1 < len(out[i]); j++ {
-			if out[i][j] != "-t" || !strings.HasPrefix(out[i][j+1], from) {
-				continue
+	for i := range wins {
+		window := &wins[i]
+		if i == 0 {
+			rows, err := tmuxCmd(ctx, "list-windows", "-t", createdID, "-F", "#{window_id}")
+			if err != nil {
+				return cleanup(fmt.Errorf("resolve initial window receipt: %w", err))
 			}
-			target := out[i][j+1]
-			out[i][j+1] = runtimeID + strings.TrimPrefix(target, from)
+			window.TmuxID = strings.TrimSpace(strings.Split(rows, "\n")[0])
+		} else {
+			pane := window.Panes[0]
+			args := []string{"new-window", "-d", "-P", "-F", "#{window_id}", "-t", fmt.Sprintf("%s:%d", createdID, base+i), "-c", pane.Cwd}
+			if safe := safeWindowName(window.Name, sess.Name); safe != "" {
+				args = append(args, "-n", safe)
+			}
+			if cmd := paneCmd(pane); cmd != "" {
+				args = append(args, cmdArgs(cmd)...)
+			}
+			id, err := tmuxCmd(ctx, args...)
+			if err != nil {
+				return cleanup(fmt.Errorf("create window %d: %w", i, err))
+			}
+			window.TmuxID = strings.TrimSpace(id)
+		}
+		if !strings.HasPrefix(window.TmuxID, "@") {
+			return cleanup(fmt.Errorf("tmux returned invalid window receipt %q", window.TmuxID))
+		}
+		if err := tmuxRun(ctx, "set-option", "-w", "-t", window.TmuxID, "automatic-rename", "off"); err != nil {
+			return cleanup(err)
+		}
+		if safe := safeWindowName(window.Name, sess.Name); safe != "" {
+			if err := tmuxRun(ctx, "rename-window", "-t", window.TmuxID, safe); err != nil {
+				return cleanup(err)
+			}
+		}
+		paneID, err := tmuxCmd(ctx, "list-panes", "-t", window.TmuxID, "-F", "#{pane_id}")
+		if err != nil {
+			return cleanup(err)
+		}
+		window.Panes[0].TmuxID = strings.TrimSpace(strings.Split(paneID, "\n")[0])
+		for pi := 1; pi < len(window.Panes); pi++ {
+			pane := window.Panes[pi]
+			args := []string{"split-window", "-d", "-P", "-F", "#{pane_id}", "-t", window.TmuxID, "-h", "-c", pane.Cwd}
+			if cmd := paneCmd(pane); cmd != "" {
+				args = append(args, cmdArgs(cmd)...)
+			}
+			id, err := tmuxCmd(ctx, args...)
+			if err != nil {
+				return cleanup(fmt.Errorf("create pane %d in window %s: %w", pi, window.TmuxID, err))
+			}
+			window.Panes[pi].TmuxID = strings.TrimSpace(id)
+		}
+		if window.Layout != "" {
+			ids := map[int]string{}
+			indexes := map[int]int{}
+			for _, pane := range window.Panes {
+				ids[pane.Idx] = pane.TmuxID
+				indexes[pane.Idx] = pane.Idx
+			}
+			layout, err := tmuxlayout.RemapPaneBindingsByIndex(window.Layout, ids, indexes)
+			if err != nil {
+				return cleanup(err)
+			}
+			if err := tmuxRun(ctx, "select-layout", "-t", window.TmuxID, layout); err != nil {
+				return cleanup(err)
+			}
 		}
 	}
-	return out
+	sess.Windows = wins
+	return nil
 }
 
 func (c *Ctl) windowBaseIndex(ctx context.Context) int {
@@ -715,7 +700,12 @@ func cmdArgs(cmd string) []string {
 	if cmd == "" {
 		return nil
 	}
-	return strings.Fields(cmd)
+	parser := shellwords.NewParser()
+	args, err := parser.Parse(cmd)
+	if err != nil || parser.Position >= 0 {
+		return []string{cmd}
+	}
+	return args
 }
 
 // execAttach replaces gotomux with an interactive tmux client while suppressing
@@ -724,31 +714,24 @@ func cmdArgs(cmd string) []string {
 // prints "[detached ...]\n" separately on stdout. Redirecting stdout therefore
 // removes the receipt and its cursor-moving newline without touching TTY output.
 // Keep a close-on-exec copy so an exec failure can restore diagnostics.
-func execAttach(tmuxBin, name string) error {
+func execAttach(name string) error {
+	server, err := newTmuxServer()
+	if err != nil {
+		return err
+	}
 	devNull, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
 	if err != nil {
 		return err
 	}
 	defer devNull.Close()
-
-	savedStdout, err := syscall.Dup(int(os.Stdout.Fd()))
+	cmd, err := server.PrepareAttachTarget(context.Background(), name, gotmux.TerminalStreams{In: os.Stdin, Out: os.Stdout, Err: os.Stderr}, gotmux.AttachOptions{})
 	if err != nil {
 		return err
 	}
-	syscall.CloseOnExec(savedStdout)
-
-	if err := syscall.Dup2(int(devNull.Fd()), int(os.Stdout.Fd())); err != nil {
-		syscall.Close(savedStdout)
-		return err
-	}
-
-	execErr := syscall.Exec(tmuxBin, []string{"tmux", "attach-session", "-t", name}, os.Environ())
-	restoreErr := syscall.Dup2(savedStdout, int(os.Stdout.Fd()))
-	syscall.Close(savedStdout)
-	if execErr != nil {
-		return execErr
-	}
-	return restoreErr
+	// tmux renders through the terminal supplied on stdin. Stdout carries the
+	// detach receipt, so suppress it while preserving the terminal stream.
+	cmd.Stdout = devNull
+	return cmd.Run()
 }
 
 func (c *Ctl) Connect(ctx context.Context, name, cwd string) error {
@@ -775,11 +758,7 @@ func (c *Ctl) Connect(ctx context.Context, name, cwd string) error {
 	}
 	// Replace gotomux with the interactive client. Its stdout is suppressed by
 	// execAttach, while the server continues to render through stdin's TTY fd.
-	tmuxBin, err := exec.LookPath("tmux")
-	if err != nil {
-		return fmt.Errorf("tmux not found: %w", err)
-	}
-	if err := execAttach(tmuxBin, name); err != nil {
+	if err := execAttach(name); err != nil {
 		return fmt.Errorf("attach to %q: %w", name, err)
 	}
 	return nil
@@ -789,6 +768,22 @@ func (c *Ctl) Connect(ctx context.Context, name, cwd string) error {
 // server-scoped observation. It never creates a session and never resolves by
 // mutable session name.
 func (c *Ctl) ConnectObserved(ctx context.Context, runtimeID, serverKey string) error {
+	if err := c.ValidateObserved(ctx, runtimeID, serverKey); err != nil {
+		return err
+	}
+	if os.Getenv("TMUX") != "" {
+		// TMUX/TMUX_PANE identify the invoking client context. Let tmux resolve
+		// that client; gotomux supplies the exact, already validated runtime ID.
+		return switchObservedClient(ctx, runtimeID)
+	}
+	return execAttach(runtimeID)
+}
+
+func switchObservedClient(ctx context.Context, runtimeID string) error {
+	return tmuxRun(ctx, "switch-client", "-t", runtimeID)
+}
+
+func (c *Ctl) ValidateObserved(ctx context.Context, runtimeID, serverKey string) error {
 	if !strings.HasPrefix(runtimeID, "$") || serverKey == "" {
 		return fmt.Errorf("connect observed session: missing runtime identity or server generation")
 	}
@@ -800,42 +795,43 @@ func (c *Ctl) ConnectObserved(ctx context.Context, runtimeID, serverKey string) 
 	if err != nil || strings.TrimSpace(currentID) != runtimeID {
 		return fmt.Errorf("connect observed session %s: runtime identity is no longer present", runtimeID)
 	}
-	if os.Getenv("TMUX") != "" {
-		return tmuxRun(ctx, "switch-client", "-t", runtimeID)
-	}
-	tmuxBin, err := exec.LookPath("tmux")
-	if err != nil {
-		return fmt.Errorf("tmux not found: %w", err)
-	}
-	return execAttach(tmuxBin, runtimeID)
+	return nil
 }
 
 func tmuxServerKeyTarget(ctx context.Context, target string) string {
-	identity, err := tmuxCmd(ctx, "display-message", "-p", "-t", target, "#{socket_path}\t#{pid}")
+	identity, err := tmuxCmd(ctx, "display-message", "-p", "-t", target, "#{socket_path}	#{pid}	#{start_time}")
 	if err != nil || identity == "" {
 		return ""
 	}
-	parts := strings.SplitN(identity, "\t", 2)
-	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+	fields := strings.Split(identity, "	")
+	if len(fields) != 3 {
 		return ""
 	}
-	return ServerKeyFromSocket(parts[0], parts[1])
+	return ServerKeyFromMetadata(fields[0], fields[1], fields[2])
 }
 
-// ServerKeyFromSocket derives the same server-generation identity from the
-// tmux format fields included in list-sessions, without starting a client
-// subprocess. The daemon uses it on control-mode snapshots.
-func ServerKeyFromSocket(socket, serverPID string) string {
-	if socket == "" || serverPID == "" {
+// ServerKeyFromMetadata converts gotmux's verified server identity into the
+// stable cache key shared by standalone and control-mode observations.
+func ServerKeyFromMetadata(socket, serverPID, started string) string {
+	if socket == "" || serverPID == "" || started == "" {
 		return ""
 	}
-	info, err := os.Stat(socket)
-	if err != nil {
-		return ""
+	return strings.Join([]string{socket, serverPID, started}, ":")
+}
+
+func (c *Ctl) RemoveCreatedSession(ctx context.Context, runtimeID, serverKey string) error {
+	if err := validateIdentityTarget(IdentitySession, runtimeID); err != nil {
+		return err
 	}
-	stat, ok := info.Sys().(*syscall.Stat_t)
-	if !ok {
-		return ""
+	if serverKey == "" || tmuxServerKeyTarget(ctx, runtimeID) != serverKey {
+		return fmt.Errorf("created session server generation changed; refusing cleanup")
 	}
-	return fmt.Sprintf("%s:%s:%d:%d:%d:%d", socket, serverPID, stat.Dev, stat.Ino, stat.Ctim.Sec, stat.Ctim.Nsec)
+	return tmuxRun(ctx, "kill-session", "-t", runtimeID)
+}
+
+func (c *Ctl) KillObserved(ctx context.Context, runtimeID, serverKey string) error {
+	if err := c.ValidateObserved(ctx, runtimeID, serverKey); err != nil {
+		return err
+	}
+	return tmuxRun(ctx, "kill-session", "-t", runtimeID)
 }

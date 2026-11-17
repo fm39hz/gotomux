@@ -1,9 +1,11 @@
 package daemon
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"log"
 	"net"
 	"os"
 	"os/exec"
@@ -20,6 +22,25 @@ import (
 	"github.com/fm39hz/gotomux/internal/tmux"
 	"github.com/fm39hz/gotomux/internal/tmuxtest"
 )
+
+func TestConnectResultIPCLogsOutcomeAfterPickerSelection(t *testing.T) {
+	old := log.Writer()
+	var captured bytes.Buffer
+	log.SetOutput(&captured)
+	t.Cleanup(func() { log.SetOutput(old) })
+	d := &Daemon{}
+	var response bytes.Buffer
+	if err := d.serveRequest(json.NewEncoder(&response), Request{Cmd: "connect-result", Name: "work", RuntimeID: "$7", ServerKey: "socket:pid:start", Outcome: "failed", Error: "switch client rejected"}); err != nil {
+		t.Fatal(err)
+	}
+	var ack Response
+	if err := json.NewDecoder(&response).Decode(&ack); err != nil || !ack.OK {
+		t.Fatalf("ack=%+v err=%v", ack, err)
+	}
+	if !strings.Contains(captured.String(), "outcome=failed") || !strings.Contains(captured.String(), "runtime_id=$7") || !strings.Contains(captured.String(), "switch client rejected") {
+		t.Fatalf("connect result not diagnosable in daemon log: %s", captured.String())
+	}
+}
 
 // newIsolated builds a daemon against a private tmux server and a private data
 // dir, so nothing here can reach the developer's real server, store, socket or

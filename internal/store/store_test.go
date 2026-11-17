@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -54,6 +55,57 @@ func TestSaveOverwritesAliasAndCwd(t *testing.T) {
 		t.Fatalf("want 2 windows after overwrite, got %d", len(got.Windows))
 	}
 	_ = s.Delete("zz-test-alias")
+}
+
+func TestListMetaCarriesLogicalSessionIdentity(t *testing.T) {
+	s := isolatedStore(t)
+	want := "00000000-0000-4000-8000-000000000001"
+	legacy := &model.Session{
+		Name: "identity-meta", Cwd: "/work/identity-meta",
+		Windows: []model.Window{{Name: "shell", Cwd: "/work/identity-meta", Panes: []model.Pane{{Cwd: "/work/identity-meta", Cmd: "bash"}}}},
+	}
+	if err := s.Save(legacy); err != nil {
+		t.Fatal(err)
+	}
+	baseline := &model.Session{
+		Name: legacy.Name, Cwd: legacy.Cwd, LogicalID: want,
+		Windows: []model.Window{{Idx: 0, Name: "shell", Cwd: legacy.Cwd, SlotID: "00000000-0000-4000-8000-000000000002", Panes: []model.Pane{{Idx: 0, Cwd: legacy.Cwd, Cmd: "bash", SlotID: "00000000-0000-4000-8000-000000000003"}}}},
+	}
+	if err := s.SaveBaseline(baseline); err != nil {
+		t.Fatal(err)
+	}
+	// Simulate a legacy body that omitted logical_id while the normalized
+	// baseline column already owns the identity.
+	legacyBody := *baseline
+	legacyBody.LogicalID = ""
+	body, err := json.Marshal(&legacyBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.Exec(`UPDATE baseline SET body = ? WHERE name = ?`, string(body), legacy.Name); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := s.GetBaseline(legacy.Name)
+	if err != nil || loaded == nil || loaded.LogicalID != want {
+		t.Fatalf("legacy baseline identity = (%v, %v), want %q", loaded, err, want)
+	}
+	// Binding is allowed only after the complete stored recipe matches.
+	if _, err := s.NormalizeRecipeIdentity(model.RecipeFromSession(*legacy), model.RecipeFromSession(*baseline)); err != nil {
+		t.Fatalf("normalize exact legacy recipe identity: %v", err)
+	}
+	rows, err := s.ListMeta()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, row := range rows {
+		if row.Name == "identity-meta" {
+			if row.LogicalID != want {
+				t.Fatalf("ListMeta logical id = %q, want %q", row.LogicalID, want)
+			}
+			return
+		}
+	}
+	t.Fatal("ListMeta omitted the saved session")
 }
 
 func TestSessionAliasKey(t *testing.T) {
@@ -218,5 +270,20 @@ PRAGMA user_version = 7;`); err != nil {
 	var userVersion int
 	if err := st.db.QueryRow(`PRAGMA user_version`).Scan(&userVersion); err != nil || userVersion != schemaVersion {
 		t.Fatalf("user_version=%d err=%v, want %d", userVersion, err, schemaVersion)
+	}
+}
+
+func TestPresetRoundTripKeepsLaunchArguments(t *testing.T) {
+	st := isolatedStore(t)
+	recipe := &model.Session{Name: "launch-contract", Cwd: "/tmp", Windows: []model.Window{{Panes: []model.Pane{{Cmd: "sleep", CmdPath: "/usr/bin/sleep", StartCmd: "sleep 300"}}}}}
+	if err := st.Save(recipe); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := st.Get(recipe.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Windows[0].Panes[0].StartCmd != "sleep 300" {
+		t.Fatalf("launch command lost: %+v", loaded.Windows[0].Panes[0])
 	}
 }

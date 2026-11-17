@@ -110,7 +110,7 @@ func buildSnapshot(target *model.Session, serverKey, sessionRows, windowRows, pa
 	}
 
 	snapshot := &model.Snapshot{
-		ServerKey: serverKey, Complete: true, Target: *target,
+		ServerKey: serverKey, Complete: true, Target: model.ObserveSession(*target),
 		TargetSessionID: target.TmuxID, Memberships: memberships,
 	}
 	for _, ref := range sessions {

@@ -13,7 +13,7 @@ type Snapshot struct {
 	// Complete is true only after all server/session/window/pane references
 	// validate and the selected session remains stable through observation.
 	Complete        bool
-	Target          Session
+	Target          ObservedSession
 	TargetSessionID string
 	ActiveWindowID  string
 	// Sessions and Objects index logical/runtime identities server-wide.

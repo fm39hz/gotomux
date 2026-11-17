@@ -3,7 +3,6 @@ package reconcile
 import (
 	"fmt"
 	"sort"
-	"strings"
 
 	"github.com/fm39hz/gotomux/internal/identity"
 	"github.com/fm39hz/gotomux/internal/model"
@@ -13,7 +12,7 @@ import (
 // Resolve matches a desired baseline to a complete live snapshot. It performs
 // no I/O and never treats a name or index as sufficient identity evidence.
 func Resolve(desired DesiredState, live model.Snapshot) Resolution {
-	base := desired.Session
+	base := desired.Baseline
 	r := Resolution{Status: ResolutionReady, ServerKey: live.ServerKey}
 	if !live.Complete || live.ServerKey == "" || live.Target.ServerKey != live.ServerKey || live.TargetSessionID == "" || live.Target.TmuxID != live.TargetSessionID {
 		r.addConflict("session", nil, "live observation is incomplete or has inconsistent server/session identity")
@@ -36,9 +35,8 @@ func Resolve(desired DesiredState, live model.Snapshot) Resolution {
 	r.TargetSession = sessionMatch
 
 	baseSeenLogical, baseSeenRuntime := map[string]bool{}, map[string]bool{}
-	var semanticBase []int
 	usedLive := map[string]bool{}
-	for bi, bw := range base.Windows {
+	for bi, bw := range base.Desired.Windows {
 		if bw.SlotID != "" {
 			if baseSeenLogical[bw.SlotID] {
 				r.addConflict(windowLabel(bw), nil, "baseline repeats a window slot ID")
@@ -46,12 +44,13 @@ func Resolve(desired DesiredState, live model.Snapshot) Resolution {
 			}
 			baseSeenLogical[bw.SlotID] = true
 		}
-		if sameServer(&base, &live.Target) && bw.TmuxID != "" {
-			if baseSeenRuntime[bw.TmuxID] {
-				r.addConflict(windowLabel(bw), []string{bw.TmuxID}, "baseline repeats a runtime window ID in this server generation")
+		if sameServerGeneration(base.Bindings.ServerKey, live.ServerKey) && base.Bindings.Windows[bw.SlotID] != "" {
+			runtimeID := base.Bindings.Windows[bw.SlotID]
+			if baseSeenRuntime[runtimeID] {
+				r.addConflict(windowLabel(bw), []string{runtimeID}, "baseline repeats a runtime window ID in this server generation")
 				continue
 			}
-			baseSeenRuntime[bw.TmuxID] = true
+			baseSeenRuntime[runtimeID] = true
 		}
 		match, conflict, anchored := resolveWindowAnchor(base, live, bi, bw)
 		if conflict != nil {
@@ -81,84 +80,14 @@ func Resolve(desired DesiredState, live model.Snapshot) Resolution {
 			r.Windows = append(r.Windows, windowResolution)
 			continue
 		}
-		semanticBase = append(semanticBase, bi)
+		r.Missing = append(r.Missing, bi)
 	}
-
-	var semanticLive []model.Window
-	for _, lw := range live.Target.Windows {
-		if !usedLive[lw.TmuxID] && lw.SlotID == "" {
-			semanticLive = append(semanticLive, lw)
-		}
-	}
-	scores := make([][]scoreVector, len(semanticBase))
-	allowed := make([][]bool, len(semanticBase))
-	evidence := make([][]semanticEvidence, len(semanticBase))
-	for ri, bi := range semanticBase {
-		scores[ri] = make([]scoreVector, len(semanticLive))
-		allowed[ri] = make([]bool, len(semanticLive))
-		evidence[ri] = make([]semanticEvidence, len(semanticLive))
-		for li, lw := range semanticLive {
-			e := semanticWindowEvidence(&base, base.Windows[bi], &live.Target, lw)
-			scores[ri][li], allowed[ri][li], evidence[ri][li] = e.score, e.allowed, e
-		}
-	}
-	semanticUsed := map[string]bool{}
-	groupResolved := resolveEquivalentWindowGroup(&r, base, live, semanticBase, semanticLive, scores, allowed, evidence, semanticUsed)
-	if !groupResolved {
-		assignment, optimum := maxLexAssignment(scores, allowed)
-		ambiguousBase := map[int]bool{}
-		for ri, li := range assignment {
-			if li < 0 || li >= len(semanticLive) || !allowed[ri][li] {
-				continue
-			}
-			alternative := cloneAllowed(allowed)
-			alternative[ri][li] = false
-			_, alternativeScore := maxLexAssignment(scores, alternative)
-			if alternativeScore.equal(optimum) {
-				labels := semanticCandidates(evidence[ri], semanticLive)
-				r.Ambiguous = append(r.Ambiguous, Ambiguity{Baseline: windowLabel(base.Windows[semanticBase[ri]]), Live: labels, Reason: "multiple one-to-one semantic assignments have equal evidence", Evidence: evidence[ri][li].items})
-				ambiguousBase[semanticBase[ri]] = true
-				r.Missing = append(r.Missing, semanticBase[ri])
-				continue
-			}
-			lw := semanticLive[li]
-			semanticUsed[lw.TmuxID] = true
-			match := ObjectMatch{Kind: ObjectWindow, BaselineIndex: semanticBase[ri], BaselineIdentityID: base.Windows[semanticBase[ri]].SlotID, LiveIdentityID: lw.SlotID, BaselineRuntimeID: base.Windows[semanticBase[ri]].TmuxID, LiveRuntimeID: lw.TmuxID, Evidence: evidence[ri][li].items}
-			panes, paneAmbiguous, paneConflicts := resolvePanes(base, live, semanticBase[ri], lw)
-			r.Windows = append(r.Windows, WindowResolution{Match: match, Panes: panes})
-			r.Ambiguous = append(r.Ambiguous, paneAmbiguous...)
-			r.Conflicts = append(r.Conflicts, paneConflicts...)
-		}
-		for ri, bi := range semanticBase {
-			if ambiguousBase[bi] {
-				continue
-			}
-			if assignment[ri] >= 0 && assignment[ri] < len(semanticLive) && allowed[ri][assignment[ri]] {
-				continue
-			}
-			var plausible []string
-			var plausibleEvidence []Evidence
-			for li, e := range evidence[ri] {
-				if e.plausible {
-					plausible = append(plausible, windowLabel(semanticLive[li]))
-					plausibleEvidence = append(plausibleEvidence, e.items...)
-				}
-			}
-			if len(plausible) > 0 {
-				sort.Strings(plausible)
-				r.Ambiguous = append(r.Ambiguous, Ambiguity{Baseline: windowLabel(base.Windows[bi]), Live: uniqueStrings(plausible), Reason: "candidate evidence is insufficient for a safe identity match", Evidence: dedupeEvidence(plausibleEvidence)})
-				r.Missing = append(r.Missing, bi)
-				continue
-			}
-			r.Missing = append(r.Missing, bi)
+	for _, window := range live.Target.Windows {
+		if !usedLive[window.TmuxID] {
+			r.Extra = append(r.Extra, window.TmuxID)
 		}
 	}
 
-	for _, lw := range live.Target.Windows {
-		if !usedLive[lw.TmuxID] && !semanticUsed[lw.TmuxID] {
-			r.Extra = append(r.Extra, lw.TmuxID)
-		}
-	}
 	sort.Ints(r.Missing)
 	sort.Strings(r.Extra)
 	sort.Slice(r.Windows, func(i, j int) bool { return r.Windows[i].Match.BaselineIndex < r.Windows[j].Match.BaselineIndex })
@@ -175,30 +104,33 @@ func Resolve(desired DesiredState, live model.Snapshot) Resolution {
 	return r
 }
 
-func resolveSession(base model.Session, live model.Snapshot) (ObjectMatch, *Conflict) {
+func resolveSession(baseline model.Baseline, live model.Snapshot) (ObjectMatch, *Conflict) {
 	target := live.Target
-	match := ObjectMatch{Kind: ObjectSession, BaselineIndex: -1, BaselineIdentityID: base.LogicalID, LiveIdentityID: target.LogicalID, BaselineRuntimeID: base.TmuxID, LiveRuntimeID: target.TmuxID}
-	sameGeneration := base.ServerKey != "" && base.ServerKey == live.ServerKey
+	base := baseline.Desired
+	runtimeID := baseline.Bindings.SessionID
+	match := ObjectMatch{Kind: ObjectSession, BaselineIndex: -1, BaselineIdentityID: base.LogicalID, LiveIdentityID: target.LogicalID, BaselineRuntimeID: runtimeID, LiveRuntimeID: target.TmuxID}
+	sameGeneration := baseline.Bindings.ServerKey != "" && baseline.Bindings.ServerKey == live.ServerKey
 	if target.LogicalID != "" {
 		if base.LogicalID != target.LogicalID {
 			return ObjectMatch{}, &Conflict{Baseline: base.Name, Live: []string{target.Name}, Reason: "baseline and live session have different logical IDs"}
 		}
-		if sameGeneration && base.TmuxID != "" && target.TmuxID != base.TmuxID {
-			return ObjectMatch{}, &Conflict{Baseline: base.Name, Live: []string{target.TmuxID}, Reason: "logical session ID conflicts with runtime session ID in the same server generation"}
-		}
+		// A logical instance may be recreated while the tmux server survives.
+		// Cached runtime bindings do not veto a unique current logical owner;
+		// validateObjectIndex rejects duplicate live owners before this point.
 		match.Evidence = []Evidence{{Class: EvidenceLogical, Signal: "session-logical-id", Value: base.LogicalID}}
 		return match, nil
 	}
-	if sameGeneration && base.TmuxID != "" && base.TmuxID == target.TmuxID {
+	if sameGeneration && runtimeID != "" && runtimeID == target.TmuxID {
 		match.Evidence = []Evidence{{Class: EvidenceRuntime, Signal: "session-id", Value: target.TmuxID}}
 		return match, nil
 	}
 	return ObjectMatch{}, &Conflict{Baseline: base.Name, Live: []string{target.Name}, Reason: "session identity cannot be established from durable or same-generation runtime evidence"}
 }
 
-func resolveWindowAnchor(base model.Session, live model.Snapshot, index int, window model.Window) (ObjectMatch, *Conflict, bool) {
-	sameGeneration := sameServer(&base, &live.Target)
+func resolveWindowAnchor(base model.Baseline, live model.Snapshot, index int, window model.WindowSpec) (ObjectMatch, *Conflict, bool) {
+	sameGeneration := sameServerGeneration(base.Bindings.ServerKey, live.ServerKey)
 	var tagged, runtime *model.ObjectIdentity
+	runtimeID := base.Bindings.Windows[window.SlotID]
 	if window.SlotID != "" {
 		matches := objectsByStableID(live.Objects, ObjectWindow, window.SlotID)
 		if len(matches) > 1 {
@@ -208,149 +140,65 @@ func resolveWindowAnchor(base model.Session, live model.Snapshot, index int, win
 			tagged = matches[0]
 		}
 	}
-	if sameGeneration && window.TmuxID != "" {
-		runtime = objectByRuntimeID(live.Objects, ObjectWindow, window.TmuxID)
+	if sameGeneration && runtimeID != "" {
+		runtime = objectByRuntimeID(live.Objects, ObjectWindow, runtimeID)
 	}
 	if tagged != nil && runtime != nil && tagged.RuntimeID != runtime.RuntimeID {
 		return ObjectMatch{}, &Conflict{Baseline: windowLabel(window), Live: []string{tagged.RuntimeID, runtime.RuntimeID}, Reason: "window slot and runtime bindings identify different objects"}, false
 	}
 	if tagged != nil {
-		return windowObjectMatch(index, window, *tagged, live, Evidence{Class: EvidenceLogical, Signal: "window-slot-id", Value: window.SlotID}), nil, true
+		return windowObjectMatch(index, window, runtimeID, *tagged, live, Evidence{Class: EvidenceLogical, Signal: "window-slot-id", Value: window.SlotID}), nil, true
 	}
 	if runtime != nil {
 		if runtime.SlotID != "" && runtime.SlotID != window.SlotID {
 			return ObjectMatch{}, &Conflict{Baseline: windowLabel(window), Live: []string{runtime.RuntimeID}, Reason: "same runtime window ID carries a different slot ID"}, false
 		}
-		return windowObjectMatch(index, window, *runtime, live, Evidence{Class: EvidenceRuntime, Signal: "window-id", Value: window.TmuxID}), nil, true
+		return windowObjectMatch(index, window, runtimeID, *runtime, live, Evidence{Class: EvidenceRuntime, Signal: "window-id", Value: runtimeID}), nil, true
 	}
 	return ObjectMatch{}, nil, false
 }
 
-func windowObjectMatch(index int, baseline model.Window, live model.ObjectIdentity, snapshot model.Snapshot, evidence Evidence) ObjectMatch {
-	return ObjectMatch{Kind: ObjectWindow, BaselineIndex: index, BaselineIdentityID: baseline.SlotID, LiveIdentityID: live.SlotID, BaselineRuntimeID: baseline.TmuxID, LiveRuntimeID: live.RuntimeID, OutsideTarget: !isWindowMember(snapshot.Memberships, snapshot.TargetSessionID, live.RuntimeID), Evidence: []Evidence{evidence}}
+func windowObjectMatch(index int, baseline model.WindowSpec, baselineRuntimeID string, live model.ObjectIdentity, snapshot model.Snapshot, evidence Evidence) ObjectMatch {
+	return ObjectMatch{Kind: ObjectWindow, BaselineIndex: index, BaselineIdentityID: baseline.SlotID, LiveIdentityID: live.SlotID, BaselineRuntimeID: baselineRuntimeID, LiveRuntimeID: live.RuntimeID, OutsideTarget: !isWindowMember(snapshot.Memberships, snapshot.TargetSessionID, live.RuntimeID), Evidence: []Evidence{evidence}}
 }
 
-func resolvePanes(base model.Session, live model.Snapshot, windowIndex int, liveWindow model.Window) (PaneResolution, []Ambiguity, []Conflict) {
-	baselineWindow := base.Windows[windowIndex]
+// resolvePanes establishes ownership from stable tags or same-generation
+// runtime lineage. Similar commands, cwd, names and geometry never assign a
+// baseline identity to a newly created, unmanaged pane.
+func resolvePanes(base model.Baseline, live model.Snapshot, windowIndex int, liveWindow model.Window) (PaneResolution, []Ambiguity, []Conflict) {
+	baselineWindow := base.Desired.Windows[windowIndex]
 	var out PaneResolution
-	var ambiguities []Ambiguity
 	var conflicts []Conflict
 	used := map[string]bool{}
-	var semanticBase []int
 	for index, pane := range baselineWindow.Panes {
 		match, conflict, anchored := resolvePaneAnchor(base, live, baselineWindow, liveWindow, index, pane)
 		if conflict != nil {
 			conflicts = append(conflicts, *conflict)
 			continue
 		}
-		if anchored {
-			if used[match.LiveRuntimeID] {
-				conflicts = append(conflicts, Conflict{Baseline: fmt.Sprintf("%s pane %d", windowLabel(baselineWindow), index), Live: []string{match.LiveRuntimeID}, Reason: "multiple baseline panes resolve to one live pane"})
-				continue
-			}
-			used[match.LiveRuntimeID] = true
-			out.Matches = append(out.Matches, match)
+		if !anchored {
+			out.Missing = append(out.Missing, index)
 			continue
 		}
-		semanticBase = append(semanticBase, index)
-	}
-	var semanticLive []model.Pane
-	for _, pane := range liveWindow.Panes {
-		if !used[pane.TmuxID] && pane.SlotID == "" {
-			semanticLive = append(semanticLive, pane)
+		if used[match.LiveRuntimeID] {
+			conflicts = append(conflicts, Conflict{Baseline: fmt.Sprintf("%s pane %d", windowLabel(baselineWindow), index), Live: []string{match.LiveRuntimeID}, Reason: "multiple baseline panes resolve to one live pane"})
+			continue
 		}
-	}
-	scores := make([][]scoreVector, len(semanticBase))
-	allowed := make([][]bool, len(semanticBase))
-	evidence := make([][]semanticEvidence, len(semanticBase))
-	for row, baselineIndex := range semanticBase {
-		scores[row] = make([]scoreVector, len(semanticLive))
-		allowed[row] = make([]bool, len(semanticLive))
-		evidence[row] = make([]semanticEvidence, len(semanticLive))
-		for col, pane := range semanticLive {
-			ev := semanticPaneEvidence(&base, baselineWindow.Panes[baselineIndex], &live.Target, pane)
-			scores[row][col], allowed[row][col], evidence[row][col] = ev.score, ev.allowed, ev
-		}
-	}
-	semanticUsed := map[string]bool{}
-	if equivalentSemanticGroup(scores, allowed) {
-		baseRows := append([]int(nil), semanticBase...)
-		liveRows := append([]model.Pane(nil), semanticLive...)
-		sort.Slice(baseRows, func(i, j int) bool {
-			return baselineWindow.Panes[baseRows[i]].Idx < baselineWindow.Panes[baseRows[j]].Idx
-		})
-		sort.Slice(liveRows, func(i, j int) bool { return liveRows[i].TmuxID < liveRows[j].TmuxID })
-		count := minInt(len(baseRows), len(liveRows))
-		var baselineLabels, liveLabels []string
-		for i := 0; i < count; i++ {
-			bi, pane := baseRows[i], liveRows[i]
-			baseline := baselineWindow.Panes[bi]
-			baselineLabels = append(baselineLabels, fmt.Sprintf("pane[%d]", baseline.Idx))
-			liveLabels = append(liveLabels, pane.TmuxID)
-			semanticUsed[pane.TmuxID] = true
-			out.Matches = append(out.Matches, ObjectMatch{Kind: ObjectPane, BaselineIndex: bi, BaselineIdentityID: baseline.SlotID, LiveIdentityID: pane.SlotID, BaselineRuntimeID: baseline.TmuxID, LiveRuntimeID: pane.TmuxID, Evidence: append(append([]Evidence(nil), evidence[0][0].items...), Evidence{Class: EvidenceSemantic, Signal: "equivalent-group", Value: "interchangeable panes in an identified window"})})
-		}
-		for _, missing := range baseRows[count:] {
-			out.Missing = append(out.Missing, missing)
-		}
-		ambiguities = append(ambiguities, Ambiguity{Baseline: fmt.Sprintf("%s panes %s", windowLabel(baselineWindow), strings.Join(baselineLabels, ", ")), Live: liveLabels, Reason: "untagged panes share an interchangeable semantic signature; grouped without replacing processes", EquivalentGroup: true})
-	} else {
-		assignment, optimum := maxLexAssignment(scores, allowed)
-		ambiguousBase := map[int]bool{}
-		for row, col := range assignment {
-			if col < 0 || col >= len(semanticLive) || !allowed[row][col] {
-				continue
-			}
-			alternative := cloneAllowed(allowed)
-			alternative[row][col] = false
-			_, other := maxLexAssignment(scores, alternative)
-			if other.equal(optimum) {
-				labels := paneCandidates(evidence[row], semanticLive)
-				ambiguities = append(ambiguities, Ambiguity{Baseline: fmt.Sprintf("%s pane %d", windowLabel(baselineWindow), semanticBase[row]), Live: labels, Reason: "multiple one-to-one pane assignments have equal evidence", Evidence: evidence[row][col].items})
-				ambiguousBase[semanticBase[row]] = true
-				for _, pane := range semanticLive {
-					if contains(labels, pane.TmuxID) {
-						semanticUsed[pane.TmuxID] = true
-					}
-				}
-				continue
-			}
-			baseline, pane := baselineWindow.Panes[semanticBase[row]], semanticLive[col]
-			semanticUsed[pane.TmuxID] = true
-			out.Matches = append(out.Matches, ObjectMatch{Kind: ObjectPane, BaselineIndex: semanticBase[row], BaselineIdentityID: baseline.SlotID, LiveIdentityID: pane.SlotID, BaselineRuntimeID: baseline.TmuxID, LiveRuntimeID: pane.TmuxID, Evidence: evidence[row][col].items})
-		}
-		for row, baselineIndex := range semanticBase {
-			if ambiguousBase[baselineIndex] || assignment[row] >= 0 && assignment[row] < len(semanticLive) && allowed[row][assignment[row]] {
-				continue
-			}
-			var plausible []string
-			var evidenceItems []Evidence
-			for col, ev := range evidence[row] {
-				if ev.plausible {
-					plausible = append(plausible, semanticLive[col].TmuxID)
-					evidenceItems = append(evidenceItems, ev.items...)
-				}
-			}
-			if len(plausible) > 0 {
-				ambiguities = append(ambiguities, Ambiguity{Baseline: fmt.Sprintf("%s pane %d", windowLabel(baselineWindow), baselineIndex), Live: uniqueStrings(plausible), Reason: "pane candidate evidence is insufficient for a safe match", Evidence: dedupeEvidence(evidenceItems)})
-			} else {
-				out.Missing = append(out.Missing, baselineIndex)
-			}
-		}
+		used[match.LiveRuntimeID] = true
+		out.Matches = append(out.Matches, match)
 	}
 	for _, pane := range liveWindow.Panes {
-		if !used[pane.TmuxID] && !semanticUsed[pane.TmuxID] {
+		if !used[pane.TmuxID] {
 			out.Extra = append(out.Extra, pane.TmuxID)
 		}
 	}
 	sort.Ints(out.Missing)
 	sort.Strings(out.Extra)
-	sort.Slice(out.Matches, func(i, j int) bool { return out.Matches[i].BaselineIndex < out.Matches[j].BaselineIndex })
-	return out, ambiguities, conflicts
+	return out, nil, conflicts
 }
 
-func resolvePaneReferencesOutside(base model.Session, live model.Snapshot, windowIndex int, windowID string) (PaneResolution, []Ambiguity, []Conflict) {
-	want := base.Windows[windowIndex]
+func resolvePaneReferencesOutside(base model.Baseline, live model.Snapshot, windowIndex int, windowID string) (PaneResolution, []Ambiguity, []Conflict) {
+	want := base.Desired.Windows[windowIndex]
 	var out PaneResolution
 	var conflicts []Conflict
 	refs := map[string]model.ObjectIdentity{}
@@ -372,8 +220,9 @@ func resolvePaneReferencesOutside(base model.Session, live model.Snapshot, windo
 				found = matches[0]
 			}
 		}
-		if found == nil && sameServer(&base, &live.Target) {
-			if ref, ok := refs[pane.TmuxID]; ok {
+		runtimeID := base.Bindings.Panes[pane.SlotID]
+		if found == nil && sameServerGeneration(base.Bindings.ServerKey, live.ServerKey) {
+			if ref, ok := refs[runtimeID]; ok {
 				copy := ref
 				found = &copy
 			}
@@ -391,7 +240,7 @@ func resolvePaneReferencesOutside(base model.Session, live model.Snapshot, windo
 			continue
 		}
 		used[found.RuntimeID] = true
-		out.Matches = append(out.Matches, ObjectMatch{Kind: ObjectPane, BaselineIndex: index, BaselineIdentityID: pane.SlotID, LiveIdentityID: found.SlotID, BaselineRuntimeID: pane.TmuxID, LiveRuntimeID: found.RuntimeID, Evidence: []Evidence{{Class: EvidenceRuntime, Signal: "pane-reference", Value: found.RuntimeID}}})
+		out.Matches = append(out.Matches, ObjectMatch{Kind: ObjectPane, BaselineIndex: index, BaselineIdentityID: pane.SlotID, LiveIdentityID: found.SlotID, BaselineRuntimeID: runtimeID, LiveRuntimeID: found.RuntimeID, Evidence: []Evidence{{Class: EvidenceRuntime, Signal: "pane-reference", Value: found.RuntimeID}}})
 	}
 	for id := range refs {
 		if !used[id] {
@@ -403,9 +252,10 @@ func resolvePaneReferencesOutside(base model.Session, live model.Snapshot, windo
 	return out, nil, conflicts
 }
 
-func resolvePaneAnchor(base model.Session, live model.Snapshot, baseWindow, liveWindow model.Window, index int, pane model.Pane) (ObjectMatch, *Conflict, bool) {
-	sameGeneration := base.ServerKey != "" && base.ServerKey == live.ServerKey
+func resolvePaneAnchor(base model.Baseline, live model.Snapshot, baseWindow model.WindowSpec, liveWindow model.Window, index int, pane model.PaneSpec) (ObjectMatch, *Conflict, bool) {
+	sameGeneration := base.Bindings.ServerKey != "" && base.Bindings.ServerKey == live.ServerKey
 	var tagged, runtime *model.ObjectIdentity
+	runtimeID := base.Bindings.Panes[pane.SlotID]
 	if pane.SlotID != "" {
 		matches := objectsByStableID(live.Objects, ObjectPane, pane.SlotID)
 		if len(matches) > 1 {
@@ -415,8 +265,8 @@ func resolvePaneAnchor(base model.Session, live model.Snapshot, baseWindow, live
 			tagged = matches[0]
 		}
 	}
-	if sameGeneration && pane.TmuxID != "" {
-		runtime = objectByRuntimeID(live.Objects, ObjectPane, pane.TmuxID)
+	if sameGeneration && runtimeID != "" {
+		runtime = objectByRuntimeID(live.Objects, ObjectPane, runtimeID)
 	}
 	if tagged != nil && runtime != nil && tagged.RuntimeID != runtime.RuntimeID {
 		return ObjectMatch{}, &Conflict{Baseline: fmt.Sprintf("%s pane %d", windowLabel(baseWindow), index), Live: []string{tagged.RuntimeID, runtime.RuntimeID}, Reason: "pane slot and runtime bindings identify different objects"}, false
@@ -425,7 +275,7 @@ func resolvePaneAnchor(base model.Session, live model.Snapshot, baseWindow, live
 		if tagged.ParentID != liveWindow.TmuxID {
 			return ObjectMatch{}, &Conflict{Baseline: fmt.Sprintf("%s pane %d", windowLabel(baseWindow), index), Live: []string{tagged.RuntimeID}, Reason: "pane slot belongs to a different window"}, false
 		}
-		return paneObjectMatch(index, pane, *tagged, Evidence{Class: EvidenceLogical, Signal: "pane-slot-id", Value: pane.SlotID}), nil, true
+		return paneObjectMatch(index, pane, runtimeID, *tagged, Evidence{Class: EvidenceLogical, Signal: "pane-slot-id", Value: pane.SlotID}), nil, true
 	}
 	if runtime != nil {
 		if runtime.ParentID != liveWindow.TmuxID {
@@ -434,23 +284,23 @@ func resolvePaneAnchor(base model.Session, live model.Snapshot, baseWindow, live
 		if runtime.SlotID != "" && runtime.SlotID != pane.SlotID {
 			return ObjectMatch{}, &Conflict{Baseline: fmt.Sprintf("%s pane %d", windowLabel(baseWindow), index), Live: []string{runtime.RuntimeID}, Reason: "same runtime pane ID carries a different slot ID"}, false
 		}
-		return paneObjectMatch(index, pane, *runtime, Evidence{Class: EvidenceRuntime, Signal: "pane-id", Value: pane.TmuxID}), nil, true
+		return paneObjectMatch(index, pane, runtimeID, *runtime, Evidence{Class: EvidenceRuntime, Signal: "pane-id", Value: runtimeID}), nil, true
 	}
 	return ObjectMatch{}, nil, false
 }
 
-func paneObjectMatch(index int, baseline model.Pane, live model.ObjectIdentity, evidence Evidence) ObjectMatch {
-	return ObjectMatch{Kind: ObjectPane, BaselineIndex: index, BaselineIdentityID: baseline.SlotID, LiveIdentityID: live.SlotID, BaselineRuntimeID: baseline.TmuxID, LiveRuntimeID: live.RuntimeID, Evidence: []Evidence{evidence}}
+func paneObjectMatch(index int, baseline model.PaneSpec, baselineRuntimeID string, live model.ObjectIdentity, evidence Evidence) ObjectMatch {
+	return ObjectMatch{Kind: ObjectPane, BaselineIndex: index, BaselineIdentityID: baseline.SlotID, LiveIdentityID: live.SlotID, BaselineRuntimeID: baselineRuntimeID, LiveRuntimeID: live.RuntimeID, Evidence: []Evidence{evidence}}
 }
 
-func validateBaselineIdentities(base model.Session) error {
+func validateBaselineIdentities(base model.Baseline) error {
 	if base.SchemaVersion != model.CurrentBaselineSchemaVersion {
 		return fmt.Errorf("baseline schema version %d is unsupported; freeze the session again", base.SchemaVersion)
 	}
-	if base.LogicalID == "" {
+	if base.Desired.LogicalID == "" {
 		return fmt.Errorf("baseline has no session identity")
 	}
-	if len(base.Windows) == 0 {
+	if len(base.Desired.Windows) == 0 {
 		return fmt.Errorf("baseline has no windows")
 	}
 	seen := map[string]string{}
@@ -468,18 +318,18 @@ func validateBaselineIdentities(base model.Session) error {
 		seen[id] = key
 		return nil
 	}
-	if err := check(ObjectSession, base.TmuxID, base.LogicalID); err != nil {
+	if err := check(ObjectSession, base.Bindings.SessionID, base.Desired.LogicalID); err != nil {
 		return err
 	}
-	for _, window := range base.Windows {
-		if err := check(ObjectWindow, window.TmuxID, window.SlotID); err != nil {
+	for _, window := range base.Desired.Windows {
+		if err := check(ObjectWindow, base.Bindings.Windows[window.SlotID], window.SlotID); err != nil {
 			return err
 		}
 		if len(window.Panes) == 0 {
 			return fmt.Errorf("baseline window %d has no panes", window.Idx)
 		}
 		for _, pane := range window.Panes {
-			if err := check(ObjectPane, pane.TmuxID, pane.SlotID); err != nil {
+			if err := check(ObjectPane, base.Bindings.Panes[pane.SlotID], pane.SlotID); err != nil {
 				return err
 			}
 		}
@@ -627,7 +477,7 @@ func runtimeLabels(objects []*model.ObjectIdentity) []string {
 	return labels
 }
 
-func targetWindowByID(session model.Session, runtimeID string) (model.Window, bool) {
+func targetWindowByID(session model.ObservedSession, runtimeID string) (model.Window, bool) {
 	for _, window := range session.Windows {
 		if window.TmuxID == runtimeID {
 			return window, true
@@ -645,148 +495,14 @@ func isWindowMember(memberships []model.WindowMembership, sessionID, windowID st
 	return false
 }
 
-func cloneAllowed(src [][]bool) [][]bool {
-	copy := make([][]bool, len(src))
-	for i := range src {
-		copy[i] = append([]bool(nil), src[i]...)
-	}
-	return copy
-}
-
-func semanticCandidates(row []semanticEvidence, live []model.Window) []string {
-	var labels []string
-	for i, evidence := range row {
-		if evidence.allowed {
-			labels = append(labels, windowCandidateLabel(live[i]))
-		}
-	}
-	return uniqueStrings(labels)
-}
-
-func resolveEquivalentWindowGroup(r *Resolution, base model.Session, live model.Snapshot, baseRows []int, liveRows []model.Window, scores [][]scoreVector, allowed [][]bool, evidence [][]semanticEvidence, used map[string]bool) bool {
-	if !equivalentSemanticGroup(scores, allowed) {
-		return false
-	}
-	baseOrder := append([]int(nil), baseRows...)
-	liveOrder := append([]model.Window(nil), liveRows...)
-	sort.Slice(baseOrder, func(i, j int) bool {
-		a, b := base.Windows[baseOrder[i]], base.Windows[baseOrder[j]]
-		if a.Idx != b.Idx {
-			return a.Idx < b.Idx
-		}
-		if a.SlotID != b.SlotID {
-			return a.SlotID < b.SlotID
-		}
-		return a.Name < b.Name
-	})
-	sort.Slice(liveOrder, func(i, j int) bool { return liveOrder[i].TmuxID < liveOrder[j].TmuxID })
-	count := minInt(len(baseOrder), len(liveOrder))
-	var baselineLabels, liveLabels []string
-	var groupEvidence []Evidence
-	for i := 0; i < count; i++ {
-		bi, lw := baseOrder[i], liveOrder[i]
-		baseRow, liveCol := -1, -1
-		for row, index := range baseRows {
-			if index == bi {
-				baseRow = row
-				break
-			}
-		}
-		for col, candidate := range liveRows {
-			if candidate.TmuxID == lw.TmuxID {
-				liveCol = col
-				break
-			}
-		}
-		if baseRow < 0 || liveCol < 0 {
-			return false
-		}
-		semantic := evidence[baseRow][liveCol]
-		baselineLabels = append(baselineLabels, windowLabel(base.Windows[bi]))
-		liveLabels = append(liveLabels, windowCandidateLabel(lw))
-		items := append([]Evidence(nil), semantic.items...)
-		items = append(items, Evidence{Class: EvidenceSemantic, Signal: "equivalent-group", Value: "interchangeable untagged live window signature"})
-		match := ObjectMatch{Kind: ObjectWindow, BaselineIndex: bi, BaselineIdentityID: base.Windows[bi].SlotID, LiveIdentityID: lw.SlotID, BaselineRuntimeID: base.Windows[bi].TmuxID, LiveRuntimeID: lw.TmuxID, Evidence: items}
-		panes, paneAmbiguous, paneConflicts := resolvePanes(base, live, bi, lw)
-		r.Windows = append(r.Windows, WindowResolution{Match: match, Panes: panes})
-		r.Ambiguous = append(r.Ambiguous, paneAmbiguous...)
-		r.Conflicts = append(r.Conflicts, paneConflicts...)
-		used[lw.TmuxID] = true
-		groupEvidence = append(groupEvidence, semantic.items...)
-	}
-	for _, bi := range baseOrder[count:] {
-		r.Missing = append(r.Missing, bi)
-	}
-	r.Ambiguous = append(r.Ambiguous, Ambiguity{Baseline: strings.Join(baselineLabels, ", "), Live: liveLabels, Reason: "untagged live windows share an interchangeable semantic signature; grouped without replacing processes", Evidence: dedupeEvidence(groupEvidence), EquivalentGroup: true})
-	return true
-}
-
-func windowCandidateLabel(window model.Window) string {
-	return fmt.Sprintf("%s[%s]", windowLabel(window), window.TmuxID)
-}
-
-func paneCandidates(row []semanticEvidence, live []model.Pane) []string {
-	var ids []string
-	for i, evidence := range row {
-		if evidence.allowed {
-			ids = append(ids, live[i].TmuxID)
-		}
-	}
-	return uniqueStrings(ids)
-}
-
-func uniqueStrings(values []string) []string {
-	seen := map[string]bool{}
-	out := make([]string, 0, len(values))
-	for _, value := range values {
-		if !seen[value] {
-			seen[value] = true
-			out = append(out, value)
-		}
-	}
-	sort.Strings(out)
-	return out
-}
-
-func contains(values []string, want string) bool {
-	for _, value := range values {
-		if value == want {
-			return true
-		}
-	}
-	return false
-}
-
-func minInt(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
-
-func dedupeEvidence(values []Evidence) []Evidence {
-	seen := map[string]bool{}
-	var out []Evidence
-	for _, value := range values {
-		key := fmt.Sprintf("%d\x00%s\x00%s", value.Class, value.Signal, value.Value)
-		if !seen[key] {
-			seen[key] = true
-			out = append(out, value)
-		}
-	}
-	return out
-}
-
 func (r *Resolution) addConflict(baseline string, live []string, reason string) {
 	r.Conflicts = append(r.Conflicts, Conflict{Baseline: baseline, Live: live, Reason: reason})
 	r.Status = ResolutionConflict
 }
 
-func sameServer(a, b *model.Session) bool {
-	return a != nil && b != nil && a.ServerKey != "" && a.ServerKey == b.ServerKey
-}
+func sameServerGeneration(a, b string) bool { return a != "" && a == b }
 
-func windowLabel(window model.Window) string {
+func windowLabel(window model.WindowSpec) string {
 	if window.Name != "" {
 		return fmt.Sprintf("%s@index-%d", window.Name, window.Idx)
 	}

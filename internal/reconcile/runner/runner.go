@@ -59,7 +59,7 @@ func (r Runner) Execute(ctx context.Context, sessionName, journalID string, plan
 		if journal == nil {
 			return fmt.Errorf("reconcile journal %q does not exist", journalID)
 		}
-		if journal.Status == model.JournalPlanned {
+		if journal.Status == model.JournalPlanned || journal.Status == model.JournalNeedsAttention {
 			return r.Journal.UpdateReconcile(journalID, model.JournalRunning, 0, "")
 		}
 		if journal.Status == model.JournalRunning {
@@ -265,13 +265,13 @@ func hydrateLayoutOperation(plan core.PlanResult, op core.Operation) (core.Opera
 		if match.Match.LiveRuntimeID != op.Target.ID {
 			continue
 		}
-		if match.Match.BaselineIndex < 0 || match.Match.BaselineIndex >= len(plan.DesiredSession.Windows) {
+		if match.Match.BaselineIndex < 0 || match.Match.BaselineIndex >= len(plan.DesiredBaseline.Session().Windows) {
 			return op, fmt.Errorf("layout operation %s has an invalid baseline window mapping", op.ID)
 		}
 		if desired != nil {
 			return op, fmt.Errorf("layout operation %s has ambiguous baseline window mapping", op.ID)
 		}
-		want := plan.DesiredSession.Windows[match.Match.BaselineIndex]
+		want := plan.DesiredBaseline.Session().Windows[match.Match.BaselineIndex]
 		desired = &want
 	}
 	if desired == nil {
@@ -310,7 +310,7 @@ func sameTarget(plan core.PlanResult, snapshot model.Snapshot, journal *model.Re
 			return fmt.Errorf("target session logical identity changed")
 		}
 	}
-	resolution := core.Resolve(core.DesiredState{Session: plan.DesiredSession, ClassifierVersion: plan.ClassifierVersion}, snapshot)
+	resolution := core.Resolve(core.DesiredState{Baseline: plan.DesiredBaseline, ClassifierVersion: plan.ClassifierVersion}, snapshot)
 	if resolution.Status != core.ResolutionReady {
 		if len(resolution.Conflicts) > 0 {
 			return fmt.Errorf("identity resolution changed during execution: %s: %s", resolution.Status, resolution.Conflicts[0].Reason)
@@ -503,16 +503,12 @@ func operationSatisfied(op core.Operation, snapshot model.Snapshot) bool {
 	case core.OperationSelectWindow:
 		return snapshot.ActiveWindowID == op.Target.ID
 	case core.OperationExactRebuild:
-		resolution := core.Resolve(core.DesiredState{Session: op.DesiredSession}, snapshot)
-		if resolution.Status != core.ResolutionReady || core.Plan(core.DesiredState{Session: op.DesiredSession}, snapshot, resolution, core.PolicyExact).Status != core.PlanNoop {
+		resolution := core.Resolve(core.DesiredState{Baseline: op.DesiredBaseline}, snapshot)
+		if resolution.Status != core.ResolutionReady || core.Plan(core.DesiredState{Baseline: op.DesiredBaseline}, snapshot, resolution, core.PolicyExact).Status != core.PlanNoop {
 			return false
 		}
 		if !exactOperationMarkersValid(snapshot, op) {
 			return false
-		}
-		if slot := planFinalSlot(op.DesiredSession); slot != "" {
-			active, ok := targetWindowByRuntime(snapshot.Target, snapshot.ActiveWindowID)
-			return ok && active.SlotID == slot
 		}
 		return true
 	default:

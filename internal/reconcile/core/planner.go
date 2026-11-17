@@ -16,7 +16,7 @@ import (
 // never repairs an ambiguous/conflicting mapping and never emits a destructive
 // operation under the preserve policy.
 func Plan(desired DesiredState, live model.Snapshot, resolution Resolution, policy Policy) PlanResult {
-	result := PlanResult{PlanSchemaVersion: CurrentPlanSchemaVersion, Status: PlanBlocked, Policy: policy, DesiredSession: desired.Session, ClassifierVersion: desired.ClassifierVersion, Resolution: resolution}
+	result := PlanResult{PlanSchemaVersion: CurrentPlanSchemaVersion, Status: PlanBlocked, Policy: policy, DesiredBaseline: desired.Baseline, ClassifierVersion: desired.ClassifierVersion, Resolution: resolution}
 	if err := policy.Validate(); err != nil {
 		result.BlockedReason = err.Error()
 		return result
@@ -29,8 +29,8 @@ func Plan(desired DesiredState, live model.Snapshot, resolution Resolution, poli
 		result.BlockedReason = "resolution and live snapshot do not describe the same complete session generation"
 		return result
 	}
-	base := desired.Session
-	if err := validateDesiredIdentities(base); err != nil {
+	base := desired.Baseline.Desired
+	if err := validateDesiredRecipe(base); err != nil {
 		result.BlockedReason = err.Error()
 		return result
 	}
@@ -39,8 +39,8 @@ func Plan(desired DesiredState, live model.Snapshot, resolution Resolution, poli
 			if match.Match.OutsideTarget || match.Match.BaselineIndex < 0 || match.Match.BaselineIndex >= len(base.Windows) {
 				continue
 			}
-			want := base.Windows[match.Match.BaselineIndex]
-			wantRole := semanticWindowRole(base, want)
+			wantSpec := base.Windows[match.Match.BaselineIndex]
+			wantRole := semanticRecipeWindowRole(desired.ClassifierVersion, wantSpec)
 			if wantRole == "" {
 				continue
 			}
@@ -49,7 +49,7 @@ func Plan(desired DesiredState, live model.Snapshot, resolution Resolution, poli
 				result.BlockedReason = fmt.Sprintf("cannot verify the semantic role of identified window %s", match.Match.LiveRuntimeID)
 				return result
 			}
-			gotRole := semanticWindowRole(live.Target, got)
+			gotRole := semanticObservedWindowRole(live.Target, got)
 			if gotRole != wantRole && !hasDurableIdentity(match.Match) {
 				result.BlockedReason = fmt.Sprintf("identified window %s has semantic role %q; baseline requires %q; preserve cannot safely replace its live panes", got.TmuxID, gotRole, wantRole)
 				return result
@@ -96,7 +96,7 @@ func Plan(desired DesiredState, live model.Snapshot, resolution Resolution, poli
 			TargetIdentityID:  resolution.TargetSession.LiveIdentityID,
 			ExpectedServerKey: live.ServerKey, ExpectedSessionID: live.TargetSessionID,
 			ExpectedFingerprint: snapshotFingerprint(live),
-			Destructive:         true, DesiredSession: base,
+			Destructive:         true, DesiredBaseline: desired.Baseline,
 			ExactOriginalWindows: append([]model.Window(nil), live.Target.Windows...),
 			Reason:               "restore the complete frozen baseline and terminate replaced pane processes",
 		}
@@ -111,7 +111,7 @@ func Plan(desired DesiredState, live model.Snapshot, resolution Resolution, poli
 		result.BlockedReason = err.Error()
 		return result
 	}
-	baseMax, liveMax := maxIndex(base.Windows), maxIndex(live.Target.Windows)
+	baseMax, liveMax := maxRecipeIndex(base.Windows), maxIndex(live.Target.Windows)
 	matchedByBase := make(map[int]WindowResolution, len(resolution.Windows))
 	liveByID := make(map[string]model.Window, len(live.Target.Windows))
 	for _, window := range live.Target.Windows {
@@ -167,7 +167,8 @@ func Plan(desired DesiredState, live model.Snapshot, resolution Resolution, poli
 			result.BlockedReason = "matched target window is absent from the detailed live snapshot"
 			return result
 		}
-		want := base.Windows[match.Match.BaselineIndex]
+		wantSpec := base.Windows[match.Match.BaselineIndex]
+		want := wantSpec.SessionDTO()
 		if window.Idx == want.Idx {
 			continue
 		}
@@ -187,7 +188,7 @@ func Plan(desired DesiredState, live model.Snapshot, resolution Resolution, poli
 	}
 
 	for _, match := range resolution.Windows {
-		want := base.Windows[match.Match.BaselineIndex]
+		want := base.Windows[match.Match.BaselineIndex].SessionDTO()
 		target := RuntimeRef{ServerGeneration: live.ServerKey, Kind: ObjectWindow, ID: match.Match.LiveRuntimeID}
 		if match.Match.OutsideTarget {
 			if len(match.Panes.Missing) > 0 || len(match.Panes.Extra) > 0 || !windowLayoutMatches(want, live.Objects, target.ID) {
@@ -250,7 +251,7 @@ func Plan(desired DesiredState, live model.Snapshot, resolution Resolution, poli
 	}
 
 	for _, missingIndex := range resolution.Missing {
-		want := base.Windows[missingIndex]
+		want := base.Windows[missingIndex].SessionDTO()
 		result.Operations = append(result.Operations, Operation{
 			Kind: OperationCreateWindow, Target: RuntimeRef{ServerGeneration: live.ServerKey, Kind: ObjectSession, ID: live.TargetSessionID}, TargetIdentityID: resolution.TargetSession.LiveIdentityID,
 			ExpectedServerKey: live.ServerKey, ExpectedSessionID: live.TargetSessionID,
@@ -291,7 +292,7 @@ func bindingOperations(desired DesiredState, live model.Snapshot, resolution Res
 	if includeSession && live.Target.LogicalID == "" {
 		operations = append(operations, Operation{
 			Kind: OperationBindIdentity, Target: RuntimeRef{ServerGeneration: live.ServerKey, Kind: ObjectSession, ID: live.TargetSessionID},
-			TargetIdentityID: desired.Session.LogicalID, ExpectedServerKey: live.ServerKey, ExpectedSessionID: live.TargetSessionID,
+			TargetIdentityID: desired.Baseline.Desired.LogicalID, ExpectedServerKey: live.ServerKey, ExpectedSessionID: live.TargetSessionID,
 			Reason: "bind the verified live session to its baseline identity",
 		})
 	}
@@ -299,7 +300,7 @@ func bindingOperations(desired DesiredState, live model.Snapshot, resolution Res
 		return operations
 	}
 	for _, windowMatch := range resolution.Windows {
-		baselineWindow := desired.Session.Windows[windowMatch.Match.BaselineIndex]
+		baselineWindow := desired.Baseline.Desired.Windows[windowMatch.Match.BaselineIndex]
 		if windowMatch.Match.LiveIdentityID == "" {
 			target := RuntimeRef{ServerGeneration: live.ServerKey, Kind: ObjectWindow, ID: windowMatch.Match.LiveRuntimeID}
 			fingerprint := objectFingerprint(objectByRuntime(live.Objects, ObjectWindow, windowMatch.Match.LiveRuntimeID))
@@ -339,12 +340,13 @@ func bindingOperations(desired DesiredState, live model.Snapshot, resolution Res
 }
 
 func appendLayoutOperation(operations []Operation, desired DesiredState, live model.Snapshot, match WindowResolution, window model.Window, target RuntimeRef) []Operation {
-	want := desired.Session.Windows[match.Match.BaselineIndex]
+	wantSpec := desired.Baseline.Desired.Windows[match.Match.BaselineIndex]
+	want := wantSpec.SessionDTO()
 	if len(window.Panes)+len(match.Panes.Missing) < len(want.Panes) || len(window.Panes) > len(want.Panes) || want.Layout == "" {
 		return operations
 	}
 	equal, known := tmuxlayout.Compare(want.Layout, len(want.Panes), window.Layout, len(window.Panes))
-	paneOrderMatches, paneOrderKnown := paneSlotLayoutMatches(want, window, match.Panes)
+	paneOrderMatches, paneOrderKnown := paneSlotLayoutMatches(wantSpec, window, match.Panes)
 	if known && equal && (!paneOrderKnown || paneOrderMatches) {
 		return operations
 	}
@@ -357,7 +359,7 @@ func appendLayoutOperation(operations []Operation, desired DesiredState, live mo
 }
 
 func exactStateMatches(desired DesiredState, live model.Snapshot, resolution Resolution) bool {
-	base := desired.Session
+	base := desired.Baseline.Desired
 	if len(resolution.Missing) != 0 || len(resolution.Extra) != 0 || len(resolution.Windows) != len(base.Windows) {
 		return false
 	}
@@ -365,12 +367,13 @@ func exactStateMatches(desired DesiredState, live model.Snapshot, resolution Res
 		if match.Match.OutsideTarget || match.Match.BaselineIndex < 0 || match.Match.BaselineIndex >= len(base.Windows) {
 			return false
 		}
-		want := base.Windows[match.Match.BaselineIndex]
+		wantSpec := base.Windows[match.Match.BaselineIndex]
+		want := wantSpec.SessionDTO()
 		got, ok := targetWindowByID(live.Target, match.Match.LiveRuntimeID)
 		if !ok || got.Idx != want.Idx || len(match.Panes.Missing) != 0 || len(match.Panes.Extra) != 0 || len(got.Panes) != len(want.Panes) {
 			return false
 		}
-		wantRole, gotRole := semanticWindowRole(base, want), semanticWindowRole(live.Target, got)
+		wantRole, gotRole := semanticRecipeWindowRole(desired.ClassifierVersion, base.Windows[match.Match.BaselineIndex]), semanticObservedWindowRole(live.Target, got)
 		if wantRole != "" && wantRole != gotRole {
 			return false
 		}
@@ -379,7 +382,7 @@ func exactStateMatches(desired DesiredState, live model.Snapshot, resolution Res
 			if !known || !equal {
 				return false
 			}
-			paneOrderMatches, paneOrderKnown := paneSlotLayoutMatches(want, got, match.Panes)
+			paneOrderMatches, paneOrderKnown := paneSlotLayoutMatches(wantSpec, got, match.Panes)
 			if paneOrderKnown && !paneOrderMatches {
 				return false
 			}
@@ -388,7 +391,7 @@ func exactStateMatches(desired DesiredState, live model.Snapshot, resolution Res
 	return true
 }
 
-func validateDesiredIndices(session model.Session) error {
+func validateDesiredIndices(session model.Recipe) error {
 	seen := map[int]bool{}
 	for _, window := range session.Windows {
 		if window.Idx < 0 || seen[window.Idx] {
@@ -402,35 +405,48 @@ func validateDesiredIndices(session model.Session) error {
 	return nil
 }
 
-func validateDesiredIdentities(session model.Session) error {
+func validateDesiredRecipe(recipe model.Recipe) error {
 	seen := map[string]string{}
-	add := func(kind, runtimeID, stableID string) error {
-		if stableID == "" {
-			return fmt.Errorf("desired %s at %s has no identity; freeze the intended session again before reconciling", kind, runtimeID)
+	add := func(kind, id string) error {
+		if id == "" {
+			return fmt.Errorf("desired %s has no identity; freeze the intended session again before reconciling", kind)
 		}
-		if err := identity.Validate(stableID); err != nil {
-			return fmt.Errorf("desired %s at %s has malformed stable ID: %w", kind, runtimeID, err)
+		if err := identity.Validate(id); err != nil {
+			return fmt.Errorf("desired %s has malformed identity: %w", kind, err)
 		}
-		if prior, exists := seen[stableID]; exists {
-			return fmt.Errorf("desired stable ID %s is duplicated by %s and %s", stableID, prior, kind+" "+runtimeID)
+		if prior, ok := seen[id]; ok {
+			return fmt.Errorf("desired stable ID %s is shared by %s and %s", id, prior, kind)
 		}
-		seen[stableID] = kind + " " + runtimeID
+		seen[id] = kind
 		return nil
 	}
-	if err := add("session", session.TmuxID, session.LogicalID); err != nil {
+	if err := add("session", recipe.LogicalID); err != nil {
 		return err
 	}
-	for _, window := range session.Windows {
-		if err := add("window", window.TmuxID, window.SlotID); err != nil {
+	for _, w := range recipe.Windows {
+		if err := add("window", w.SlotID); err != nil {
 			return err
 		}
-		for _, pane := range window.Panes {
-			if err := add("pane", pane.TmuxID, pane.SlotID); err != nil {
+		if len(w.Panes) == 0 {
+			return fmt.Errorf("desired window %d has no panes", w.Idx)
+		}
+		for _, p := range w.Panes {
+			if err := add("pane", p.SlotID); err != nil {
 				return err
 			}
 		}
 	}
 	return nil
+}
+
+func maxRecipeIndex(windows []model.WindowSpec) int {
+	max := 0
+	for _, w := range windows {
+		if w.Idx > max {
+			max = w.Idx
+		}
+	}
+	return max
 }
 
 func moveOperation(live model.Snapshot, window model.Window, from, to int, temporary bool, reason string) Operation {
@@ -471,12 +487,38 @@ func objectFingerprint(object *model.ObjectIdentity) string {
 func snapshotFingerprint(snapshot model.Snapshot) string {
 	copy := snapshot
 	copy.ActiveWindowID = "" // client focus is outside the structural plan contract
+	// A plan owns one target session. Activity elsewhere on the server cannot
+	// invalidate its topology. Per-operation guards validate external targets.
+	windows := map[string]bool{}
+	for _, window := range snapshot.Target.Windows {
+		windows[window.TmuxID] = true
+	}
+	copy.Sessions = nil
+	for _, session := range snapshot.Sessions {
+		if session.RuntimeID == snapshot.TargetSessionID {
+			copy.Sessions = append(copy.Sessions, session)
+		}
+	}
+	copy.Objects = nil
+	for _, object := range snapshot.Objects {
+		if object.Kind == model.ObjectSession && object.RuntimeID == snapshot.TargetSessionID || object.Kind == model.ObjectWindow && windows[object.RuntimeID] || object.Kind == model.ObjectPane && windows[object.ParentID] {
+			copy.Objects = append(copy.Objects, object)
+		}
+	}
+	copy.Memberships = nil
+	for _, membership := range snapshot.Memberships {
+		if windows[membership.WindowID] {
+			copy.Memberships = append(copy.Memberships, membership)
+		}
+	}
+
 	copy.Target.LogicalID = ""
 	copy.Target.Windows = append([]model.Window(nil), snapshot.Target.Windows...)
-	copy.Sessions = append([]model.SessionIdentity(nil), snapshot.Sessions...)
-	copy.Objects = append([]model.ObjectIdentity(nil), snapshot.Objects...)
+	copy.Sessions = append([]model.SessionIdentity(nil), copy.Sessions...)
+	copy.Objects = append([]model.ObjectIdentity(nil), copy.Objects...)
 	for i := range copy.Target.Windows {
 		copy.Target.Windows[i].SlotID = ""
+		copy.Target.Windows[i].Cwd = "" // active pane cwd is not window topology
 		copy.Target.Windows[i].Panes = append([]model.Pane(nil), snapshot.Target.Windows[i].Panes...)
 		for j := range copy.Target.Windows[i].Panes {
 			copy.Target.Windows[i].Panes[j].CmdPath = ""
@@ -509,12 +551,12 @@ func digest(value any) string {
 
 func planID(desired DesiredState, live model.Snapshot, policy Policy, operations []Operation) string {
 	value := struct {
-		Baseline model.Session
+		Baseline model.Baseline
 		Server   string
 		Session  string
 		Policy   Policy
 		Ops      []Operation
-	}{desired.Session, live.ServerKey, live.TargetSessionID, policy, operations}
+	}{desired.Baseline, live.ServerKey, live.TargetSessionID, policy, operations}
 	return digest(value)
 }
 

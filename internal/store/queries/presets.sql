@@ -1,5 +1,5 @@
 -- name: ListPresetMeta :many
-SELECT name, cwd, last_used FROM session ORDER BY last_used DESC, name;
+SELECT name, cwd, last_used, logical_id FROM session ORDER BY last_used DESC, name;
 
 -- name: PresetByName :one
 SELECT name, cwd, logical_id FROM session WHERE name = ?;
@@ -9,7 +9,7 @@ SELECT id, idx, name, COALESCE(cwd, '') AS cwd, COALESCE(layout, '') AS layout, 
 FROM window WHERE session = ? ORDER BY idx;
 
 -- name: PresetPanes :many
-SELECT id, idx, COALESCE(cwd, '') AS cwd, COALESCE(cmd, '') AS cmd, COALESCE(cmd_path, '') AS cmd_path, slot_id
+SELECT id, idx, COALESCE(cwd, '') AS cwd, COALESCE(cmd, '') AS cmd, COALESCE(cmd_path, '') AS cmd_path, slot_id, start_cmd
 FROM pane WHERE window_id = ? ORDER BY idx;
 
 -- name: DeleteSession :exec
@@ -34,7 +34,7 @@ INSERT INTO session(name, cwd, created_at, last_used, logical_id) VALUES(?, ?, ?
 INSERT INTO window(session, idx, name, cwd, layout, slot_id) VALUES(?, ?, ?, ?, ?, ?);
 
 -- name: InsertPane :exec
-INSERT INTO pane(window_id, idx, cwd, cmd, cmd_path, slot_id) VALUES(?, ?, ?, ?, ?, ?);
+INSERT INTO pane(window_id, idx, cwd, cmd, cmd_path, slot_id, start_cmd) VALUES(?, ?, ?, ?, ?, ?, ?);
 
 -- name: UpdatePresetLogicalID :exec
 UPDATE session SET logical_id = ? WHERE name = ? AND (logical_id = '' OR logical_id = ?);

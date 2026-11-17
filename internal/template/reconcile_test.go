@@ -20,7 +20,7 @@ type noBaselineOps struct{ runner.TmuxPort }
 
 func (noBaselineOps) Observe(_ context.Context, name string) (*model.Snapshot, error) {
 	session := model.Session{Name: name, TmuxID: "$1", ServerKey: "test-server"}
-	return &model.Snapshot{ServerKey: session.ServerKey, Complete: true, Target: session, TargetSessionID: session.TmuxID, Sessions: []model.SessionIdentity{{Name: name, RuntimeID: session.TmuxID}}, Objects: []model.ObjectIdentity{{Kind: model.ObjectSession, RuntimeID: session.TmuxID}}}, nil
+	return &model.Snapshot{ServerKey: session.ServerKey, Complete: true, Target: model.ObserveSession(session), TargetSessionID: session.TmuxID, Sessions: []model.SessionIdentity{{Name: name, RuntimeID: session.TmuxID}}, Objects: []model.ObjectIdentity{{Kind: model.ObjectSession, RuntimeID: session.TmuxID}}}, nil
 }
 func (noBaselineOps) SetStableID(context.Context, tmux.IdentityKind, string, string) error {
 	return nil
@@ -150,7 +150,7 @@ func TestReconcileRejectsUnidentifiedBaselineBeforeMutation(t *testing.T) {
 	}
 	live := model.Session{Name: "work", LogicalID: baseline.LogicalID, TmuxID: "$1", ServerKey: "server-a", Windows: baseline.Windows}
 	ops := &identifiedTestOps{snapshot: model.Snapshot{
-		ServerKey: "server-a", Complete: true, Target: live, TargetSessionID: "$1",
+		ServerKey: "server-a", Complete: true, Target: model.ObserveSession(live), TargetSessionID: "$1",
 		Sessions:    []model.SessionIdentity{{Name: "work", LogicalID: live.LogicalID, RuntimeID: "$1"}},
 		Objects:     []model.ObjectIdentity{{Kind: model.ObjectSession, LogicalID: live.LogicalID, RuntimeID: "$1"}, {Kind: model.ObjectWindow, RuntimeID: "@1", PaneCount: 1}, {Kind: model.ObjectPane, RuntimeID: "%1", ParentID: "@1"}},
 		Memberships: []model.WindowMembership{{SessionID: "$1", WindowID: "@1", Index: 1}},
@@ -172,12 +172,12 @@ func TestReconcileReplansAfterNoopJournalNeedsAttention(t *testing.T) {
 		Windows: []model.Window{{Idx: 1, Name: "yazi", Role: "files", Cwd: "/work", SlotID: "00000000-0000-4000-8000-000000000002", TmuxID: "@1", Panes: []model.Pane{{Idx: 1, Cmd: "yazi", Cwd: "/work", SlotID: "00000000-0000-4000-8000-000000000003", TmuxID: "%1"}}}},
 	}
 	snapshot := model.Snapshot{
-		ServerKey: "server-a", Complete: true, Target: baseline, TargetSessionID: "$1", ActiveWindowID: "@1",
+		ServerKey: "server-a", Complete: true, Target: model.ObserveSession(baseline), TargetSessionID: "$1", ActiveWindowID: "@1",
 		Sessions:    []model.SessionIdentity{{Name: "work", LogicalID: baseline.LogicalID, RuntimeID: "$1"}},
 		Objects:     []model.ObjectIdentity{{Kind: model.ObjectSession, LogicalID: baseline.LogicalID, RuntimeID: "$1"}, {Kind: model.ObjectWindow, SlotID: baseline.Windows[0].SlotID, RuntimeID: "@1", PaneCount: 1}, {Kind: model.ObjectPane, SlotID: baseline.Windows[0].Panes[0].SlotID, RuntimeID: "%1", ParentID: "@1"}},
 		Memberships: []model.WindowMembership{{SessionID: "$1", WindowID: "@1", Index: 1}},
 	}
-	desired := core.DesiredState{Session: baseline, ClassifierVersion: 1}
+	desired := core.DesiredState{Baseline: model.BaselineFromSession(baseline), ClassifierVersion: 1}
 	plan := core.Plan(desired, snapshot, core.Resolve(desired, snapshot), core.PolicyPreserve)
 	if plan.Status != core.PlanNoop {
 		t.Fatalf("fixture plan = %+v; want noop", plan)
@@ -208,12 +208,12 @@ func TestNeedsAttentionNoopJournalReplansCurrentTaggedLiveState(t *testing.T) {
 		Windows: []model.Window{{Idx: 1, Name: "yazi", Role: "files", Cwd: "/work", SlotID: "00000000-0000-4000-8000-000000000002", TmuxID: "@1", Panes: []model.Pane{{Idx: 1, Cmd: "yazi", Cwd: "/work", SlotID: "00000000-0000-4000-8000-000000000003", TmuxID: "%1"}}}},
 	}
 	oldSnapshot := model.Snapshot{
-		ServerKey: "server-a", Complete: true, Target: baseline, TargetSessionID: "$1", ActiveWindowID: "@1",
+		ServerKey: "server-a", Complete: true, Target: model.ObserveSession(baseline), TargetSessionID: "$1", ActiveWindowID: "@1",
 		Sessions:    []model.SessionIdentity{{Name: "work", LogicalID: baseline.LogicalID, RuntimeID: "$1"}},
 		Objects:     []model.ObjectIdentity{{Kind: model.ObjectSession, LogicalID: baseline.LogicalID, RuntimeID: "$1"}, {Kind: model.ObjectWindow, SlotID: baseline.Windows[0].SlotID, RuntimeID: "@1", PaneCount: 1}, {Kind: model.ObjectPane, SlotID: baseline.Windows[0].Panes[0].SlotID, RuntimeID: "%1", ParentID: "@1"}},
 		Memberships: []model.WindowMembership{{SessionID: "$1", WindowID: "@1", Index: 1}},
 	}
-	desired := core.DesiredState{Session: baseline, ClassifierVersion: 1}
+	desired := core.DesiredState{Baseline: model.BaselineFromSession(baseline), ClassifierVersion: 1}
 	oldPlan := core.Plan(desired, oldSnapshot, core.Resolve(desired, oldSnapshot), core.PolicyPreserve)
 	if oldPlan.Status != core.PlanNoop {
 		t.Fatalf("old plan = %+v; want noop", oldPlan)
@@ -272,8 +272,29 @@ func TestReconcileReportsIncludeRuntimeIDsAndPolicyOutcome(t *testing.T) {
 	if got := reconcileReport(core.PlanResult{Status: core.PlanNoop, Policy: core.PolicyPreserve}); got != "already aligned" {
 		t.Fatalf("plain no-op report = %q, want explicit confirmation", got)
 	}
-	exact := reconcileReport(core.PlanResult{Status: core.PlanReady, Policy: core.PolicyExact, DesiredSession: model.Session{Windows: []model.Window{{}, {}}}})
+	exact := reconcileReport(core.PlanResult{Status: core.PlanReady, Policy: core.PolicyExact, DesiredBaseline: model.BaselineFromSession(model.Session{Windows: []model.Window{{}, {}}})})
 	if !strings.Contains(exact, "hard reconciled") || !strings.Contains(exact, "2 window(s)") {
 		t.Fatalf("exact report = %q", exact)
 	}
+}
+
+func (s *baselineTestStore) GetBaselineState(name string) (*model.Baseline, error) {
+	session, err := s.GetBaseline(name)
+	if err != nil || session == nil {
+		return nil, err
+	}
+	state := model.BaselineFromSession(*session)
+	return &state, nil
+}
+func (s *baselineTestStore) GetBaselineStateByLogicalID(id string) (*model.Baseline, error) {
+	session, err := s.GetBaselineByLogicalID(id)
+	if err != nil || session == nil {
+		return nil, err
+	}
+	state := model.BaselineFromSession(*session)
+	return &state, nil
+}
+func (s *baselineTestStore) CommitReconcileState(state model.Baseline, journalID string) error {
+	session := state.Session()
+	return s.CommitReconcile(&session, journalID)
 }

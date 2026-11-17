@@ -75,8 +75,8 @@ func TestStaleSourceMsgDropped(t *testing.T) {
 		if it.Name == "dead-session" {
 			t.Errorf("dead row resurrected at %d: %v", i, itemKeys(got.ui.items))
 		}
-		if it.Name != before[i] {
-			t.Errorf("row %d changed: %q vs original %q", i, it.Name, before[i])
+		if string(it.ID()) != before[i] {
+			t.Errorf("row %d changed: %q vs original %q", i, it.ID(), before[i])
 		}
 	}
 

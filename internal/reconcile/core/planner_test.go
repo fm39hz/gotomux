@@ -21,7 +21,7 @@ func khoCongPolicyFixture() (DesiredState, model.Snapshot) {
 			{Idx: 2, Name: "codex", Role: "agent", SlotID: "00000000-0000-4000-8000-000000000006", TmuxID: "@3", Cwd: "/work", Panes: []model.Pane{{Idx: 0, Cmd: "codex", Cwd: "/work", SlotID: "00000000-0000-4000-8000-000000000007", TmuxID: "%3"}}},
 		},
 	}
-	snapshot := model.Snapshot{ServerKey: live.ServerKey, Complete: true, Target: live, TargetSessionID: live.TmuxID, ActiveWindowID: "@3", Sessions: []model.SessionIdentity{{Name: live.Name, LogicalID: live.LogicalID, RuntimeID: live.TmuxID}}}
+	snapshot := model.Snapshot{ServerKey: live.ServerKey, Complete: true, Target: model.ObserveSession(live), TargetSessionID: live.TmuxID, ActiveWindowID: "@3", Sessions: []model.SessionIdentity{{Name: live.Name, LogicalID: live.LogicalID, RuntimeID: live.TmuxID}}}
 	snapshot.Objects = append(snapshot.Objects, model.ObjectIdentity{Kind: model.ObjectSession, LogicalID: live.LogicalID, RuntimeID: live.TmuxID})
 	for _, window := range live.Windows {
 		snapshot.Objects = append(snapshot.Objects, model.ObjectIdentity{Kind: model.ObjectWindow, SlotID: window.SlotID, RuntimeID: window.TmuxID, Layout: window.Layout, PaneCount: len(window.Panes)})
@@ -30,7 +30,7 @@ func khoCongPolicyFixture() (DesiredState, model.Snapshot) {
 			snapshot.Objects = append(snapshot.Objects, model.ObjectIdentity{Kind: model.ObjectPane, SlotID: pane.SlotID, RuntimeID: pane.TmuxID, ParentID: window.TmuxID})
 		}
 	}
-	return DesiredState{Session: base, ClassifierVersion: 1}, snapshot
+	return DesiredState{Baseline: model.BaselineFromSession(base), ClassifierVersion: 1}, snapshot
 }
 
 func TestPlanPreserveCreatesMissingBaselineAndKeepsCodexExtra(t *testing.T) {
@@ -45,7 +45,7 @@ func TestPlanPreserveCreatesMissingBaselineAndKeepsCodexExtra(t *testing.T) {
 	deleted := false
 	activePreserved := false
 	for _, op := range plan.Operations {
-		if op.Kind == OperationCreateWindow && op.Window.SlotID == desired.Session.Windows[1].SlotID {
+		if op.Kind == OperationCreateWindow && op.Window.SlotID == desired.Baseline.Session().Windows[1].SlotID {
 			createdAgent = true
 		}
 		if op.Kind == OperationMoveWindow && op.Target.ID == "@3" && op.Temporary {
@@ -58,7 +58,7 @@ func TestPlanPreserveCreatesMissingBaselineAndKeepsCodexExtra(t *testing.T) {
 			activePreserved = true
 		}
 	}
-	if !createdAgent || !stagedCodex || deleted || !activePreserved || len(plan.PreservedWindows) != 1 || plan.PreservedWindows[0] != "@3" {
+	if !createdAgent || !stagedCodex || deleted || activePreserved || len(plan.PreservedWindows) != 1 || plan.PreservedWindows[0] != "@3" {
 		t.Fatalf("preserve operations/policy = %+v", plan)
 	}
 }
@@ -68,7 +68,7 @@ func TestPlanDoesNotRenameSemanticAlias(t *testing.T) {
 	baseFiles := model.Window{Idx: 3, Name: "files", Role: "files", SlotID: "00000000-0000-4000-8000-000000000008", TmuxID: "@8", Cwd: "/work", Panes: []model.Pane{{Idx: 0, Cmd: "yazi", CmdPath: "/usr/bin/yazi", Cwd: "/work", SlotID: "00000000-0000-4000-8000-000000000009", TmuxID: "%8"}}}
 	liveFiles := baseFiles
 	liveFiles.Name, liveFiles.Idx = "yazi", 3
-	desired.Session.Windows = []model.Window{baseFiles}
+	desired.Baseline.Desired.Windows = model.RecipeFromSession(model.Session{Windows: []model.Window{baseFiles}}).Windows
 	live.Target.Windows = []model.Window{liveFiles}
 	live.ActiveWindowID = ""
 	live.Objects = []model.ObjectIdentity{{Kind: model.ObjectSession, LogicalID: live.Target.LogicalID, RuntimeID: "$1"}, {Kind: model.ObjectWindow, SlotID: liveFiles.SlotID, RuntimeID: "@8", PaneCount: 1}, {Kind: model.ObjectPane, SlotID: liveFiles.Panes[0].SlotID, RuntimeID: "%8", ParentID: "@8"}}
@@ -84,11 +84,11 @@ func TestPlanExactIsNoopWhenAlignedAndRebuildsOnlyWhenNeeded(t *testing.T) {
 	desired, live := khoCongPolicyFixture()
 	// Make the live tree exactly match the baseline, including the runtime
 	// identity of the agent window, without changing the baseline definition.
-	live.Target.Windows = append([]model.Window(nil), desired.Session.Windows...)
+	live.Target.Windows = append([]model.Window(nil), desired.Baseline.Session().Windows...)
 	live.ActiveWindowID = ""
 	for i := range live.Target.Windows {
-		live.Target.Windows[i].TmuxID = desired.Session.Windows[i].TmuxID
-		live.Target.Windows[i].Panes = append([]model.Pane(nil), desired.Session.Windows[i].Panes...)
+		live.Target.Windows[i].TmuxID = desired.Baseline.Session().Windows[i].TmuxID
+		live.Target.Windows[i].Panes = append([]model.Pane(nil), desired.Baseline.Session().Windows[i].Panes...)
 	}
 	live.Objects = []model.ObjectIdentity{{Kind: model.ObjectSession, LogicalID: live.Target.LogicalID, RuntimeID: "$1"}}
 	live.Memberships = nil
@@ -141,7 +141,7 @@ func TestPreserveKeepsDurableWindowIdentityAcrossRoleDrift(t *testing.T) {
 	}
 	live.Target.Windows[0].Name = "fish"
 	live.Target.Windows[0].Panes[0].Cmd = "fish"
-	desired := DesiredState{Session: base, ClassifierVersion: 1}
+	desired := DesiredState{Baseline: model.BaselineFromSession(base), ClassifierVersion: 1}
 	resolution := Resolve(desired, live)
 	if resolution.Status != ResolutionReady {
 		t.Fatalf("identity resolution = %+v", resolution)
@@ -153,9 +153,9 @@ func TestPreserveKeepsDurableWindowIdentityAcrossRoleDrift(t *testing.T) {
 	if err := Verify(desired, live, resolution, PolicyPreserve, plan); err != nil {
 		t.Fatalf("preserve verification rejected durable identity with live role drift: %v", err)
 	}
-	updated, err := RefreshBindings(base, live, resolution)
-	if err != nil || updated.Windows[0].Role != "files" {
-		t.Fatalf("preserve binding refresh overwrote the frozen role: role=%q err=%v", updated.Windows[0].Role, err)
+	updated, err := RefreshBindings(model.BaselineFromSession(base), live, resolution)
+	if err != nil || updated.Desired.Windows[0].Role != "files" {
+		t.Fatalf("preserve binding refresh overwrote the frozen role: role=%q err=%v", updated.Desired.Windows[0].Role, err)
 	}
 	exact := Plan(desired, live, resolution, PolicyExact)
 	if exact.Status != PlanReady || len(exact.Operations) != 1 || exact.Operations[0].Kind != OperationExactRebuild {
@@ -168,7 +168,7 @@ func TestPlanLinksExistingWindowBackFromAnotherSessionByIdentity(t *testing.T) {
 	desiredSession := model.Session{Name: "target", LogicalID: "00000000-0000-4000-8000-000000000001", SchemaVersion: model.CurrentBaselineSchemaVersion, TmuxID: "$1", ServerKey: "server-a", Cwd: "/work", ClassifierVersion: 1, Windows: []model.Window{baselineWindow}}
 	liveWindow := model.Window{Idx: 2, Name: "shell", TmuxID: "@2", Cwd: "/work", Panes: []model.Pane{{Idx: 0, Cwd: "/work", TmuxID: "%2"}}}
 	liveSession := model.Session{Name: "target", LogicalID: desiredSession.LogicalID, TmuxID: "$1", ServerKey: desiredSession.ServerKey, Cwd: "/work", Windows: []model.Window{liveWindow}}
-	snapshot := model.Snapshot{ServerKey: "server-a", Complete: true, Target: liveSession, TargetSessionID: "$1",
+	snapshot := model.Snapshot{ServerKey: "server-a", Complete: true, Target: model.ObserveSession(liveSession), TargetSessionID: "$1",
 		Sessions: []model.SessionIdentity{{Name: "target", LogicalID: desiredSession.LogicalID, RuntimeID: "$1"}, {Name: "other", RuntimeID: "$2"}},
 		Objects: []model.ObjectIdentity{
 			{Kind: model.ObjectSession, LogicalID: desiredSession.LogicalID, RuntimeID: "$1"}, {Kind: model.ObjectSession, RuntimeID: "$2"},
@@ -177,7 +177,7 @@ func TestPlanLinksExistingWindowBackFromAnotherSessionByIdentity(t *testing.T) {
 		},
 		Memberships: []model.WindowMembership{{SessionID: "$2", WindowID: "@1", Index: 4}, {SessionID: "$1", WindowID: "@2", Index: 2}},
 	}
-	desired := DesiredState{Session: desiredSession, ClassifierVersion: 1}
+	desired := DesiredState{Baseline: model.BaselineFromSession(desiredSession), ClassifierVersion: 1}
 	resolution := Resolve(desired, snapshot)
 	if resolution.Status != ResolutionReady || len(resolution.Windows) != 1 || !resolution.Windows[0].Match.OutsideTarget {
 		t.Fatalf("linked window resolution = %+v", resolution)
@@ -190,7 +190,7 @@ func TestPlanLinksExistingWindowBackFromAnotherSessionByIdentity(t *testing.T) {
 	if exact.Status != PlanBlocked || len(exact.Operations) != 0 {
 		t.Fatalf("exact policy must not kill a window linked to another session: %+v", exact)
 	}
-	desired.Session.Windows[0].Panes = append(desired.Session.Windows[0].Panes, model.Pane{Idx: 1, SlotID: "00000000-0000-4000-8000-000000000004", Cwd: "/work"})
+	desired.Baseline.Desired.Windows[0].Panes = append(desired.Baseline.Desired.Windows[0].Panes, model.PaneSpec{Idx: 1, SlotID: "00000000-0000-4000-8000-000000000004", Cwd: "/work"})
 	needsRepair := Resolve(desired, snapshot)
 	blocked := Plan(desired, snapshot, needsRepair, PolicyPreserve)
 	if blocked.Status != PlanBlocked || len(blocked.Operations) != 0 {
@@ -201,7 +201,7 @@ func TestPlanLinksExistingWindowBackFromAnotherSessionByIdentity(t *testing.T) {
 func TestResolveRejectsUnsupportedBaselineSchema(t *testing.T) {
 	base, live := identityFixture([]model.Window{{Idx: 0, Panes: []model.Pane{{Idx: 0}}}}, []model.Window{{Idx: 0, TmuxID: "@1", Panes: []model.Pane{{Idx: 0, TmuxID: "%1"}}}})
 	base.SchemaVersion = model.CurrentBaselineSchemaVersion - 1
-	got := Resolve(DesiredState{Session: base}, live)
+	got := Resolve(DesiredState{Baseline: model.BaselineFromSession(base)}, live)
 	if got.Status != ResolutionConflict {
 		t.Fatalf("unsupported baseline schema resolution = %+v", got)
 	}
@@ -237,13 +237,13 @@ func TestSnapshotFingerprintDoesNotMutateIdentityEvidence(t *testing.T) {
 }
 
 func TestPlanBindsResolvedSessionAndSlotsThroughVerifiedOperations(t *testing.T) {
-	baseWindow := model.Window{Idx: 1, Name: "editor", Cwd: "/work", Panes: []model.Pane{{Idx: 0, Cwd: "/work", Cmd: "nvim", CmdPath: "/usr/bin/nvim"}}}
+	baseWindow := model.Window{Idx: 1, Name: "editor", TmuxID: "@9", Cwd: "/work", Panes: []model.Pane{{Idx: 0, TmuxID: "%9", Cwd: "/work", Cmd: "nvim", CmdPath: "/usr/bin/nvim"}}}
 	liveWindow := model.Window{Idx: 1, Name: "renamed", Cwd: "/work", TmuxID: "@9", Panes: []model.Pane{{Idx: 0, Cwd: "/work", Cmd: "nvim", CmdPath: "/usr/bin/nvim", TmuxID: "%9"}}}
 	base, live := identityFixture([]model.Window{baseWindow}, []model.Window{liveWindow})
 	live.Target.LogicalID = ""
 	live.Sessions[0].LogicalID = ""
 	live.Objects[0].LogicalID = ""
-	desired := DesiredState{Session: base, ClassifierVersion: 1}
+	desired := DesiredState{Baseline: model.BaselineFromSession(base), ClassifierVersion: 1}
 	resolution := Resolve(desired, live)
 	plan := Plan(desired, live, resolution, PolicyPreserve)
 	if plan.Status != PlanReady || len(plan.Operations) != 3 {
@@ -271,5 +271,17 @@ func TestPreconditionFingerprintsIgnoreTransientExecutablePath(t *testing.T) {
 	}
 	if SnapshotFingerprint(snapshot) != SnapshotFingerprint(changed) {
 		t.Fatal("snapshot precondition changed only because best-effort CmdPath evidence disappeared")
+	}
+}
+
+func TestSnapshotFingerprintIgnoresUnrelatedSessionAndClientFocus(t *testing.T) {
+	_, live := khoCongPolicyFixture()
+	before := SnapshotFingerprint(live)
+	live.ActiveWindowID = "@1"
+	live.Sessions = append(live.Sessions, model.SessionIdentity{RuntimeID: "$99", Name: "other"})
+	live.Objects = append(live.Objects, model.ObjectIdentity{Kind: model.ObjectSession, RuntimeID: "$99"}, model.ObjectIdentity{Kind: model.ObjectWindow, RuntimeID: "@99"}, model.ObjectIdentity{Kind: model.ObjectPane, RuntimeID: "%99", ParentID: "@99"})
+	live.Memberships = append(live.Memberships, model.WindowMembership{SessionID: "$99", WindowID: "@99"})
+	if SnapshotFingerprint(live) != before {
+		t.Fatal("unrelated activity or client focus invalidated target plan")
 	}
 }

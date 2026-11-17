@@ -12,6 +12,7 @@ import (
 	"github.com/fm39hz/gotomux/internal/model"
 	core "github.com/fm39hz/gotomux/internal/reconcile/core"
 	"github.com/fm39hz/gotomux/internal/reconcile/runner"
+	"github.com/fm39hz/gotomux/internal/sessionguard"
 	"github.com/fm39hz/gotomux/internal/store"
 	"github.com/fm39hz/gotomux/internal/tmux"
 )
@@ -40,6 +41,21 @@ func ReconcileSession(ctx context.Context, ctl ReconcileOps, st store.Storer, na
 	if !live.Complete || live.Target.Name != name {
 		return "", fmt.Errorf("reconcile: target session observation is incomplete or changed")
 	}
+	release, err := sessionguard.Acquire(live.ServerKey, live.TargetSessionID)
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = release() }()
+	// Observation precedes locking only to discover the incarnation key.
+	// Re-observe under the lock before selecting a baseline or mutating tmux.
+	locked, err := ctl.Observe(ctx, name)
+	if err != nil {
+		return "", err
+	}
+	if !locked.Complete || locked.ServerKey != live.ServerKey || locked.TargetSessionID != live.TargetSessionID {
+		return "", fmt.Errorf("session incarnation changed before reconcile lock was acquired")
+	}
+	live = locked
 	base, err := loadReconcileBaseline(st, name, live.Target.LogicalID)
 	if err != nil {
 		return "", err
@@ -47,14 +63,15 @@ func ReconcileSession(ctx context.Context, ctl ReconcileOps, st store.Storer, na
 	if base == nil {
 		return "", fmt.Errorf("no reconcile baseline for %q; freeze the session first with gotomux -f", name)
 	}
-	if err := requireReconcileBaselineIdentity(*base); err != nil {
+	baseSession := base.Session()
+	if err := requireReconcileBaselineIdentity(baseSession); err != nil {
 		return "", fmt.Errorf("%w; freeze the intended session again with gotomux -f", err)
 	}
 	policy := core.PolicyPreserve
 	if hard {
 		policy = core.PolicyExact
 	}
-	active, err := findActiveJournal(st, *base, live.Target, name)
+	active, err := findActiveJournal(st, baseSession, live.Target.Session(), name)
 	if err != nil {
 		return "", err
 	}
@@ -67,19 +84,19 @@ func ReconcileSession(ctx context.Context, ctl ReconcileOps, st store.Storer, na
 			active = nil // safe legacy/unsupported plan was aborted before mutation
 		} else if plan.Policy != policy {
 			return "", fmt.Errorf("reconcile journal %q uses policy %q; resume it with the same policy", active.ID, plan.Policy)
-		} else if active.Status == model.JournalNeedsAttention && active.CompletedStep == len(plan.Operations) {
+		} else if active.Status == model.JournalNeedsAttention && len(plan.Operations) > 0 && active.CompletedStep == len(plan.Operations) {
 			// The cursor proves every operation's postcondition was observed. A
 			// repeated terminal verification must not execute that operation list
 			// again. Commit if the current complete observation now verifies;
 			// otherwise only preserve may replan, and only after operation markers
 			// prove there is no staged/uncertain object to recover.
-			desired := core.DesiredState{Session: plan.DesiredSession, ClassifierVersion: plan.ClassifierVersion}
+			desired := core.DesiredState{Baseline: plan.DesiredBaseline, ClassifierVersion: plan.ClassifierVersion}
 			resolution := core.Resolve(desired, *live)
 			verifyErr := core.Verify(desired, *live, resolution, plan.Policy, *plan)
 			if verifyErr == nil {
 				return executeAndCommit(ctx, ctl, st, name, active.ID, *plan)
 			}
-			if plan.Policy != core.PolicyPreserve || hasTargetOperationMarkers(*live) {
+			if plan.Policy != core.PolicyPreserve || hasTargetOperationMarkers(*live, *plan) {
 				return "", fmt.Errorf("reconcile journal %q is at terminal verification with no safe automatic recovery: %w; journal remains needs_attention", active.ID, verifyErr)
 			}
 			if err := st.UpdateReconcile(active.ID, model.JournalAborted, active.CompletedStep, "terminal verification failed; no operation markers remain; replanning from a fresh snapshot: "+verifyErr.Error()); err != nil {
@@ -98,10 +115,11 @@ func ReconcileSession(ctx context.Context, ctl ReconcileOps, st store.Storer, na
 		}
 	}
 
-	desired := core.DesiredState{Session: *base}
-	desired.Session.Name = live.Target.Name
-	stampSemanticMetadata(&desired.Session)
-	desired.ClassifierVersion = desired.Session.ClassifierVersion
+	baseSession.Name = live.Target.Name
+	stampSemanticMetadata(&baseSession)
+	base.Desired = model.RecipeFromSession(baseSession)
+	base.ClassifierVersion = baseSession.ClassifierVersion
+	desired := core.DesiredState{Baseline: *base, ClassifierVersion: base.ClassifierVersion}
 	resolution := core.Resolve(desired, *live)
 	if resolution.Status != core.ResolutionReady {
 		return resolutionReport(resolution), nil
@@ -126,12 +144,12 @@ func ReconcileSession(ctx context.Context, ctl ReconcileOps, st store.Storer, na
 		return "", err
 	}
 	journal := model.ReconcileJournal{
-		ID: journalID, SessionKey: desired.Session.LogicalID, SessionName: name,
-		SessionLogicalID: desired.Session.LogicalID, Policy: string(policy),
+		ID: journalID, SessionKey: desired.Baseline.Desired.LogicalID, SessionName: name,
+		SessionLogicalID: desired.Baseline.Desired.LogicalID, Policy: string(policy),
 		Status: model.JournalPlanned, PlanJSON: string(planJSON),
 	}
 	if err := st.StartReconcile(journal); err != nil {
-		if active, getErr := st.GetActiveReconcile(desired.Session.LogicalID); getErr == nil && active != nil {
+		if active, getErr := st.GetActiveReconcile(desired.Baseline.Desired.LogicalID); getErr == nil && active != nil {
 			return "", fmt.Errorf("reconcile %q is already active as journal %s (%s)", name, active.ID, active.Status)
 		}
 		return "", err
@@ -149,7 +167,7 @@ func decodeJournalPlan(st store.Storer, journal *model.ReconcileJournal) (*core.
 		return nil, fmt.Errorf("reconcile journal %q has invalid plan JSON at cursor %d: %w", journal.ID, journal.CompletedStep, err)
 	}
 	if plan.PlanSchemaVersion == core.CurrentPlanSchemaVersion {
-		if plan.ID == "" || plan.Policy.Validate() != nil || plan.DesiredSession.LogicalID != journal.SessionLogicalID || plan.Resolution.ServerKey == "" || plan.Resolution.TargetSession.LiveRuntimeID == "" {
+		if plan.ID == "" || plan.Policy.Validate() != nil || plan.DesiredBaseline.Session().LogicalID != journal.SessionLogicalID || plan.Resolution.ServerKey == "" || plan.Resolution.TargetSession.LiveRuntimeID == "" {
 			return nil, quarantineJournal(st, journal, "plan identity or policy envelope is incomplete")
 		}
 		if journal.CompletedStep < 0 || journal.CompletedStep > len(plan.Operations) {
@@ -186,7 +204,7 @@ func quarantineJournal(st store.Storer, journal *model.ReconcileJournal, reason 
 	return fmt.Errorf("invalid reconcile plan: %s; journal %q remains needs_attention", reason, journal.ID)
 }
 
-func hasTargetOperationMarkers(snapshot model.Snapshot) bool {
+func hasTargetOperationMarkers(snapshot model.Snapshot, plan core.PlanResult) bool {
 	targetWindows := make(map[string]bool, len(snapshot.Target.Windows))
 	for _, window := range snapshot.Target.Windows {
 		targetWindows[window.TmuxID] = true
@@ -195,6 +213,12 @@ func hasTargetOperationMarkers(snapshot model.Snapshot) bool {
 		if object.OperationID == "" {
 			continue
 		}
+		for _, operation := range plan.Operations {
+			if object.OperationID == operation.ID || strings.HasPrefix(object.OperationID, operation.ID+"/") {
+				return true
+			}
+		}
+
 		switch object.Kind {
 		case model.ObjectSession:
 			if object.RuntimeID == snapshot.TargetSessionID {
@@ -222,24 +246,22 @@ func isWindowMemberOf(memberships []model.WindowMembership, sessionID, windowID 
 	return false
 }
 
-func loadReconcileBaseline(st store.Storer, name, liveLogicalID string) (*model.Session, error) {
+func loadReconcileBaseline(st store.Storer, name, liveLogicalID string) (*model.Baseline, error) {
 	if liveLogicalID != "" {
-		base, err := st.GetBaselineByLogicalID(liveLogicalID)
+		base, err := st.GetBaselineStateByLogicalID(liveLogicalID)
 		if err != nil || base != nil {
 			return base, err
 		}
-		// A known live logical identity is authoritative. A same-name baseline
-		// with another identity is a conflict, not a fallback candidate.
-		byName, err := st.GetBaseline(name)
+		byName, err := st.GetBaselineState(name)
 		if err != nil {
 			return nil, err
 		}
-		if byName != nil && byName.LogicalID != liveLogicalID {
-			return nil, fmt.Errorf("live session %q has logical identity %s but its name is associated with baseline identity %s", name, liveLogicalID, byName.LogicalID)
+		if byName != nil && byName.Desired.LogicalID != liveLogicalID {
+			return nil, fmt.Errorf("live session %q has logical identity %s but its name is associated with baseline identity %s", name, liveLogicalID, byName.Desired.LogicalID)
 		}
 		return nil, nil
 	}
-	base, err := st.GetBaseline(name)
+	base, err := st.GetBaselineState(name)
 	if err != nil || base != nil {
 		return base, err
 	}
@@ -331,7 +353,7 @@ func executeAndCommit(ctx context.Context, ctl ReconcileOps, st store.Storer, se
 		_ = st.UpdateReconcile(journalID, model.JournalNeedsAttention, len(plan.Operations), "post-run observation failed: "+err.Error())
 		return "", fmt.Errorf("reconcile ran but final observation failed: %w", err)
 	}
-	desired := core.DesiredState{Session: plan.DesiredSession, ClassifierVersion: plan.ClassifierVersion}
+	desired := core.DesiredState{Baseline: plan.DesiredBaseline, ClassifierVersion: plan.ClassifierVersion}
 	resolution := core.Resolve(desired, *fresh)
 	if err := core.Verify(desired, *fresh, resolution, plan.Policy, plan); err != nil {
 		_ = st.UpdateReconcile(journalID, model.JournalNeedsAttention, len(plan.Operations), "verification failed: "+err.Error())
@@ -353,13 +375,14 @@ func executeAndCommit(ctx context.Context, ctl ReconcileOps, st store.Storer, se
 			return "", fmt.Errorf("exact rebuild did not verify after marker cleanup: %w", err)
 		}
 	}
-	updated, err := core.RefreshBindings(plan.DesiredSession, *fresh, resolution)
+	updated, err := core.RefreshBindings(plan.DesiredBaseline, *fresh, resolution)
 	if err != nil {
 		_ = st.UpdateReconcile(journalID, model.JournalNeedsAttention, len(plan.Operations), "binding refresh failed: "+err.Error())
 		return "", fmt.Errorf("reconcile verified but binding refresh failed: %w", err)
 	}
-	if err := st.CommitReconcile(&updated, journalID); err != nil {
-		return "", fmt.Errorf("reconcile verified but baseline/journal commit failed: %w", err)
+	commitErr := st.CommitReconcileState(updated, journalID)
+	if commitErr != nil {
+		return "", fmt.Errorf("reconcile verified but baseline/journal commit failed: %w", commitErr)
 	}
 	return reconcileReport(plan), nil
 }
@@ -375,7 +398,7 @@ func clearExactOperationMarkers(ctx context.Context, ctl ReconcileOps, plan core
 	if exact == nil {
 		return nil
 	}
-	for _, baselineWindow := range plan.DesiredSession.Windows {
+	for _, baselineWindow := range plan.DesiredBaseline.Session().Windows {
 		var liveWindow *model.Window
 		for i := range snapshot.Target.Windows {
 			if snapshot.Target.Windows[i].SlotID == baselineWindow.SlotID {
@@ -473,7 +496,7 @@ func reconcileReport(plan core.PlanResult) string {
 		return fmt.Sprintf("already aligned; preserved %d extra window(s) and %d extra pane(s)%s", len(plan.PreservedWindows), len(plan.PreservedPanes), groupNote)
 	}
 	if plan.Policy == core.PolicyExact {
-		return fmt.Sprintf("hard reconciled: rebuilt %d window(s); prior pane processes were terminated%s", len(plan.DesiredSession.Windows), groupNote)
+		return fmt.Sprintf("hard reconciled: rebuilt %d window(s); prior pane processes were terminated%s", len(plan.DesiredBaseline.Session().Windows), groupNote)
 	}
 	moves := map[string]bool{}
 	created, repaired := 0, 0

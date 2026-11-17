@@ -71,7 +71,7 @@ func (f *fakeIdentityOps) SetStableID(_ context.Context, kind tmux.IdentityKind,
 func identitySnapshot() model.Snapshot {
 	return model.Snapshot{
 		ServerKey: "server-1", Complete: true, TargetSessionID: "$1",
-		Target:      model.Session{Name: "work", TmuxID: "$1", ServerKey: "server-1", Windows: []model.Window{{Idx: 1, TmuxID: "@1", Panes: []model.Pane{{Idx: 0, TmuxID: "%1"}}}}},
+		Target:      model.ObservedSession{Name: "work", TmuxID: "$1", ServerKey: "server-1", Windows: []model.Window{{Idx: 1, TmuxID: "@1", Panes: []model.Pane{{Idx: 0, TmuxID: "%1"}}}}},
 		Sessions:    []model.SessionIdentity{{Name: "work", RuntimeID: "$1"}},
 		Objects:     []model.ObjectIdentity{{Kind: "session", RuntimeID: "$1"}, {Kind: "window", RuntimeID: "@1"}, {Kind: "pane", RuntimeID: "%1", ParentID: "@1"}},
 		Memberships: []model.WindowMembership{{SessionID: "$1", WindowID: "@1", Index: 1}},
@@ -125,5 +125,17 @@ func TestEnsureLiveIdentitiesCanResumeAfterPartialTagFailure(t *testing.T) {
 	}
 	if ops.snapshot.Target.LogicalID == "" || ops.snapshot.Target.Windows[0].SlotID == "" || ops.snapshot.Target.Windows[0].Panes[0].SlotID == "" {
 		t.Fatalf("resume left an untagged target: %+v", ops.snapshot.Target)
+	}
+}
+
+func TestLoadedReceiptMismatchNeverAssignsIdentity(t *testing.T) {
+	ops := &fakeIdentityOps{snapshot: identitySnapshot()}
+	preferred := ops.snapshot.Target.Session()
+	preferred.TmuxID = "$9"
+	if _, err := EnsureLiveIdentitiesFromPreset(context.Background(), ops, "work", &preferred); err == nil {
+		t.Fatal("accepted another session's creation receipt")
+	}
+	if ops.sets != 0 {
+		t.Fatal("identity was written before validating creation ownership")
 	}
 }

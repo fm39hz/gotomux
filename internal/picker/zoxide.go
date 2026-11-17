@@ -3,6 +3,7 @@ package picker
 import (
 	"time"
 
+	mod "github.com/fm39hz/gotomux/internal/model"
 	"github.com/fm39hz/gotomux/internal/store"
 	"github.com/fm39hz/gotomux/internal/zoxide"
 )
@@ -126,7 +127,8 @@ func ZoxRowsToItems(rows []store.ZoxRow) []Item {
 		}
 		out = append(out, Item{
 			Kind:  KindZoxide,
-			Title: title, Desc: r.Desc, Name: r.Name, Path: r.Path, Recency: r.Recency,
+			Title: title, Desc: r.Desc, Name: r.Name, Path: r.Path,
+			Identity: mod.EntityIdentity{ProjectPath: r.Path}, Recency: r.Recency,
 		})
 	}
 	return out

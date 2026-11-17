@@ -96,7 +96,7 @@ func TestRemapPaneIDsLeavesLegacyLayoutStringsUnchanged(t *testing.T) {
 }
 
 func TestPaneIDsReturnsJSONLayoutLeafOrder(t *testing.T) {
-	layout := `{"V":2,"L":{"t":"v","c":[{"t":"h","c":[{"t":"p","I":"%8"},{"t":"p","I":"%9"}]},{"t":"p","I":"%10"}]}}`
+	layout := `{"V":2,"L":{"t":"v","c":[{"t":"h","c":[{"t":"p","I":"%8","i":0},{"t":"p","I":"%9","i":1}]},{"t":"p","I":"%10","i":2}]}}`
 	ids, err := PaneIDs(layout)
 	if err != nil {
 		t.Fatal(err)

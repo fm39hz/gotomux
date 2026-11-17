@@ -12,44 +12,6 @@ import (
 
 // --- unit tests: no tmux required, run under -short ---
 
-func TestQuoteArg(t *testing.T) {
-	cases := []struct{ in, want string }{
-		{"list-sessions", "list-sessions"},
-		{"-F", "-F"},
-		{"even-vertical", "even-vertical"},
-		{"/home/a/b.c", "/home/a/b.c"},
-		// A TAB must force quoting. The previous quote set omitted it, so the
-		// tab-separated list format was split into argv by tmux and only "S"
-		// survived as the format string.
-		{"S\t#{session_name}", "'S\t#{session_name}'"},
-		{"#{session_id}", "'#{session_id}'"},
-		{"a b", "'a b'"},
-		{";", "';'"},
-		{"it's", `'it'\''s'`},
-		{"", "''"},
-	}
-	for _, c := range cases {
-		if got := quoteArg(c.in); got != c.want {
-			t.Errorf("quoteArg(%q) = %q, want %q", c.in, got, c.want)
-		}
-	}
-}
-
-func TestBuildCommandQuotesFormat(t *testing.T) {
-	line := buildCommand([]string{"list-sessions", "-F", ListSessFmt})
-	if !strings.HasSuffix(line, "\n") {
-		t.Fatalf("command not newline-terminated: %q", line)
-	}
-	if !strings.Contains(line, "'"+ListSessFmt+"'") {
-		t.Errorf("format not single-quoted in %q", line)
-	}
-	if strings.Count(line, " ") != 2 {
-		// "list-sessions", "-F", "<quoted fmt>" — the tabs inside the quoted
-		// format must not become argument separators.
-		t.Errorf("unexpected argument split: %q", line)
-	}
-}
-
 func TestDropHiddenKeepsOrderAndNotNil(t *testing.T) {
 	in := []LiveSession{{Name: "a"}, {Name: HiddenControlSession}, {Name: "b"}}
 	got := DropHidden(in)
@@ -58,20 +20,6 @@ func TestDropHiddenKeepsOrderAndNotNil(t *testing.T) {
 	}
 	if empty := DropHidden([]LiveSession{{Name: HiddenControlSession}}); empty == nil || len(empty) != 0 {
 		t.Errorf("DropHidden(all-hidden) = %v, want non-nil empty", empty)
-	}
-}
-
-func TestClientBlockUsesBeginFlag(t *testing.T) {
-	// Flag 0 is the unsolicited block emitted for the connection's own
-	// new-session; handing it to the first Send would mispair every reply after.
-	if clientBlock("%begin 1785069236 677 0") {
-		t.Error("flag 0 block treated as a client reply")
-	}
-	if !clientBlock("%begin 1785069237 686 1") {
-		t.Error("flag 1 block not treated as a client reply")
-	}
-	if clientBlock("%begin garbage") {
-		t.Error("malformed begin line treated as a client reply")
 	}
 }
 
@@ -139,8 +87,7 @@ func TestControlConnListsAndDoesNotPerturb(t *testing.T) {
 		if !ok {
 			t.Fatalf("session %q missing from %d parsed sessions; raw:\n%s", want, len(live), raw)
 		}
-		// A bare "S" format would parse to nothing, so a populated Path proves
-		// the quoted format string survived tmux's own lexer.
+		// A populated Path proves the typed query retained the session root.
 		if s.Path == "" {
 			t.Errorf("%s has empty Path — format string was split, not quoted", want)
 		}
@@ -240,7 +187,7 @@ func drainFor(cc *ControlConn, d time.Duration) {
 	}
 }
 
-func TestControlConnErrorThenReconnect(t *testing.T) {
+func TestControlConnReconnectAfterLibraryConnectionCloses(t *testing.T) {
 	isolatedServer(t)
 	tmuxtest.NewSessions(t, "zt-err")
 	cc, err := StartControl()
@@ -252,18 +199,20 @@ func TestControlConnErrorThenReconnect(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	// A malformed command must surface as an error, not hang and not be
-	// mistaken for empty output. tmux reports it via %error, with the message in
-	// the block body — not on the %error line itself.
-	if _, err := cc.Send(ctx, "no-such-tmux-command"); err == nil {
-		t.Fatal("bogus command returned no error")
+	// Closing the library transport exercises the same dead-client path as its
+	// framed %exit handling, without reaching around it to write protocol bytes.
+	if err := cc.conn.Close(); err != nil {
+		t.Fatalf("library Connection.Close: %v", err)
 	}
-
-	// tmux may drop the client after a parse error; recovery must work.
-	if !cc.Alive() {
-		if err := cc.Reconnect(); err != nil {
-			t.Fatalf("Reconnect after error: %v", err)
-		}
+	deadline := time.Now().Add(time.Second)
+	for cc.Alive() && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if cc.Alive() {
+		t.Fatal("Alive true after library connection closed")
+	}
+	if err := cc.Reconnect(); err != nil {
+		t.Fatalf("Reconnect after connection exit: %v", err)
 	}
 	out, err := cc.Send(ctx, "list-sessions", "-F", "#{session_name}")
 	if err != nil {

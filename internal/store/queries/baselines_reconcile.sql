@@ -14,10 +14,10 @@ UPDATE baseline SET body = ?, updated_at = ?, logical_id = ? WHERE name = ?;
 INSERT INTO baseline(name, body, updated_at, logical_id) VALUES(?, ?, ?, ?);
 
 -- name: BaselineByName :one
-SELECT body FROM baseline WHERE name = ?;
+SELECT body, logical_id FROM baseline WHERE name = ?;
 
 -- name: BaselineByLogicalID :one
-SELECT body FROM baseline WHERE logical_id = ?;
+SELECT body, logical_id FROM baseline WHERE logical_id = ?;
 
 -- name: InsertReconcileJournal :exec
 INSERT INTO reconcile_journal
@@ -51,3 +51,14 @@ SELECT session_key, session_logical_id, status FROM reconcile_journal WHERE id =
 
 -- name: CompleteReconcileJournal :exec
 UPDATE reconcile_journal SET status = ?, last_error = '', updated_at = ? WHERE id = ? AND status = ?;
+
+-- name: AbortReconcilesForFreeze :exec
+UPDATE reconcile_journal
+SET status = 'aborted', last_error = 'superseded by explicit freeze', updated_at = ?
+WHERE status IN ('planned', 'running', 'needs_attention')
+  AND (session_logical_id = ? OR session_name = ?);
+
+-- name: AbortReconcilesForRevision :exec
+UPDATE reconcile_journal
+SET status = 'aborted', last_error = 'superseded by explicit recipe edit', updated_at = ?
+WHERE status IN ('planned', 'running', 'needs_attention') AND session_logical_id = ?;

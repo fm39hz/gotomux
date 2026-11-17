@@ -4,6 +4,7 @@ import (
 	"context"
 	"time"
 
+	mod "github.com/fm39hz/gotomux/internal/model"
 	"github.com/fm39hz/gotomux/internal/store"
 	"github.com/fm39hz/gotomux/internal/tmux"
 )
@@ -12,8 +13,9 @@ import (
 // Built once per picker open, threaded through the pipeline instead of
 // scattering individual parameters across function signatures.
 type Context struct {
-	Session     string           // current tmux session name, "" outside tmux
-	Path        string           // session path (project root), "" outside tmux
+	Session     string // current tmux session name, "" outside tmux
+	Path        string // session path (project root), "" outside tmux
+	Identity    mod.EntityIdentity
 	Pairs       map[string]int64 // co-occurrence scores with current session
 	Transitions map[string]int64 // directed switch scores from current session
 	Usage       map[string]store.Usage
@@ -40,8 +42,10 @@ func newContext(ctl tmux.Connector, st store.Storer, live []tmux.LiveSession, se
 	if sessID != "" {
 		if cur, ok := tmux.FindByID(live, sessID); ok {
 			ctx.Session, ctx.Path = cur.Name, cur.Path
+			ctx.Identity = mod.EntityIdentity{LogicalID: cur.LogicalID, ServerKey: cur.ServerKey, RuntimeID: cur.ID, ProjectPath: cur.Path}
 		} else if ctl != nil {
 			ctx.Session, ctx.Path = ctl.CurrentContext(context.Background())
+			ctx.Identity.ProjectPath = ctx.Path
 		}
 	}
 	if st != nil {

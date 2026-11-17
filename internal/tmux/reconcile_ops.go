@@ -81,14 +81,14 @@ func (c *Ctl) MoveWindowTo(ctx context.Context, session, windowID string, from, 
 			source = session + ":" + windowID
 		}
 	}
-	return tmuxRun(ctx, "move-window", "-s", source, "-t", windowTarget(session, to))
+	return tmuxRun(ctx, "move-window", "-d", "-s", source, "-t", windowTarget(session, to))
 }
 
 func (c *Ctl) LinkWindowTo(ctx context.Context, session, windowID string, idx int) error {
 	if !strings.HasPrefix(windowID, "@") {
 		return fmt.Errorf("link-window requires a tmux window ID")
 	}
-	return tmuxRun(ctx, "link-window", "-s", windowID, "-t", windowTarget(session, idx))
+	return tmuxRun(ctx, "link-window", "-d", "-s", windowID, "-t", windowTarget(session, idx))
 }
 
 func (c *Ctl) KillWindowAt(ctx context.Context, session, windowID string, idx int) error {

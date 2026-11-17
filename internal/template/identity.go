@@ -37,12 +37,42 @@ func ensureLiveIdentities(ctx context.Context, ops IdentityOps, targetName strin
 		return nil, err
 	}
 	if preferred != nil {
+		if preferred.TmuxID == "" || preferred.TmuxID != snapshot.TargetSessionID || preferred.ServerKey == "" || preferred.ServerKey != snapshot.ServerKey {
+			return nil, fmt.Errorf("loaded session incarnation changed before identity assignment")
+		}
 		if preferred.Name != targetName || len(preferred.Windows) != len(snapshot.Target.Windows) {
 			return nil, fmt.Errorf("preset identity tree does not match loaded session topology")
 		}
-		for i := range preferred.Windows {
-			if len(preferred.Windows[i].Panes) != len(snapshot.Target.Windows[i].Panes) {
-				return nil, fmt.Errorf("preset identity tree window %d does not match loaded pane topology", i)
+		seenWindows, seenPanes := map[string]bool{}, map[string]bool{}
+		for wi := range preferred.Windows {
+			pw := &preferred.Windows[wi]
+			var lw *model.Window
+			for li := range snapshot.Target.Windows {
+				if snapshot.Target.Windows[li].TmuxID == pw.TmuxID {
+					lw = &snapshot.Target.Windows[li]
+					break
+				}
+			}
+			if pw.TmuxID == "" || lw == nil || seenWindows[pw.TmuxID] {
+				return nil, fmt.Errorf("creation receipt has missing or duplicate window handle %q", pw.TmuxID)
+			}
+			seenWindows[pw.TmuxID] = true
+			if len(pw.Panes) != len(lw.Panes) {
+				return nil, fmt.Errorf("preset identity tree window %d does not match loaded pane topology", wi)
+			}
+			for pi := range pw.Panes {
+				pane := &pw.Panes[pi]
+				found := false
+				for _, lp := range lw.Panes {
+					if lp.TmuxID == pane.TmuxID {
+						found = true
+						break
+					}
+				}
+				if pane.TmuxID == "" || !found || seenPanes[pane.TmuxID] {
+					return nil, fmt.Errorf("creation receipt has missing, moved, or duplicate pane handle %q", pane.TmuxID)
+				}
+				seenPanes[pane.TmuxID] = true
 			}
 		}
 	}
@@ -84,18 +114,49 @@ func ensureLiveIdentities(ctx context.Context, ops IdentityOps, targetName strin
 	if err := assign(tmux.IdentitySession, snapshot.Target.TmuxID, snapshot.Target.LogicalID, preferredSessionID); err != nil {
 		return nil, fmt.Errorf("identity assignment may be partial; rerun to resume: %w", err)
 	}
-	for wi, window := range snapshot.Target.Windows {
+	windowsToAssign := make([]struct {
+		live   model.Window
+		wanted *model.Window
+	}, 0, len(snapshot.Target.Windows))
+	if preferred == nil {
+		for _, window := range snapshot.Target.Windows {
+			windowsToAssign = append(windowsToAssign, struct {
+				live   model.Window
+				wanted *model.Window
+			}{live: window})
+		}
+	} else {
+		for wi := range preferred.Windows {
+			wanted := &preferred.Windows[wi]
+			for _, liveWindow := range snapshot.Target.Windows {
+				if liveWindow.TmuxID == wanted.TmuxID {
+					windowsToAssign = append(windowsToAssign, struct {
+						live   model.Window
+						wanted *model.Window
+					}{live: liveWindow, wanted: wanted})
+					break
+				}
+			}
+		}
+	}
+	for _, target := range windowsToAssign {
+		window := target.live
 		preferredWindowID := ""
 		if preferred != nil {
-			preferredWindowID = preferred.Windows[wi].SlotID
+			preferredWindowID = target.wanted.SlotID
 		}
 		if err := assign(tmux.IdentityWindow, window.TmuxID, window.SlotID, preferredWindowID); err != nil {
 			return nil, fmt.Errorf("identity assignment may be partial; rerun to resume: %w", err)
 		}
-		for pi, pane := range window.Panes {
+		for _, pane := range window.Panes {
 			preferredPaneID := ""
 			if preferred != nil {
-				preferredPaneID = preferred.Windows[wi].Panes[pi].SlotID
+				for _, wanted := range target.wanted.Panes {
+					if wanted.TmuxID == pane.TmuxID {
+						preferredPaneID = wanted.SlotID
+						break
+					}
+				}
 			}
 			if err := assign(tmux.IdentityPane, pane.TmuxID, pane.SlotID, preferredPaneID); err != nil {
 				return nil, fmt.Errorf("identity assignment may be partial; rerun to resume: %w", err)
@@ -109,11 +170,15 @@ func ensureLiveIdentities(ctx context.Context, ops IdentityOps, targetName strin
 	if err := validateIdentitySnapshot(verified, targetName); err != nil {
 		return nil, fmt.Errorf("identity tags were written but verification failed: %w", err)
 	}
-	if err := requireTargetIDs(verified.Target); err != nil {
+	if err := requireTargetIDs(verified.Target.Session()); err != nil {
 		return nil, fmt.Errorf("identity tags were written but target remains incomplete: %w", err)
 	}
+	if verified.ServerKey != snapshot.ServerKey || verified.TargetSessionID != snapshot.TargetSessionID {
+		return nil, fmt.Errorf("session incarnation changed during identity assignment")
+	}
 	verified.Target.SchemaVersion = model.CurrentBaselineSchemaVersion
-	return &verified.Target, nil
+	session := verified.Target.Session()
+	return &session, nil
 }
 
 func validateIdentitySnapshot(snapshot *model.Snapshot, targetName string) error {

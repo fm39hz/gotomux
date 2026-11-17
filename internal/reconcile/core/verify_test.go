@@ -13,11 +13,11 @@ func TestVerifyUsesIdentityAndRoleWhilePreservingExtras(t *testing.T) {
 	extra := model.Window{Idx: 7, Name: "codex", Role: "agent", SlotID: "00000000-0000-4000-8000-000000000004", TmuxID: "@10", Cwd: "/work", Panes: []model.Pane{{Idx: 0, Cmd: "codex", Cwd: "/work", SlotID: "00000000-0000-4000-8000-000000000005", TmuxID: "%10"}}}
 	base, snapshot := identityFixture([]model.Window{baseWindow}, []model.Window{liveFiles, extra})
 	base.ClassifierVersion = 1
-	resolution := Resolve(DesiredState{Session: base, ClassifierVersion: 1}, snapshot)
-	if err := Verify(DesiredState{Session: base, ClassifierVersion: 1}, snapshot, resolution, PolicyPreserve, PlanResult{}); err != nil {
+	resolution := Resolve(DesiredState{Baseline: model.BaselineFromSession(base), ClassifierVersion: 1}, snapshot)
+	if err := Verify(DesiredState{Baseline: model.BaselineFromSession(base), ClassifierVersion: 1}, snapshot, resolution, PolicyPreserve, PlanResult{}); err != nil {
 		t.Fatalf("preserve verification rejected role alias/extra: %v (resolution=%+v)", err, resolution)
 	}
-	if err := Verify(DesiredState{Session: base, ClassifierVersion: 1}, snapshot, resolution, PolicyExact, PlanResult{}); err == nil {
+	if err := Verify(DesiredState{Baseline: model.BaselineFromSession(base), ClassifierVersion: 1}, snapshot, resolution, PolicyExact, PlanResult{}); err == nil {
 		t.Fatal("exact verification accepted preserved extra window")
 	}
 }
@@ -28,16 +28,16 @@ func TestRefreshBindingsFollowsResolutionInsteadOfBaselineIndex(t *testing.T) {
 	liveWindow.Idx, liveWindow.TmuxID, liveWindow.Panes[0].TmuxID = 4, "@9", "%9"
 	extra := model.Window{Idx: 1, Name: "extra", SlotID: "00000000-0000-4000-8000-000000000004", TmuxID: "@8", Cwd: "/work", Panes: []model.Pane{{Idx: 0, SlotID: "00000000-0000-4000-8000-000000000005", TmuxID: "%8", Cwd: "/work"}}}
 	base, snapshot := identityFixture([]model.Window{baseWindow}, []model.Window{liveWindow, extra})
-	resolution := Resolve(DesiredState{Session: base}, snapshot)
+	resolution := Resolve(DesiredState{Baseline: model.BaselineFromSession(base)}, snapshot)
 	if resolution.Status != ResolutionReady || len(resolution.Windows) != 1 || resolution.Windows[0].Match.LiveRuntimeID != "@9" {
 		t.Fatalf("resolution = %+v", resolution)
 	}
-	updated, err := RefreshBindings(base, snapshot, resolution)
+	updated, err := RefreshBindings(model.BaselineFromSession(base), snapshot, resolution)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if updated.Windows[0].TmuxID != "@9" || updated.Windows[0].Panes[0].TmuxID != "%9" || updated.Windows[0].TmuxID == extra.TmuxID {
-		t.Fatalf("runtime bindings were selected by index instead of resolution: %+v", updated.Windows[0])
+	if updated.Bindings.Windows[base.Windows[0].SlotID] != "@9" || updated.Bindings.Panes[base.Windows[0].Panes[0].SlotID] != "%9" || updated.Bindings.Windows[base.Windows[0].SlotID] == extra.TmuxID {
+		t.Fatalf("runtime bindings were selected by index instead of resolution: %+v", updated.Session().Windows[0])
 	}
 }
 
@@ -48,8 +48,8 @@ func TestVerifyRejectsMissingBaselineLogicalObjectEvenAtCorrectIndex(t *testing.
 	base, snapshot := identityFixture([]model.Window{baseWindow}, []model.Window{liveWindow})
 	snapshot.Objects[1].SlotID = liveWindow.SlotID
 	snapshot.Target.Windows[0].SlotID = liveWindow.SlotID
-	resolution := Resolve(DesiredState{Session: base}, snapshot)
-	if err := Verify(DesiredState{Session: base}, snapshot, resolution, PolicyPreserve, PlanResult{}); err == nil {
+	resolution := Resolve(DesiredState{Baseline: model.BaselineFromSession(base)}, snapshot)
+	if err := Verify(DesiredState{Baseline: model.BaselineFromSession(base)}, snapshot, resolution, PolicyPreserve, PlanResult{}); err == nil {
 		t.Fatal("verify accepted a different window slot at the baseline index")
 	}
 }

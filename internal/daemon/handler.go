@@ -24,7 +24,11 @@ type Request struct {
 	// SessID is the caller's own tmux session id ("$0"), read from its $TMUX with
 	// no fork. The daemon cannot infer it: the daemon process has no $TMUX, so the
 	// CtxSess/CtxPath fields it used to send always described nothing.
-	SessID string `json:"sess_id,omitempty"`
+	SessID    string `json:"sess_id,omitempty"`
+	RuntimeID string `json:"runtime_id,omitempty"`
+	ServerKey string `json:"server_key,omitempty"`
+	Outcome   string `json:"outcome,omitempty"`
+	Error     string `json:"error,omitempty"`
 }
 
 type Response struct {
@@ -218,6 +222,20 @@ func (d *Daemon) serveRequest(enc *json.Encoder, req Request) error {
 	case "connect":
 		d.handleConnect(req.Name)
 		return enc.Encode(Response{OK: true})
+	case "connect-result":
+		if req.Outcome != "succeeded" && req.Outcome != "failed" {
+			return enc.Encode(Response{OK: false, Error: "invalid connect outcome"})
+		}
+		if req.RuntimeID == "" || req.ServerKey == "" {
+			return enc.Encode(Response{OK: false, Error: "missing connect runtime identity"})
+		}
+		if req.Outcome == "failed" {
+			log.Printf("[connect] outcome=failed name=%q runtime_id=%s server_key=%s error=%q", req.Name, req.RuntimeID, req.ServerKey, req.Error)
+		} else {
+			d.handleConnect(req.Name)
+			log.Printf("[connect] outcome=succeeded name=%q runtime_id=%s server_key=%s", req.Name, req.RuntimeID, req.ServerKey)
+		}
+		return enc.Encode(Response{OK: true})
 	case "freeze":
 		if err := d.handleFreeze(req.Name); err != nil {
 			return enc.Encode(Response{OK: false, Error: err.Error()})
@@ -256,7 +274,7 @@ func (d *Daemon) handleConnect(name string) {
 	if name == "" || st == nil {
 		return
 	}
-	log.Printf("[store] [INFO] connect: %s", name)
+	log.Printf("[picker] selected: %s (open telemetry queued)", name)
 	st.RecordOpen(name)
 	_ = st.Touch(name) // no-op unless name is a saved preset
 	sessions := d.listLiveViaControl()

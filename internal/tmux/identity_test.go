@@ -2,6 +2,7 @@ package tmux
 
 import (
 	"context"
+	"fmt"
 	"os/exec"
 	"strings"
 	"testing"
@@ -63,7 +64,7 @@ func TestCtlObserveReadsLogicalOptionsAndServerMembership(t *testing.T) {
 		t.Fatalf("observe: %v", err)
 	}
 	if !snapshot.Complete || snapshot.Target.TmuxID != sessionID || snapshot.Target.LogicalID != "00000000-0000-4000-8000-000000000001" || len(snapshot.Target.Windows) != 1 {
-		t.Fatalf("target snapshot = %+v", snapshot.Target)
+		t.Fatalf("target snapshot = %+v", snapshot.Target.Session())
 	}
 	if snapshot.Target.Windows[0].SlotID != "00000000-0000-4000-8000-000000000002" || snapshot.Target.Windows[0].Panes[0].SlotID != "00000000-0000-4000-8000-000000000003" {
 		t.Fatalf("window/pane slot IDs = %+v", snapshot.Target.Windows[0])
@@ -111,6 +112,92 @@ func TestCtlObserveReadsLogicalOptionsAndServerMembership(t *testing.T) {
 				t.Errorf("operation marker for %s = %q", object.RuntimeID, object.OperationID)
 			}
 		}
+	}
+}
+
+func TestPickerReceiptGenerationMatchesAttachValidation(t *testing.T) {
+	tmuxtest.Isolate(t)
+	runIsolatedTmux(t, "new-session", "-d", "-s", "attach-contract", "-c", "/tmp", "sleep", "300")
+	ctl, _ := New()
+	live, err := ctl.ListLive(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var receipt *LiveSession
+	for i := range live {
+		if live[i].Name == "attach-contract" {
+			receipt = &live[i]
+			break
+		}
+	}
+	if receipt == nil {
+		t.Fatalf("missing live attach row: %+v", live)
+	}
+	if err := ctl.ValidateObserved(context.Background(), receipt.ID, receipt.ServerKey); err != nil {
+		t.Fatalf("fresh picker receipt rejected before attach: %v", err)
+	}
+	if err := ctl.ValidateObserved(context.Background(), receipt.ID, receipt.ServerKey+":stale"); err == nil {
+		t.Fatal("stale server generation was accepted")
+	}
+}
+
+func TestServerGenerationKeyStableAcrossCurrentSessionObservation(t *testing.T) {
+	tmuxtest.Isolate(t)
+	runIsolatedTmux(t, "new-session", "-d", "-s", "generation", "-c", "/tmp", "sleep", "300")
+	ctx := context.Background()
+	first := tmuxServerKey(ctx, "generation")
+	second := tmuxServerKeyTarget(ctx, "=generation")
+	if first == "" || first != second {
+		t.Fatalf("server generation key differs: %q %q", first, second)
+	}
+}
+
+func TestConnectObservedSwitchesTheCallingTmuxClient(t *testing.T) {
+	tmuxtest.Isolate(t)
+	runIsolatedTmux(t, "new-session", "-d", "-s", "source-session", "-c", "/tmp", "sleep", "301")
+	runIsolatedTmux(t, "new-session", "-d", "-s", "target-session", "-c", "/tmp", "sleep", "300")
+	control := NewControl()
+	if err := control.Reconnect(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { control.Close() })
+	sessionRows := runIsolatedTmux(t, "list-sessions", "-F", "#{session_name}\t#{session_id}")
+	var serverID string
+	for _, row := range strings.Split(sessionRows, "\n") {
+		fields := strings.Split(row, "\t")
+		if len(fields) == 2 && fields[0] == HiddenControlSession {
+			serverID = fields[1]
+		}
+	}
+	if serverID == "" {
+		t.Fatalf("hidden control session missing from list: %q", sessionRows)
+	}
+	paneID := runIsolatedTmux(t, "list-panes", "-t", "=__gotomuxd", "-F", "#{pane_id}")
+	socket := runIsolatedTmux(t, "display-message", "-p", "-t", "=target-session", "#{socket_path}")
+	serverPID := runIsolatedTmux(t, "display-message", "-p", "-t", "=target-session", "#{pid}")
+	t.Setenv("TMUX", fmt.Sprintf("%s,%s,%s", socket, serverPID, strings.TrimPrefix(serverID, "$")))
+	t.Setenv("TMUX_PANE", paneID)
+	ctl, _ := New()
+	live, err := ctl.ListLive(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var receipt *LiveSession
+	for i := range live {
+		if live[i].Name == "target-session" {
+			receipt = &live[i]
+			break
+		}
+	}
+	if receipt == nil {
+		t.Fatalf("target receipt absent: %+v", live)
+	}
+	if err := ctl.ConnectObserved(context.Background(), receipt.ID, receipt.ServerKey); err != nil {
+		t.Fatalf("switch by observed runtime identity: %v", err)
+	}
+	clientSession := runIsolatedTmux(t, "list-clients", "-F", "#{client_session}")
+	if clientSession != "target-session" {
+		t.Fatalf("calling tmux client now shows %q; want target-session", clientSession)
 	}
 }
 

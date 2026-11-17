@@ -37,6 +37,7 @@ type Pane struct {
 	Cmd      sql.NullString
 	CmdPath  string
 	SlotID   string
+	StartCmd string
 }
 
 type Placement struct {

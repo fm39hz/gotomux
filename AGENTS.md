@@ -54,14 +54,14 @@ main.go               CLI entry: flags, daemon probe, freeze/edit/profile paths
 cmd/gotomuxd/         daemon entry (thin; all logic in internal/daemon)
 internal/
   config/    config.toml + env-driven Config, XDG dir resolution (every path goes through this)
-  model/     shared Session/Window/Pane/Usage types — the lingua franca
+  model/     Recipe/Baseline/ObservedSession domain contracts; Session is a compatibility DTO
   daemon/    poll loop, tmux control-socket cache, Unix-socket IPC
   event/     tiny in-process pub/sub (freeze.done, shape.saved)
   picker/    Bubble Tea UI, Source registry, ranking, zoxide, git enrich
   project/   project root walk, session-name sanitize, children, git
   store/     SQLite: presets, usage, pairs, transitions, shapes, placement, forks, zox cache
   template/  shape derive/bake/label, JSON format, config-dir mirror, freeze glue
-  tmux/      Ctl (exec) + ControlConn (direct socket), freeze, load, pane detect
+  tmux/      Ctl adapter over pinned gotmux executor/control transport, freeze, load, pane detect
   toolclass/ hardcoded vocabulary: shell/editor/files/git/agent + chrome roles + icons
 ```
 
@@ -93,7 +93,7 @@ Full list (tmux 3.7b, each constraint killed a plausible design): **`docs/specs/
 
 - **Never start the tmux server** from the daemon (systemd makes every pane a transient scope under the starting unit; stopping gotomuxd then destroyed real sessions). Attach only when `tmux.ServerRunning()` is already true, else stay `Ready=false`.
 - The only non-perturbing client is a **dedicated hidden session** (`tmux -C new-session -A -s __gotomuxd -- cat`); it is visible to listings, so every consumer must filter `__gotomuxd`.
-- Control-socket commands: **one command per line**, single-quote non-token args, never quote the separator; `%exit` is a reconnect trigger.
+- gotmux owns control framing, command quoting and event decoding. Keep its connection bound only to the hidden session; the command adapter uses ExistingOnly except for explicit session/server creation.
 - **Events cover membership only** (`%sessions-changed`); timestamps need the periodic poll — keep both.
 
 ### Shapes — the non-obvious core
@@ -135,8 +135,8 @@ Documented in the header comment of `internal/template/edit.go` (`Format`/`Parse
 
 ### Picker sources & ranking
 
-`Source` = `Snapshot()` (paint) + `Refresh()` (background `tea.Cmd`) + `FlattenFilter(query)` (per-source cap / hide-when-typing). Order is create → tmux → preset → zoxide. Dedup applies within an intent class: create/zoxide share a project-creation class, while live attach and saved-preset instantiation remain separate rows even when names or paths coincide. Picker item IDs include intent and observed identity so same-name actions do not share cursor state. Create hides itself once a query is typed; zoxide caps at `ZoxideCap` (40) only when the query is empty.
-
+`Source` = `Snapshot()` (paint) + `Refresh()` (background `tea.Cmd`) + `FlattenFilter(query)` (per-source cap / hide-when-typing). Order is create → tmux → preset → zoxide. Dedup uses normalized path, falling back to name only when path is absent; Active → Preset → Create → Zoxide priority selects one row for the same project, while same-name projects at different paths remain separately selectable. Item IDs include name and normalized path. Create hides itself once a query is typed; zoxide caps at `ZoxideCap` (40) only when the query is empty.
+Source has Snapshot for painting, Refresh for background updates, and FlattenFilter for per-source caps/hide rules. Order is create, tmux, preset, zoxide. Dedup by normalized project path; use name only when path is absent. For one path prefer Active, then Preset, Create, Zoxide. A same-name project at another path stays selectable. Item IDs include name and normalized path. Create hides itself after typing; zoxide is capped at ZoxideCap (40) when the query is empty.
 #### Cold start — where the time actually goes (measured, do not re-derive)
 
 Measured with `hyperfine` on ~300 zoxide entries. `gotomux -p` profiles the **standalone** path only; it never consults the daemon.
@@ -158,15 +158,15 @@ To add a source: implement `Source`, register in `defaultSources`, and give it a
 
 ### Store
 
-`$XDG_DATA_HOME/gotomux/state.db`, pure-Go `modernc.org/sqlite`, WAL + `synchronous=NORMAL` + 1s busy timeout. Tables: `session`/`window`/`pane` (presets, cascade delete), `usage`, `pair`, `transition`, `zox_meta`/`zox_item`, `shape`, `sticky`, `placement`, `fork`.
+`$XDG_DATA_HOME/gotomux/state.db`, pure-Go `modernc.org/sqlite`, WAL + `synchronous=NORMAL` + 1s busy timeout. Goose owns all schema changes; sqlc owns generated query plumbing. Migrations are additive, versioned, and immutable once released. Tables: `session`/`window`/`pane` (recipes, cascade delete), `baseline` (desired recipe plus last incarnation snapshot), `reconcile_journal`, `usage`, `pair`, `transition`, `zox_meta`/`zox_item`, `shape`, `sticky`, `placement`, `fork`.
 
-Migration is additive-only and idempotent: `CREATE TABLE IF NOT EXISTS` plus `pragma_table_info` probes for columns added later (`window.cwd`, `shape.updated_at`). Follow that pattern — never drop or rewrite a table.
+The baseline envelope `logical_id` must agree with the `LogicalID` inside its JSON body; a mismatch is corruption and must be reported. Do not infer identity from names or rewrite unidentified legacy baselines during adoption. Explicit freeze may replace the desired baseline and atomically abort stale reconcile journals.
 
-`store.Storer` is the interface everything depends on; `*store.Store` is the only implementation outside tests. Add methods there, not on the concrete type alone.
+`store.Storer` is the compatibility interface for picker/shape paths. `store.RecipeRepository` and `store.BaselineRepository` are the typed identity/reconcile boundaries; production `*store.Store` implements both. Keep raw SQL in sqlc query files and update generated code with `sqlc`.
 
 ### Connect behavior
 
-Inside tmux (`$TMUX` set): `SwitchClient`. Outside: `Attach`. `Load` is a no-op if the session already exists. Enter on Create/Zoxide: attach a same-name live session only when its observed project root matches; an identified name collision stops before creation. With no live or identified-name conflict, bake the sticky shape as a new instance. Preset rows instantiate their saved recipe by logical identity.
+Inside tmux (`$TMUX` set): switch to the observed session ID. Outside: attach to the observed session ID. `Load` returns an error if its name already exists; callers must resolve/attach explicitly. Enter on Create/Zoxide: attach a same-name live session only when its observed project root matches; an identified name collision stops before creation. With no live or identified-name conflict, bake the sticky shape as a new instance. Preset rows instantiate their saved recipe by logical identity.
 
 `project.FindProjectRoot` walks up for `project.godot`, `.git`, `package.json`, `Cargo.toml`, `go.mod`. `project.SessionName` sanitizes the basename to `[a-z0-9-]`.
 
@@ -193,6 +193,6 @@ There are no `GOTOMUX_*` settings variables anymore. Genuinely env-only: `XDG_DA
 
 ## External deps
 
-`charm.land/bubbletea/v2` + `bubbles/v2` + `lipgloss` (TUI), `junegunn/fzf/src/algo` (fuzzy core, needs `algo.Init` in `main`), `modernc.org/sqlite`, `shirou/gopsutil/v4` + `/proc` (freeze cmd detection, Linux), `richardwooding/projectdetect`, `epilande/go-devicons`, `BurntSushi/toml` (config file). Runtime: `tmux` required, `zoxide` optional.
+`charm.land/bubbletea/v2` + `bubbles/v2` + `lipgloss` (TUI), `junegunn/fzf/src/algo` (fuzzy core, needs `algo.Init` in `main`), `modernc.org/sqlite`, `pressly/goose/v3` (migrations), sqlc generated queries, `zigai/gotmux` v0.5.2 (tmux executor/control/attach, requires tmux 3.6+), `google/uuid` (UUIDs), `go-shellwords` (launch command argv), `gofrs/flock` (session mutation guard), `shirou/gopsutil/v4` + `/proc` (freeze cmd detection, Linux), `richardwooding/projectdetect`, `epilande/go-devicons`, `BurntSushi/toml` (config file). Runtime: `tmux` 3.6+ required, `zoxide` optional.
 
-Session listing/attach is done with hand-built tmux commands in `internal/tmux` (both `exec` and the control socket) — there is no tmux client library in the tree.
+Tmux access is centralized in `internal/tmux/executor.go` and `internal/tmux/control.go` using pinned gotmux. The daemon attaches only to the hidden session and never starts the server. `internal/tmuxlayout` remains application-owned because the available library does not preserve gotomux's stable pane-slot layout contract. The product requires tmux 3.6 or newer.

@@ -179,7 +179,7 @@ func (f *fakeJournal) UpdateReconcile(id string, status model.ReconcileJournalSt
 func runnerSnapshot() model.Snapshot {
 	win := model.Window{Idx: 1, Name: "editor", SlotID: "00000000-0000-4000-8000-000000000002", TmuxID: "@1", Panes: []model.Pane{{Idx: 0, SlotID: "00000000-0000-4000-8000-000000000003", TmuxID: "%1"}}}
 	session := model.Session{Name: "work", LogicalID: "00000000-0000-4000-8000-000000000001", SchemaVersion: model.CurrentBaselineSchemaVersion, TmuxID: "$1", ServerKey: "server-a", Windows: []model.Window{win}}
-	return model.Snapshot{ServerKey: "server-a", Complete: true, Target: session, TargetSessionID: "$1", Sessions: []model.SessionIdentity{{Name: "work", LogicalID: session.LogicalID, RuntimeID: "$1"}}, Objects: []model.ObjectIdentity{
+	return model.Snapshot{ServerKey: "server-a", Complete: true, Target: model.ObserveSession(session), TargetSessionID: "$1", Sessions: []model.SessionIdentity{{Name: "work", LogicalID: session.LogicalID, RuntimeID: "$1"}}, Objects: []model.ObjectIdentity{
 		{Kind: model.ObjectSession, LogicalID: session.LogicalID, RuntimeID: "$1"},
 		{Kind: model.ObjectWindow, SlotID: win.SlotID, RuntimeID: "@1", Layout: win.Layout, PaneCount: len(win.Panes)},
 		{Kind: model.ObjectPane, SlotID: win.Panes[0].SlotID, RuntimeID: "%1", ParentID: "@1"},
@@ -196,7 +196,7 @@ func TestRunnerBindsResolvedIdentitiesThroughJournaledOperations(t *testing.T) {
 	live.Target.Windows[0].Panes[0].SlotID = ""
 	live.Objects[1].SlotID = ""
 	live.Objects[2].SlotID = ""
-	desired := core.DesiredState{Session: want.Target}
+	desired := core.DesiredState{Baseline: model.BaselineFromSession(want.Target.Session())}
 	resolution := core.Resolve(desired, live)
 	if resolution.Status != core.ResolutionReady {
 		t.Fatalf("initial identity resolution = %+v", resolution)
@@ -240,7 +240,7 @@ func TestRunnerRejectsChangedEvidenceBeforeBindingSlot(t *testing.T) {
 			base.Objects[i].SlotID = ""
 		}
 	}
-	desired := core.DesiredState{Session: runnerSnapshot().Target}
+	desired := core.DesiredState{Baseline: model.BaselineFromSession(runnerSnapshot().Target.Session())}
 	resolution := core.Resolve(desired, base)
 	plan := core.Plan(desired, base, resolution, core.PolicyPreserve)
 	if plan.Status != core.PlanReady || len(plan.Operations) != 2 {
@@ -269,7 +269,7 @@ func movePlan(snapshot model.Snapshot) core.PlanResult {
 		Kind: model.ObjectSession, BaselineIndex: -1, BaselineIdentityID: snapshot.Target.LogicalID,
 		LiveIdentityID: snapshot.Target.LogicalID, BaselineRuntimeID: snapshot.Target.TmuxID, LiveRuntimeID: snapshot.TargetSessionID,
 	}}
-	return core.PlanResult{ID: "plan-a", Status: core.PlanReady, Policy: core.PolicyPreserve, DesiredSession: snapshot.Target, ClassifierVersion: 1, Resolution: resolution,
+	return core.PlanResult{PlanSchemaVersion: core.CurrentPlanSchemaVersion, ID: "plan-a", Status: core.PlanReady, Policy: core.PolicyPreserve, DesiredBaseline: model.BaselineFromSession(snapshot.Target.Session()), ClassifierVersion: 1, Resolution: resolution,
 		StartSnapshotFingerprint: core.SnapshotFingerprint(snapshot),
 		Operations: []core.Operation{{ID: "plan-a/0001", Kind: core.OperationMoveWindow,
 			Target:            core.RuntimeRef{ServerGeneration: snapshot.ServerKey, Kind: model.ObjectWindow, ID: "@1"},
@@ -314,7 +314,7 @@ func TestRunnerRecoversWhenMutationSucceededButJournalAdvanceFailed(t *testing.T
 func TestRunnerAbortsStalePlanBeforeAnyMutation(t *testing.T) {
 	initial := runnerSnapshot()
 	changed := runnerSnapshot()
-	changed.Target.Windows[0].Cwd = "/changed"
+	changed.Target.Windows[0].Idx = 9
 	port := &fakePort{snapshot: changed}
 	journal := &fakeJournal{entry: model.ReconcileJournal{ID: "run-3", Status: model.JournalPlanned}}
 	r := Runner{Tmux: port, Journal: journal}

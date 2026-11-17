@@ -29,7 +29,47 @@ func (s *Store) StartReconcile(journal model.ReconcileJournal) error {
 		journal.CreatedAt = now
 	}
 	journal.UpdatedAt = now
-	err := s.q.InsertReconcileJournal(storeContext, dbgen.InsertReconcileJournalParams{
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	q := s.q.WithTx(tx)
+	// The desired document in the plan is its optimistic concurrency token.
+	// Check it in the same transaction that claims the active journal, closing
+	// the observation-to-journal gap without timestamps or runtime bindings.
+	var envelope struct{ DesiredBaseline model.Baseline }
+	if err := json.Unmarshal([]byte(journal.PlanJSON), &envelope); err != nil {
+		return err
+	}
+	if envelope.DesiredBaseline.Desired.LogicalID != "" {
+		row, err := q.BaselineByLogicalID(storeContext, journal.SessionLogicalID)
+		if err != nil {
+			return fmt.Errorf("claim reconcile baseline: %w", err)
+		}
+		current, err := decodeBaselineEnvelope(row.Body, row.LogicalID)
+		if err != nil {
+			return err
+		}
+		expected := envelope.DesiredBaseline.Desired
+		actual := model.RecipeFromSession(current)
+		// Session rename is a presentation change applied during planning.
+		actual.Name = expected.Name
+		if !expected.SameReplay(actual) || expected.LogicalID != actual.LogicalID {
+			return fmt.Errorf("baseline changed after reconcile planning; retry from a fresh snapshot")
+		}
+		for wi, window := range expected.Windows {
+			if window.SlotID != actual.Windows[wi].SlotID {
+				return fmt.Errorf("baseline window identity changed after planning")
+			}
+			for pi, pane := range window.Panes {
+				if pane.SlotID != actual.Windows[wi].Panes[pi].SlotID {
+					return fmt.Errorf("baseline pane identity changed after planning")
+				}
+			}
+		}
+	}
+	err = q.InsertReconcileJournal(storeContext, dbgen.InsertReconcileJournalParams{
 		ID: journal.ID, SessionKey: journal.SessionKey, SessionName: journal.SessionName,
 		SessionLogicalID: journal.SessionLogicalID, Policy: journal.Policy, Status: string(journal.Status),
 		PlanJson: journal.PlanJSON, CompletedStep: int64(journal.CompletedStep), LastError: journal.LastError,
@@ -38,7 +78,7 @@ func (s *Store) StartReconcile(journal model.ReconcileJournal) error {
 	if err != nil {
 		return fmt.Errorf("start reconcile journal: %w", err)
 	}
-	return nil
+	return tx.Commit()
 }
 
 func (s *Store) UpdateReconcile(id string, status model.ReconcileJournalStatus, completedStep int, lastError string) error {
@@ -135,6 +175,11 @@ func (s *Store) CommitReconcile(sess *model.Session, journalID string) error {
 		return fmt.Errorf("complete reconcile journal: %w", err)
 	}
 	return tx.Commit()
+}
+
+func (s *Store) CommitReconcileState(state model.Baseline, journalID string) error {
+	session := state.Session()
+	return s.CommitReconcile(&session, journalID)
 }
 
 func validJournalTransition(old, next model.ReconcileJournalStatus) bool {

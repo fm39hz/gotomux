@@ -314,7 +314,6 @@ func newModelCore(cfg *config.Config, d Deps, createName, createCwd string, seed
 	if env.Now == 0 {
 		env.Now = time.Now().Unix()
 	}
-	applyRankMeta(bySrc, d.Store, env)
 
 	m := assemble(cfg, d, createName, createCwd, cache, srcs, bySrc, env, seed.StickyLabel)
 	if !seed.Seeded {
@@ -401,16 +400,21 @@ func (m *model) liveNames() []string {
 }
 
 func (m *model) pool() []Item {
-	return flattenSources(m.sources, m.bySrc, strings.TrimSpace(m.ui.queryInput.Value()))
+	// Source observations remain intact across filtering and refresh. Resolve
+	// availability against the complete set, including the current session.
+	projected := make(map[Source][]Item, len(m.bySrc))
+	for source, items := range m.bySrc {
+		projected[source] = append([]Item(nil), items...)
+	}
+	applyRankMeta(projected, nil, m.env)
+	return flattenSources(m.sources, projected, strings.TrimSpace(m.ui.queryInput.Value()))
 }
 
 func (m *model) mergeSource(src Source, items []Item) {
 	if m.bySrc == nil {
 		m.bySrc = map[Source][]Item{}
 	}
-	slot := map[Source][]Item{src: items}
-	applyRankMeta(slot, m.store, m.env)
-	m.bySrc[src] = slot[src]
+	m.bySrc[src] = append([]Item(nil), items...)
 }
 
 func (m *model) refilter() {
@@ -581,7 +585,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				name := it.Name
 				if it.Kind == KindActive || (it.Kind == KindPreset && m.ctl.Has(context.Background(), name)) {
 					stop := HoldInterrupt()
-					sid, created, err := template.FreezeRemember(m.ctl, m.ensureStore(), name)
+					sid, created, err := template.FreezeObserved(m.ctl, m.ensureStore(), name, mod.EntityIdentity{RuntimeID: it.RuntimeID, ServerKey: it.ServerKey})
 					stop()
 					if err != nil {
 						m.ui.status = err.Error()
@@ -610,7 +614,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			switch it.Kind {
 			case KindActive:
 				stop := HoldInterrupt()
-				_, _, err := template.FreezeRemember(m.ctl, m.ensureStore(), it.Name)
+				_, _, err := template.FreezeObserved(m.ctl, m.ensureStore(), it.Name, mod.EntityIdentity{RuntimeID: it.RuntimeID, ServerKey: it.ServerKey})
 				stop()
 				if err != nil {
 					m.ui.status = err.Error()
@@ -677,7 +681,6 @@ func (m *model) reload() {
 	m.sources = defaultSources(m.ctl, st, m.createName, m.createCwd, m.cache)
 	m.bySrc = snapshotAll(m.sources)
 	m.env = newContext(m.ctl, st, m.cache.tmuxSnap, m.sessID)
-	applyRankMeta(m.bySrc, st, m.env)
 	enrichAllSyncWith(m.bySrc, gitConc(m.cfg))
 	m.refilter()
 	if savedScroll > 0 && savedScroll != m.ui.viewportStart {
@@ -711,7 +714,12 @@ func (m *model) unmake() {
 	it := m.ui.items[m.ui.cursor]
 	switch it.Kind {
 	case KindActive:
-		if err := m.ctl.Kill(context.Background(), it.Name); err != nil {
+		remover, ok := m.ctl.(tmux.ObservedSessionRemover)
+		if !ok || it.RuntimeID == "" || it.ServerKey == "" {
+			m.ui.status = "kill: selected session has no verified runtime receipt; refresh the picker"
+			return
+		}
+		if err := remover.KillObserved(context.Background(), it.RuntimeID, it.ServerKey); err != nil {
 			m.ui.status = err.Error()
 			return
 		}
@@ -770,7 +778,6 @@ func (m *model) beginEdit(name string) (tea.Cmd, error) {
 		c.Stdin, c.Stdout, c.Stderr = os.Stdin, os.Stdout, os.Stderr
 	}
 	st := m.ensureStore()
-	old := name
 	return tea.ExecProcess(c, func(err error) tea.Msg {
 		defer os.Remove(path)
 		if err != nil {
@@ -785,7 +792,7 @@ func (m *model) beginEdit(name string) (tea.Cmd, error) {
 			return editDoneMsg{err: fmt.Errorf("parse: %w", err)}
 		}
 		stop := HoldInterrupt()
-		err = template.CommitEdit(st, old, np)
+		err = template.CommitObservedEdit(st, p, np)
 		stop()
 		if err != nil {
 			return editDoneMsg{err: err}

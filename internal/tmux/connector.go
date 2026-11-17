@@ -18,3 +18,21 @@ type Connector interface {
 	Load(ctx context.Context, p *model.Session) error
 	Connect(ctx context.Context, name, cwd string) error
 }
+
+// ObservedConnector attaches only to an existing runtime session on the
+// observed server generation. It must never create a session as a fallback.
+type ObservedConnector interface {
+	ConnectObserved(ctx context.Context, runtimeID, serverKey string) error
+}
+
+// CreatedSessionCleaner is used only with the receipt of a successful create.
+// Removal is guarded by the server generation and exact runtime handle.
+type CreatedSessionCleaner interface {
+	RemoveCreatedSession(ctx context.Context, runtimeID, serverKey string) error
+}
+
+// ObservedSessionRemover removes exactly the selected runtime incarnation.
+// Implementations must reject missing or stale server evidence.
+type ObservedSessionRemover interface {
+	KillObserved(ctx context.Context, runtimeID, serverKey string) error
+}

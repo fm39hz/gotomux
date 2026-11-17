@@ -42,8 +42,15 @@ func Isolate(t *testing.T) (root string) {
 	// Behave as if run outside tmux, regardless of how the test was launched.
 	t.Setenv("TMUX", "")
 
-	if out, err := exec.Command("tmux", "start-server").CombinedOutput(); err != nil {
-		t.Skipf("start-server: %v: %s", err, strings.TrimSpace(string(out)))
+	// An empty default tmux server exits immediately. Bootstrap a private
+	// session in the same command queue, then keep the verified server alive.
+	// A fixed config also prevents user hooks/plugins from entering fixtures.
+	configPath := filepath.Join(root, "tmux.conf")
+	if err := os.WriteFile(configPath, []byte("set -g base-index 1\nset -g renumber-windows on\nset -g default-shell /bin/sh\nset -g automatic-rename off\nset -g exit-empty off\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command("tmux", "-f", configPath, "new-session", "-d", "-s", "__gotomux_test_bootstrap", "-c", root, "sleep", "600").CombinedOutput(); err != nil {
+		t.Skipf("start isolated server: %v: %s", err, strings.TrimSpace(string(out)))
 	}
 
 	out, err := exec.Command("tmux", "display-message", "-p", "#{socket_path}").Output()
@@ -60,6 +67,10 @@ func Isolate(t *testing.T) (root string) {
 
 	// Only now is teardown safe.
 	t.Cleanup(func() { _ = exec.Command("tmux", "kill-server").Run() })
+	if out, err := exec.Command("tmux", "-S", sock, "kill-session", "-t", "=__gotomux_test_bootstrap").CombinedOutput(); err != nil {
+		t.Fatalf("remove private bootstrap session: %v: %s", err, out)
+	}
+
 	return root
 }
 
