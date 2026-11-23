@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/fm39hz/gotomux/internal/model"
+	"github.com/fm39hz/gotomux/internal/toolclass"
 )
 
 // Reconciliation operations reshape a live session without touching the
@@ -15,32 +16,37 @@ import (
 // in it) is untouched. new-window at a concrete index rebuilds a missing
 // window exactly like Load does.
 
-// paneCmd: the full command to recreate a pane.
-//
-// Prefer the frozen absolute executable (CmdPath): panes are spawned by the
-// tmux server under the creating client's environment, where a bare name the
-// user's interactive shell resolves via config-added PATH entries may not
-// exist — the pane dies instantly and the window silently disappears from
-// rebuilt sessions. Arguments from StartCmd are kept verbatim; without a
-// StartCmd, fall back to the detected bare Cmd.
-//
-// A frozen path can dangle (tool upgraded, version-manager shim rotated), so
-// it is honoured only while it still exists; a dangling path falls back to
-// StartCmd/Cmd — the pre-CmdPath behaviour — instead of failing the spawn.
+// paneCmd resolves explicit launch evidence first. Foreground observations
+// may supply a resolved executable only for that same launcher. Without launch
+// evidence, only interactive workspace tools are inferred; batch processes
+// observed under a shell do not become startup commands.
 func paneCmd(p model.Pane) string {
-	if p.CmdPath != "" && fileExists(p.CmdPath) {
-		if p.StartCmd == "" {
-			return p.CmdPath
+	// Explicit launch commands retain their executable and arguments. The
+	// detected foreground executable must not replace a shell/wrapper launcher.
+	if strings.TrimSpace(p.StartCmd) != "" {
+		args := cmdArgs(p.StartCmd)
+		path := replayExecutablePath(p.CmdPath)
+		if len(args) > 0 && toolclass.Base(args[0]) == toolclass.Base(p.Cmd) && path != "" && fileExists(path) {
+			args[0] = path
+			for i := range args {
+				args[i] = strconv.Quote(args[i])
+			}
+			return strings.Join(args, " ")
 		}
-		start := strings.TrimSpace(p.StartCmd)
-		rest := ""
-		if i := strings.IndexAny(start, " \t"); i >= 0 {
-			rest = start[i:]
-		}
-		return strings.TrimSpace(p.CmdPath + rest)
-	}
-	if p.StartCmd != "" {
 		return p.StartCmd
+	}
+	// Legacy snapshots may have captured a transient foreground command without
+	// launch evidence. Treat those as interactive shell panes.
+	if len(cmdArgs(p.Cmd)) > 1 {
+		return p.Cmd
+	}
+	if !inferredReplayTool(p.Cmd) {
+		return ""
+	}
+	p.CmdPath = replayExecutablePath(p.CmdPath)
+
+	if p.CmdPath != "" && fileExists(p.CmdPath) {
+		return p.CmdPath
 	}
 	return p.Cmd
 }

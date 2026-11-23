@@ -454,6 +454,10 @@ func (c *Ctl) Freeze(ctx context.Context, name string) (*model.Session, error) {
 		}
 		cmd := detectPaneCmd(pCur, pStart, int32(pPid64), procs)
 		cmdPath := resolvePaneCmdPath(cmd, int32(pPid64), procs)
+		cmdPath = replayExecutablePath(cmdPath)
+		if strings.TrimSpace(pStart) == "" && !inferredReplayTool(cmd) {
+			cmd, cmdPath = "", ""
+		}
 		w.panes = append(w.panes, model.Pane{
 			Idx:      pIdx,
 			Cwd:      pPath,
